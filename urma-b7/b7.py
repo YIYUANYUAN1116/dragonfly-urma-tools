@@ -241,13 +241,16 @@ def prepare_remote_role(
     ports = " ".join(str(port) for port in layout["ports"].values())
     script = f"""set -eu
 run_dir={shlex.quote(layout['runDir'])}
+staging="$run_dir.b7-preparing"
 storage={shlex.quote(layout['storage'])}
 cache={shlex.quote(layout['cache'])}
 config={shlex.quote(layout['config'])}
-if [ -e "$run_dir" ]; then
-  echo "run directory already exists: $run_dir" >&2
-  exit 20
-fi
+for target in "$run_dir" "$staging" "$storage" "$config"; do
+  if [ -e "$target" ]; then
+    echo "prepare target already exists: $target" >&2
+    exit 20
+  fi
+done
 for port in {ports}; do
   if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
     echo "port already in use: $port" >&2
@@ -255,9 +258,13 @@ for port in {ports}; do
   fi
 done
 umask 077
-mkdir -p "$run_dir" "$storage" "$cache"
+mkdir "$staging"
+trap 'rm -rf -- "$staging"' EXIT
+printf '%s' {shlex.quote(marker)} | base64 -d > "$staging/.b7-owner.json"
+mv -T "$staging" "$run_dir"
+trap - EXIT
+mkdir -p "$storage" "$cache"
 printf '%s' {shlex.quote(payload)} | base64 -d > "$config"
-printf '%s' {shlex.quote(marker)} | base64 -d > "$run_dir/.b7-owner.json"
 sha256sum "$config" | awk '{{print $1}}'
 """
     completed = ssh_script(node, inventory, script)
@@ -281,21 +288,37 @@ def prepare_origin(
     target_name = PurePosixPath(target).name
     if not target_name.startswith(f"{run_id}-") or not target_name.endswith(".bin"):
         raise B7Error("origin target does not match the run id")
+    owner_marker = target + ".b7-owner.json"
+    marker = base64.b64encode(
+        json.dumps({"schemaVersion": 1, "runId": run_id, "kind": "origin"}).encode(
+            "utf-8"
+        )
+    ).decode("ascii")
     script = f"""set -eu
 seed={shlex.quote(seed)}
 target={shlex.quote(target)}
+owner_marker={shlex.quote(owner_marker)}
 test -f "$seed"
-if [ -e "$target" ]; then
-  echo "origin target already exists: $target" >&2
+if [ -e "$target" ] || [ -e "$owner_marker" ]; then
+  echo "origin target or owner marker already exists: $target" >&2
   exit 20
 fi
-ln "$seed" "$target"
+umask 077
+printf '%s' {shlex.quote(marker)} | base64 -d > "$owner_marker"
+if ! ln "$seed" "$target"; then
+  rm -f -- "$owner_marker"
+  exit 21
+fi
 sha256sum "$target" | awk '{{print $1}}'
 """
     completed = ssh_script(node, inventory, script)
     if completed.returncode != 0:
         raise B7Error(f"cannot prepare origin: {completed.stderr.strip()}")
-    return {"path": target, "sha256": completed.stdout.strip()}
+    return {
+        "path": target,
+        "ownerMarker": owner_marker,
+        "sha256": completed.stdout.strip(),
+    }
 
 
 def assert_owned_script(layout: dict[str, Any], run_id: str, role: str) -> str:
@@ -638,12 +661,33 @@ def cleanup_remote_role(
     run_id: str,
 ) -> None:
     expected_run = f"/tmp/dragonfly-urma-b7/{run_id}/{role}"
+    expected_staging = expected_run + ".b7-preparing"
     expected_storage = f"/var/lib/dragonfly-b7/{run_id}/{role}"
     if layout["runDir"] != expected_run or layout["storage"] != expected_storage:
         raise B7Error(f"cleanup layout mismatch for {role}")
     safe_remote_path(PurePosixPath(layout["config"]))
     script = f"""set -eu
-{assert_owned_script(layout, run_id, role)}
+run_dir={shlex.quote(expected_run)}
+staging={shlex.quote(expected_staging)}
+storage={shlex.quote(expected_storage)}
+config={shlex.quote(layout['config'])}
+if [ ! -e "$run_dir" ] && [ ! -e "$staging" ] && [ ! -e "$storage" ] && [ ! -e "$config" ]; then
+  exit 0
+fi
+owned=0
+for directory in "$run_dir" "$staging"; do
+  if [ -e "$directory" ]; then
+    marker="$directory/.b7-owner.json"
+    test -f "$marker"
+    grep -Fq {shlex.quote(json.dumps(run_id))} "$marker"
+    grep -Fq {shlex.quote(json.dumps(role))} "$marker"
+    owned=1
+  fi
+done
+if [ "$owned" -ne 1 ]; then
+  echo "refusing cleanup without an owned run or staging directory" >&2
+  exit 23
+fi
 pidfile={shlex.quote(layout['pid'])}
 if [ -f "$pidfile" ]; then
   pid=$(cat "$pidfile")
@@ -652,8 +696,8 @@ if [ -f "$pidfile" ]; then
     exit 20
   fi
 fi
-rm -rf -- {shlex.quote(expected_run)} {shlex.quote(expected_storage)}
-rm -f -- {shlex.quote(layout['config'])}
+rm -rf -- "$run_dir" "$staging" "$storage"
+rm -f -- "$config"
 rmdir --ignore-fail-on-non-empty {shlex.quote(str(PurePosixPath(expected_run).parent))} 2>/dev/null || true
 """
     completed = ssh_script(node, inventory, script, timeout=30)
@@ -662,16 +706,99 @@ rmdir --ignore-fail-on-non-empty {shlex.quote(str(PurePosixPath(expected_run).pa
 
 
 def cleanup_origin(
-    inventory: dict[str, Any], origin: dict[str, Any], run_id: str
+    inventory: dict[str, Any],
+    origin: dict[str, Any],
+    run_id: str,
+    owner_marker: str | None = None,
 ) -> None:
     target = safe_remote_path(PurePosixPath(origin["path"]))
     name = PurePosixPath(target).name
     if not name.startswith(f"{run_id}-") or not name.endswith(".bin"):
         raise B7Error("origin cleanup target does not match run id")
     node = inventory["nodes"][inventory["origin"]["node"]]
-    completed = ssh_script(node, inventory, f"set -eu\nrm -f -- {shlex.quote(target)}\n")
+    if owner_marker is not None:
+        expected_marker = target + ".b7-owner.json"
+        if owner_marker != expected_marker:
+            raise B7Error("origin owner marker does not match target")
+        script = f"""set -eu
+marker={shlex.quote(owner_marker)}
+target={shlex.quote(target)}
+if [ ! -e "$target" ] && [ ! -e "$marker" ]; then
+  exit 0
+fi
+test -f "$marker"
+grep -Fq {shlex.quote(json.dumps(run_id))} "$marker"
+rm -f -- "$target" "$marker"
+"""
+    else:
+        # Compatibility for manifests created before origin owner markers were introduced.
+        script = f"set -eu\nrm -f -- {shlex.quote(target)}\n"
+    completed = ssh_script(node, inventory, script)
     if completed.returncode != 0:
         raise B7Error(f"cannot cleanup origin on {ssh_target(node)}")
+
+
+def cleanup_legacy_origin(
+    inventory: dict[str, Any], origin: dict[str, Any], run_id: str
+) -> None:
+    target = safe_remote_path(PurePosixPath(origin["path"]))
+    seed = safe_remote_path(PurePosixPath(origin["seed"]))
+    name = PurePosixPath(target).name
+    if not name.startswith(f"{run_id}-") or not name.endswith(".bin"):
+        raise B7Error("legacy origin cleanup target does not match run id")
+    node = inventory["nodes"][inventory["origin"]["node"]]
+    script = f"""set -eu
+target={shlex.quote(target)}
+seed={shlex.quote(seed)}
+if [ ! -e "$target" ]; then
+  exit 0
+fi
+test -f "$seed"
+if [ ! "$target" -ef "$seed" ]; then
+  echo "refusing legacy origin cleanup: target is not the prepared seed hard link" >&2
+  exit 20
+fi
+rm -f -- "$target"
+"""
+    completed = ssh_script(node, inventory, script)
+    if completed.returncode != 0:
+        raise B7Error(
+            f"cannot safely recover legacy origin on {ssh_target(node)}: "
+            f"{completed.stderr.strip()}"
+        )
+
+
+def rollback_preparation(
+    manifest: dict[str, Any], manifest_path: Path, inventory: dict[str, Any]
+) -> list[str]:
+    run_id = validate_run_id(str(manifest["runId"]))
+    generated = manifest["generated"]
+    remote = manifest["remote"]
+    failures: list[str] = []
+    for resource in ("origin", "child", "parent"):
+        record = remote.get(resource)
+        if not isinstance(record, dict) or record.get("status") == "rolled-back":
+            continue
+        try:
+            if resource == "origin":
+                cleanup_origin(
+                    inventory,
+                    manifest["origin"],
+                    run_id,
+                    record.get("ownerMarker"),
+                )
+            else:
+                layout = generated[resource]
+                node = inventory["nodes"][layout["node"]]
+                cleanup_remote_role(node, inventory, layout, resource, run_id)
+            record["status"] = "rolled-back"
+            record.pop("rollbackError", None)
+        except B7Error as error:
+            record["status"] = "rollback-failed"
+            record["rollbackError"] = str(error)
+            failures.append(f"{resource}: {error}")
+        write_json(manifest_path, manifest)
+    return failures
 
 
 def safe_remote_path(path: PurePosixPath) -> str:
@@ -861,13 +988,20 @@ def build_plan(inventory: dict[str, Any], mode: str, run_id: str, host: str | No
 
 
 def write_json(path: Path, value: Any) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        temporary.write_text(
             json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+        temporary.replace(path)
     except OSError as error:
         raise B7Error(f"cannot write {path}: {error}") from error
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def command_discover(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
@@ -934,6 +1068,16 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "state": "planned",
         "remote": {},
     }
+    if output.exists():
+        previous = load_json(output)
+        previous_state = previous.get("state")
+        same_run = previous.get("runId") == args.run_id
+        retryable = previous_state in ("planned", "cleaned", "prepare-rolled-back")
+        if not same_run or not retryable:
+            raise B7Error(
+                f"refusing to overwrite existing manifest in state {previous_state!r}; "
+                "run cleanup with that manifest or choose a new run id"
+            )
     if not args.execute:
         write_json(output, manifest)
         print(output)
@@ -949,16 +1093,42 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             rendered = render_role_config(
                 source, inventory, layout, role, args.run_id, case
             )
-            manifest["remote"][role] = prepare_remote_role(
+            manifest["remote"][role] = {
+                "status": "creating",
+                "target": ssh_target(node),
+                "runDir": layout["runDir"],
+                "storage": layout["storage"],
+                "config": layout["config"],
+            }
+            write_json(output, manifest)
+            prepared = prepare_remote_role(
                 node, inventory, layout, role, args.run_id, rendered
             )
-        manifest["remote"]["origin"] = prepare_origin(
-            inventory, origin, args.run_id
-        )
+            manifest["remote"][role].update(prepared)
+            manifest["remote"][role]["status"] = "prepared"
+            write_json(output, manifest)
+        manifest["remote"]["origin"] = {
+            "status": "creating",
+            "path": origin["path"],
+            "ownerMarker": origin["path"] + ".b7-owner.json",
+        }
+        write_json(output, manifest)
+        prepared_origin = prepare_origin(inventory, origin, args.run_id)
+        manifest["remote"]["origin"].update(prepared_origin)
+        manifest["remote"]["origin"]["status"] = "prepared"
+        write_json(output, manifest)
         manifest["state"] = "prepared"
     except B7Error as error:
         manifest["state"] = "prepare-failed"
         manifest["error"] = str(error)
+        write_json(output, manifest)
+        rollback_failures = rollback_preparation(manifest, output, inventory)
+        if rollback_failures:
+            manifest["state"] = "prepare-rollback-failed"
+            manifest["rollbackFailures"] = rollback_failures
+        else:
+            manifest["state"] = "prepare-rolled-back"
+            manifest.pop("rollbackFailures", None)
         write_json(output, manifest)
         raise
     write_json(output, manifest)
@@ -1182,30 +1352,65 @@ def command_cleanup(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         return 0
     failures = []
     prepared_roles = manifest.get("remote", {})
-    if not isinstance(prepared_roles, dict) or not any(
-        key in prepared_roles for key in ("parent", "child", "origin")
-    ):
-        raise B7Error("manifest records no prepared remote resources")
+    if not isinstance(prepared_roles, dict):
+        raise B7Error("manifest remote resources must be an object")
     for role in ("child", "parent"):
-        if role not in prepared_roles:
+        record = prepared_roles.get(role)
+        if record is None:
+            record = {"status": "recovering-legacy"}
+            prepared_roles[role] = record
+            write_json(args.manifest, manifest)
+        if not isinstance(record, dict):
+            failures.append(f"invalid {role} resource record")
+            continue
+        if record.get("status") in (
+            "cleaned",
+            "rolled-back",
+        ):
             continue
         layout = generated[role]
         node = inventory["nodes"][layout["node"]]
         try:
             cleanup_remote_role(node, inventory, layout, role, run_id)
+            record["status"] = "cleaned"
+            record.pop("cleanupError", None)
         except B7Error as error:
+            record["status"] = "cleanup-failed"
+            record["cleanupError"] = str(error)
             failures.append(str(error))
-    if not failures and "origin" in prepared_roles:
+        write_json(args.manifest, manifest)
+    origin_record = prepared_roles.get("origin")
+    if origin_record is None:
+        origin_record = {"status": "recovering-legacy"}
+        prepared_roles["origin"] = origin_record
+        write_json(args.manifest, manifest)
+    if not isinstance(origin_record, dict):
+        failures.append("invalid origin resource record")
+    elif origin_record.get("status") not in ("cleaned", "rolled-back"):
         try:
-            cleanup_origin(inventory, manifest["origin"], run_id)
+            if "ownerMarker" in origin_record:
+                cleanup_origin(
+                    inventory,
+                    manifest["origin"],
+                    run_id,
+                    origin_record["ownerMarker"],
+                )
+            else:
+                cleanup_legacy_origin(inventory, manifest["origin"], run_id)
+            origin_record["status"] = "cleaned"
+            origin_record.pop("cleanupError", None)
         except B7Error as error:
+            origin_record["status"] = "cleanup-failed"
+            origin_record["cleanupError"] = str(error)
             failures.append(str(error))
+        write_json(args.manifest, manifest)
     if failures:
         manifest["state"] = "cleanup-failed"
         manifest["cleanupFailures"] = failures
         write_json(args.manifest, manifest)
         raise B7Error("; ".join(failures))
     manifest["state"] = "cleaned"
+    manifest.pop("cleanupFailures", None)
     write_json(args.manifest, manifest)
     print(args.manifest)
     return 0

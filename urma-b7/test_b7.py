@@ -132,10 +132,114 @@ storage:
                 "host:\n  hostname: test\n",
             )
         script = execute.call_args.args[2]
-        self.assertIn("run directory already exists", script)
+        self.assertIn("prepare target already exists", script)
+        self.assertIn(".b7-preparing", script)
+        self.assertLess(
+            script.index('.b7-owner.json"'), script.index('mv -T "$staging" "$run_dir"')
+        )
         self.assertIn('ss -H -ltn "sport = :$port"', script)
         self.assertIn("/tmp/dragonfly-urma-b7/b7-test/parent", script)
         self.assertEqual(result["configSha256"], "abc123")
+
+    def test_prepare_origin_creates_owner_marker_before_link(self):
+        origin = b7.origin_artifact(self.inventory, "b7-test", "1g")
+        completed = b7.subprocess.CompletedProcess([], 0, stdout="abc123\n", stderr="")
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            result = b7.prepare_origin(self.inventory, origin, "b7-test")
+        script = execute.call_args.args[2]
+        self.assertIn("b7-test-1g.bin.b7-owner.json", script)
+        self.assertLess(script.index('> "$owner_marker"'), script.index('ln "$seed" "$target"'))
+        self.assertEqual(
+            result["ownerMarker"],
+            "/var/www/dragonfly/b7-test-1g.bin.b7-owner.json",
+        )
+
+    def test_prepare_failure_persists_steps_and_rolls_back_in_reverse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            observed = []
+
+            def prepare_role(_node, _inventory, _layout, role, _run_id, _rendered):
+                current = json.loads(manifest_path.read_text(encoding="utf-8"))
+                observed.append((role, current["remote"][role]["status"]))
+                return {"configSha256": f"sha-{role}"}
+
+            def fail_origin(_inventory, _origin, _run_id):
+                current = json.loads(manifest_path.read_text(encoding="utf-8"))
+                observed.append(("origin", current["remote"]["origin"]["status"]))
+                raise b7.B7Error("injected origin failure")
+
+            rollback_order = []
+            with (
+                mock.patch.object(b7, "read_remote_file", return_value="host: {}\n"),
+                mock.patch.object(b7, "render_role_config", return_value="host: {}\n"),
+                mock.patch.object(b7, "prepare_remote_role", side_effect=prepare_role),
+                mock.patch.object(b7, "prepare_origin", side_effect=fail_origin),
+                mock.patch.object(
+                    b7,
+                    "cleanup_origin",
+                    side_effect=lambda *_args, **_kwargs: rollback_order.append("origin"),
+                ),
+                mock.patch.object(
+                    b7,
+                    "cleanup_remote_role",
+                    side_effect=lambda _node, _inventory, _layout, role, _run_id: rollback_order.append(role),
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(
+                        [
+                            "prepare",
+                            "--mode",
+                            "dual",
+                            "--run-id",
+                            "b7-transaction",
+                            "--output",
+                            str(manifest_path),
+                            "--execute",
+                        ]
+                    ),
+                    2,
+                )
+            self.assertEqual(
+                observed,
+                [("parent", "creating"), ("child", "creating"), ("origin", "creating")],
+            )
+            self.assertEqual(rollback_order, ["origin", "child", "parent"])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["state"], "prepare-rolled-back")
+            self.assertEqual(manifest["error"], "injected origin failure")
+            self.assertTrue(
+                all(
+                    manifest["remote"][resource]["status"] == "rolled-back"
+                    for resource in ("parent", "child", "origin")
+                )
+            )
+
+    def test_prepare_refuses_to_overwrite_unfinished_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps({"runId": "b7-transaction", "state": "prepare-failed"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                b7.main(
+                    [
+                        "prepare",
+                        "--mode",
+                        "dual",
+                        "--run-id",
+                        "b7-transaction",
+                        "--output",
+                        str(manifest_path),
+                        "--execute",
+                    ]
+                ),
+                2,
+            )
+            preserved = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(preserved["state"], "prepare-failed")
 
     def test_dfget_uses_iteration_specific_output_and_log(self):
         _, _, generated = b7.generated_layout(self.inventory, "dual", "b7-test", None)
@@ -203,6 +307,67 @@ storage:
         self.assertIn(".b7-owner.json", script)
         self.assertIn("refusing cleanup while owned pid", script)
         self.assertIn("/var/lib/dragonfly-b7/b7-test/child", script)
+
+    def test_cleanup_recovers_legacy_prepare_with_empty_remote_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-legacy",
+                    "--output",
+                    str(manifest_path),
+                ]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["state"] = "prepare-failed"
+            manifest["remote"] = {}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            cleaned = []
+            with (
+                mock.patch.object(
+                    b7,
+                    "cleanup_remote_role",
+                    side_effect=lambda _node, _inventory, _layout, role, _run_id: cleaned.append(role),
+                ),
+                mock.patch.object(
+                    b7,
+                    "cleanup_legacy_origin",
+                    side_effect=lambda *_args: cleaned.append("origin"),
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(
+                        [
+                            "cleanup",
+                            "--manifest",
+                            str(manifest_path),
+                            "--execute",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(cleaned, ["child", "parent", "origin"])
+            recovered = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(recovered["state"], "cleaned")
+            self.assertTrue(
+                all(
+                    recovered["remote"][resource]["status"] == "cleaned"
+                    for resource in ("parent", "child", "origin")
+                )
+            )
+
+    def test_legacy_origin_cleanup_requires_seed_hard_link(self):
+        origin = b7.origin_artifact(self.inventory, "b7-legacy", "1g")
+        completed = b7.subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            b7.cleanup_legacy_origin(self.inventory, origin, "b7-legacy")
+        script = execute.call_args.args[2]
+        self.assertIn('if [ ! "$target" -ef "$seed" ]', script)
+        self.assertIn("refusing legacy origin cleanup", script)
 
     def test_execute_run_orders_parent_preheat_before_child(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -60,10 +60,21 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 - 不停止非本轮启动的进程；
 - `plan` 永不执行 `mutates=true` 的步骤，其他变更命令必须显式指定 `--execute`；
 - `prepare` 在任何远端变更前先写 `state=preparing` manifest，便于部分失败后按已记录资源恢复；
+- `prepare` 对 parent、child、origin 使用 write-ahead resource record，并在每一步开始和完成后原子替换
+  manifest；任一步失败会按 origin、child、parent 的逆序自动 rollback，每个 rollback 结果也立即持久化；
+- role 目录先在带 owner marker 的 staging directory 中建立，再原子发布；origin 使用独立 sidecar owner
+  marker。自动 rollback 只删除能证明属于当前 run 的资源，无法证明所有权时保留现场并写入
+  `prepare-rollback-failed`；
+- 未完成事务的 manifest 不允许被后续 `prepare` 覆盖。`planned`、`cleaned` 或
+  `prepare-rolled-back` 状态才允许使用同一 run ID 重新 prepare；
 - start/stop 只接受 `.b7-owner.json` 与 manifest 一致的目录；stop 还会校验 `/proc/<pid>/cmdline`
   中的精确 dfdaemon binary/config，超时只报告错误，不自动 SIGKILL；
 - 后续 cleanup 只能处理 `/tmp/dragonfly-urma-b7/<run-id>`、
   `/var/lib/dragonfly-b7/<run-id>` 和 `/var/www/dragonfly/b7-<run-id>-*`；
+- 显式 `cleanup` 同样逐资源持久化结果；一个资源清理失败时仍会继续尝试其他已记录资源；
+- 对旧版工具留下且 manifest resource record 已丢失的 partial prepare，显式 `cleanup --execute` 会尝试
+  安全恢复：role 必须带匹配当前 run 的 owner marker，origin 必须与配置的 seed 是同一 inode 的硬链接；
+  任一校验不通过都会保留现场而不是猜测删除；
 - parent 预热和 announce 完成后才能启动 child，避免 scheduler 反向选择 node2。
 
 ## 单机模式
