@@ -31,7 +31,10 @@ LOG_TIMESTAMP_RE = re.compile(
     r"^(?P<second>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
     r"(?:\.(?P<fraction>\d{1,9}))?Z\b"
 )
-TASK_ID_RE = re.compile(r'\btask_id="([^"]+)"')
+# tracing fmt renders recorded string fields differently depending on whether they
+# were recorded with Debug (`task_id="..."`) or Display (`task_id=...`). Parent
+# `urma_piece` spans use Display, while several child spans use Debug.
+TASK_ID_RE = re.compile(r'\btask_id="?([A-Za-z0-9._:-]+)"?')
 LANE_ID_RE = re.compile(r"\blane_id=(\d+)")
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),

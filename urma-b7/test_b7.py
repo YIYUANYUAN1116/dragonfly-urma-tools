@@ -931,6 +931,21 @@ storage:
         with self.assertRaisesRegex(b7.B7Error, "distinct"):
             b7.analyze_fanout_lanes(log.replace("lane_id=4", "lane_id=3"), {"task-a", "task-b"})
 
+    def test_fanout_lane_evidence_accepts_unquoted_parent_span_task_ids(self):
+        log = "\n".join(
+            (
+                "2026-08-31T16:00:00Z DEBUG urma_piece{task_id=f786 piece_id=f786-0}: "
+                "lane_id=1 piece_number=0 start upload piece content over urma",
+                "2026-08-31T16:00:00Z DEBUG urma_piece{task_id=241f piece_id=241f-0}: "
+                "lane_id=2 piece_number=0 start upload piece content over urma",
+            )
+        )
+        summary = b7.analyze_fanout_lanes(log, {"f786", "241f"})
+        self.assertEqual(summary["laneByTask"], {"f786": 1, "241f": 2})
+        scoped = b7.filter_task_scoped_log(log, {"f786"})
+        self.assertIn("task_id=f786", scoped)
+        self.assertNotIn("task_id=241f", scoped)
+
     def test_task_timing_summary_uses_only_supplied_measured_samples(self):
         samples = [
             {
