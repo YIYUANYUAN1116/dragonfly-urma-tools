@@ -9,7 +9,8 @@ UMDK 行为参考，不提供替代数据路径。
 - `plan`：生成双机或单机双实例的确定性执行计划，不执行其中的变更操作。
 - `render-config`：从现有 YAML 生成隔离配置，不覆盖源文件；
 - `prepare`：生成 manifest；只有显式 `--execute` 才在远端创建隔离目录、配置和唯一 origin 链接；
-- `run`：只有显式 `--execute` 才启动本轮 dfdaemon、完成一次预热/P2P correctness 并采集证据；
+- `run`：只有显式 `--execute` 才启动本轮 dfdaemon，按 case 完成 warmup/measured P2P
+  传输并采集证据；
 - `cleanup`：只有显式 `--execute` 且 owner/PID/path gate 全部通过才删除本轮资源。
 
 ## 快速使用
@@ -71,11 +72,23 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 后续真实执行器会先做 provider loopback smoke。如果同一 device/EID 不支持双进程 RC Jetty，结果应标记
 为 `UNSUPPORTED`，不能冒充真实 URMA E2E PASS。
 
+## Performance case
+
+`cases.json` 中的 performance case 会真实执行 `warmups` 和 `repetitions`，不是只记录矩阵参数。每轮
+parent 先完成 preheat，child 再使用 `--disable-back-to-source` 下载；父子使用相同的 `--tag`，而不同
+轮次使用不同 tag，避免后续轮次命中前一轮 task cache。warmup 结果保存但不参与汇总，measured sample
+输出单轮耗时/吞吐及 min、median、mean、p95、max、aggregate 吞吐。一次 2 warmup + 5 repetitions 的
+1 GiB case 会在 parent/child 各创建 7 个独立 task，执行前需要为两侧隔离 storage 预留足够空间，结束后
+使用 `cleanup` 回收。
+
+主证据文件只包含一次 selected-events 扫描和运行中 metrics，不再拼接可能重复的 log tail。工具在发送
+SIGTERM 前记录日志行偏移，停止两端后将新增内容分别保存为 `parent.shutdown.log` 和
+`child.shutdown.log`。受控停机引发的 peer `early eof` 单独计为 `peerCloseEvents`；其他 CQE、completion、
+protocol、digest、Jetty 或 panic 错误会使本轮失败。
+
 ## 当前限制与后续层
 
-当前 `run` 完成单次 standard-task correctness：唯一 origin、parent preheat、child
-`--disable-back-to-source`、三方 SHA-256、URMA 日志/metrics 证据以及有序 shutdown。远端 SSH 当前尚未
-在本开发环境连通，因此执行路径需要先在可访问测试网的控制机做 smoke。
-
-后续继续增加 repetitions/warmup matrix、吞吐统计、persistent/persistent-cache、failpoint、双 lane
-定向中断和 shutdown case；在这些完成前，`cases.json` 中的 performance 条目只是矩阵种子。
+当前 `run` 支持 standard-task correctness 与顺序执行的 performance repetitions：唯一 origin、逐轮
+parent preheat、child `--disable-back-to-source`、逐轮三方 SHA-256、URMA 日志/metrics 证据以及有序
+shutdown。后续仍需增加 persistent/persistent-cache、failpoint、双 lane 定向中断和带 outstanding WR
+的专项 shutdown case。

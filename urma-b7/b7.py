@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -362,8 +363,13 @@ def run_remote_dfget(
     layout: dict[str, Any],
     url: str,
     disable_back_to_source: bool,
+    task_tag: str,
+    artifact_suffix: str,
 ) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", artifact_suffix):
+        raise B7Error(f"invalid transfer artifact suffix: {artifact_suffix}")
     binary = str(PurePosixPath(node["repo"]) / inventory["dragonfly"]["binaryRelativePaths"]["dfget"])
+    transfer_log = f"{layout['transferLog']}.{artifact_suffix}"
     args = [
         binary,
         "--endpoint",
@@ -372,6 +378,8 @@ def run_remote_dfget(
         "-O",
         layout["output"],
         "--overwrite",
+        "--tag",
+        task_tag,
     ]
     if disable_back_to_source:
         args.append("--disable-back-to-source")
@@ -381,10 +389,10 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY='*' no_proxy='*'
 export LD_LIBRARY_PATH={shlex.quote(inventory['urma']['libDir'])}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
 start=$(date +%s%N)
-timeout 600 {command} >{shlex.quote(layout['transferLog'])} 2>&1
+timeout 600 {command} >{shlex.quote(transfer_log)} 2>&1
 status=$?
 end=$(date +%s%N)
-if [ "$status" -ne 0 ]; then tail -n 100 {shlex.quote(layout['transferLog'])} >&2 || true; exit "$status"; fi
+if [ "$status" -ne 0 ]; then tail -n 100 {shlex.quote(transfer_log)} >&2 || true; exit "$status"; fi
 bytes=$(stat -c %s {shlex.quote(layout['output'])})
 sha=$(sha256sum {shlex.quote(layout['output'])} | awk '{{print $1}}')
 printf '%s\\t%s\\t%s\\n' "$bytes" "$sha" "$((end-start))"
@@ -395,7 +403,13 @@ printf '%s\\t%s\\t%s\\n' "$bytes" "$sha" "$((end-start))"
     fields = completed.stdout.strip().split("\t")
     if len(fields) != 3:
         raise B7Error(f"unexpected dfget result from {ssh_target(node)}")
-    return {"bytes": int(fields[0]), "sha256": fields[1], "elapsedNs": int(fields[2])}
+    return {
+        "bytes": int(fields[0]),
+        "sha256": fields[1],
+        "elapsedNs": int(fields[2]),
+        "taskTag": task_tag,
+        "transferLog": transfer_log,
+    }
 
 
 def collect_remote_evidence(
@@ -406,9 +420,7 @@ def collect_remote_evidence(
     script = f"""set -u
 {{
   echo '=== selected events ==='
-  grep -E 'urma|fallback|digest|piece finished|peer lane|CQE|flush' {log} 2>/dev/null || true
-  echo '=== tail ==='
-  tail -n 400 {log} 2>/dev/null || true
+  grep -Ei 'urma|fallback|digest|piece finished|peer lane|cqe|flush' {log} 2>/dev/null || true
   echo '=== metrics ==='
   curl -fsS --max-time 3 http://127.0.0.1:{metrics_port}/metrics 2>/dev/null | grep -E 'dragonfly.*urma' || true
 }} | base64 | tr -d '\\n'
@@ -416,6 +428,43 @@ def collect_remote_evidence(
     completed = ssh_script(node, inventory, script, timeout=15)
     if completed.returncode != 0:
         raise B7Error(f"cannot collect evidence from {ssh_target(node)}")
+    return decode_b64(completed.stdout.strip())
+
+
+def remote_log_line_count(
+    node: dict[str, Any], inventory: dict[str, Any], layout: dict[str, Any]
+) -> int:
+    log = shlex.quote(layout["log"])
+    completed = ssh_script(
+        node,
+        inventory,
+        f"set -eu\ntest -f {log}\nwc -l < {log}\n",
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        raise B7Error(f"cannot inspect log on {ssh_target(node)}")
+    try:
+        return int(completed.stdout.strip())
+    except ValueError as error:
+        raise B7Error(f"invalid log line count from {ssh_target(node)}") from error
+
+
+def collect_remote_log_since(
+    node: dict[str, Any],
+    inventory: dict[str, Any],
+    layout: dict[str, Any],
+    first_line: int,
+) -> str:
+    if first_line < 1:
+        raise B7Error("first log line must be positive")
+    log = shlex.quote(layout["log"])
+    script = (
+        f"set -eu\ntest -f {log}\n"
+        f"sed -n '{first_line},$p' {log} | base64 | tr -d '\\n'\n"
+    )
+    completed = ssh_script(node, inventory, script, timeout=15)
+    if completed.returncode != 0:
+        raise B7Error(f"cannot collect shutdown log from {ssh_target(node)}")
     return decode_b64(completed.stdout.strip())
 
 
@@ -429,6 +478,12 @@ def analyze_evidence(parent: str, child: str) -> dict[str, int]:
         "childUrmaSuccesses": sum("success=true" in line for line in child_attempt_lines),
         "laneFinished": parent.count("urma piece finished on peer lane")
         + child.count("urma piece finished on peer lane"),
+        "laneEstablished": parent.count("urma peer lane established")
+        + child.count("urma peer lane established"),
+        "reusedSessionFalse": parent.count("reused_session=false")
+        + child.count("reused_session=false"),
+        "reusedSessionTrue": parent.count("reused_session=true")
+        + child.count("reused_session=true"),
         "fallbackErrors": sum(
             text.count(pattern)
             for text in (parent, child)
@@ -438,12 +493,77 @@ def analyze_evidence(parent: str, child: str) -> dict[str, int]:
                 "failed to download piece over urma",
             )
         ),
+        "transferErrors": sum(
+            bool(
+                re.search(
+                    r"cqe.*error|completion error|protocol error|"
+                    r"digest.*(?:error|mismatch)|unknown.*jetty|panic",
+                    line,
+                    re.IGNORECASE,
+                )
+            )
+            for text in (parent, child)
+            for line in text.splitlines()
+        ),
     }
     if summary["parentUrmaFinished"] == 0 or summary["childUrmaSuccesses"] == 0:
         raise B7Error("content matched but logs do not prove an URMA Piece transfer")
     if summary["fallbackErrors"] != 0:
         raise B7Error("URMA fallback/error evidence was found in the correctness run")
+    if summary["childUrmaAttempts"] != summary["childUrmaSuccesses"]:
+        raise B7Error("one or more child URMA Piece attempts failed")
+    if summary["parentUrmaFinished"] != summary["childUrmaSuccesses"]:
+        raise B7Error("parent/child URMA Piece completion counts differ")
+    if summary["transferErrors"] != 0:
+        raise B7Error("URMA transport error evidence was found before shutdown")
     return summary
+
+
+def analyze_shutdown_evidence(parent: str, child: str) -> dict[str, int]:
+    error_pattern = re.compile(
+        r"cqe.*error|completion error|protocol error|digest.*(?:error|mismatch)|"
+        r"unknown.*jetty|panic",
+        re.IGNORECASE,
+    )
+    relevant = [
+        line
+        for text in (parent, child)
+        for line in text.splitlines()
+        if error_pattern.search(line)
+    ]
+    peer_close = [line for line in relevant if "early eof" in line.lower()]
+    unexpected = [line for line in relevant if "early eof" not in line.lower()]
+    summary = {
+        "peerCloseEvents": len(peer_close),
+        "unexpectedErrors": len(unexpected),
+    }
+    if unexpected:
+        raise B7Error("unexpected URMA error evidence was found during shutdown")
+    return summary
+
+
+def transfer_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise B7Error("at least one measured transfer sample is required")
+    child_samples = [sample["child"] for sample in samples]
+    rates = [sample["throughputMiBps"] for sample in child_samples]
+    total_bytes = sum(sample["bytes"] for sample in child_samples)
+    total_elapsed_ns = sum(sample["elapsedNs"] for sample in child_samples)
+    ordered = sorted(rates)
+    p95_index = max(0, (len(ordered) * 95 + 99) // 100 - 1)
+    return {
+        "samples": len(samples),
+        "totalBytes": total_bytes,
+        "totalElapsedNs": total_elapsed_ns,
+        "throughputMiBps": {
+            "min": min(rates),
+            "median": statistics.median(rates),
+            "mean": statistics.fmean(rates),
+            "p95": ordered[p95_index],
+            "max": max(rates),
+            "aggregate": total_bytes * 1_000_000_000 / total_elapsed_ns / (1024 * 1024),
+        },
+    }
 
 
 def stop_remote_role(
@@ -821,13 +941,24 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     generated = manifest.get("generated")
     if not isinstance(generated, dict) or not {"parent", "child"}.issubset(generated):
         raise B7Error("manifest has no generated parent/child layout")
+    case = manifest.get("case")
+    if not isinstance(case, dict):
+        raise B7Error("manifest has no case")
+    repetitions = case.get("repetitions")
+    warmups = case.get("warmups", 0)
+    if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
+        raise B7Error("manifest repetitions must be in 1..=100")
+    if not isinstance(warmups, int) or not 0 <= warmups <= 20:
+        raise B7Error("manifest warmups must be in 0..=20")
     operations = [
         "start parent",
-        "preheat unique task on parent",
+        f"run {warmups} warmup and {repetitions} measured uniquely tagged tasks",
+        "preheat each unique task on parent",
         "start child",
-        "download with --disable-back-to-source",
+        "download each task on child with --disable-back-to-source",
         "compare SHA-256 and collect evidence",
         "SIGTERM only the two manifest-owned dfdaemon PIDs",
+        "collect and analyze post-SIGTERM log evidence",
     ]
     if not args.execute:
         print(json.dumps({"runId": run_id, "dryRun": True, "operations": operations}, indent=2))
@@ -840,48 +971,82 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     parent_node = inventory["nodes"][parent_layout["node"]]
     child_node = inventory["nodes"][child_layout["node"]]
     started: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
-    result: dict[str, Any] = {"started": {}, "transfer": {}, "stopped": {}}
+    result: dict[str, Any] = {
+        "started": {},
+        "transfer": {"warmups": [], "samples": []},
+        "stopped": {},
+    }
     failure: B7Error | None = None
     evidence_dir = args.manifest.parent / "evidence"
+    shutdown_offsets: dict[str, int] = {}
     try:
         result["started"]["parent"] = start_remote_role(
             parent_node, inventory, parent_layout, "parent", run_id
         )
         started.append(("parent", parent_node, parent_layout))
-        result["transfer"]["parent"] = run_remote_dfget(
-            parent_node,
-            inventory,
-            parent_layout,
-            manifest["origin"]["url"],
-            False,
-        )
-        result["started"]["child"] = start_remote_role(
-            child_node, inventory, child_layout, "child", run_id
-        )
-        started.append(("child", child_node, child_layout))
-        result["transfer"]["child"] = run_remote_dfget(
-            child_node,
-            inventory,
-            child_layout,
-            manifest["origin"]["url"],
-            True,
-        )
-        hashes = {
-            manifest["remote"]["origin"]["sha256"],
-            result["transfer"]["parent"]["sha256"],
-            result["transfer"]["child"]["sha256"],
-        }
-        lengths = {
-            result["transfer"]["parent"]["bytes"],
-            result["transfer"]["child"]["bytes"],
-        }
-        if len(hashes) != 1 or len(lengths) != 1:
-            raise B7Error("origin/parent/child content identity check failed")
-        child_transfer = result["transfer"]["child"]
-        child_transfer["throughputMiBps"] = (
-            child_transfer["bytes"] * 1_000_000_000
-            / child_transfer["elapsedNs"]
-            / (1024 * 1024)
+        iteration_specs = [
+            ("warmups", index, f"{run_id}-warmup-{index:03d}")
+            for index in range(1, warmups + 1)
+        ] + [
+            ("samples", index, f"{run_id}-sample-{index:03d}")
+            for index in range(1, repetitions + 1)
+        ]
+        child_started = False
+        for group, index, task_tag in iteration_specs:
+            suffix = f"{'warmup' if group == 'warmups' else 'sample'}-{index:03d}"
+            parent_transfer = run_remote_dfget(
+                parent_node,
+                inventory,
+                parent_layout,
+                manifest["origin"]["url"],
+                False,
+                task_tag,
+                suffix,
+            )
+            if not child_started:
+                result["started"]["child"] = start_remote_role(
+                    child_node, inventory, child_layout, "child", run_id
+                )
+                started.append(("child", child_node, child_layout))
+                child_started = True
+            child_transfer = run_remote_dfget(
+                child_node,
+                inventory,
+                child_layout,
+                manifest["origin"]["url"],
+                True,
+                task_tag,
+                suffix,
+            )
+            hashes = {
+                manifest["remote"]["origin"]["sha256"],
+                parent_transfer["sha256"],
+                child_transfer["sha256"],
+            }
+            lengths = {parent_transfer["bytes"], child_transfer["bytes"]}
+            if len(hashes) != 1 or len(lengths) != 1:
+                raise B7Error(
+                    f"origin/parent/child identity check failed for {task_tag}"
+                )
+            child_transfer["throughputMiBps"] = (
+                child_transfer["bytes"] * 1_000_000_000
+                / child_transfer["elapsedNs"]
+                / (1024 * 1024)
+            )
+            result["transfer"][group].append(
+                {
+                    "index": index,
+                    "taskTag": task_tag,
+                    "parent": parent_transfer,
+                    "child": child_transfer,
+                }
+            )
+        first_sample = result["transfer"]["samples"][0]
+        # Preserve the original single-sample fields for existing manifest consumers.
+        result["transfer"]["parent"] = first_sample["parent"]
+        result["transfer"]["child"] = first_sample["child"]
+        result["transfer"]["summary"] = transfer_summary(
+            result["transfer"]["samples"]
         )
         evidence_dir.mkdir(parents=True, exist_ok=True)
         evidence_by_role = {}
@@ -901,6 +1066,13 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         manifest["state"] = "run-failed"
         manifest["error"] = str(failure)
     finally:
+        for role, node, layout in started:
+            try:
+                shutdown_offsets[role] = remote_log_line_count(node, inventory, layout)
+            except B7Error as offset_error:
+                if failure is None:
+                    failure = offset_error
+                manifest["state"] = "stop-failed"
         for role, node, layout in reversed(started):
             try:
                 result["stopped"][role] = stop_remote_role(
@@ -911,6 +1083,38 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 manifest["state"] = "stop-failed"
                 if failure is None:
                     failure = stop_error
+        shutdown_by_role: dict[str, str] = {}
+        for role, node, layout in started:
+            if role not in shutdown_offsets:
+                continue
+            try:
+                shutdown_log = collect_remote_log_since(
+                    node, inventory, layout, shutdown_offsets[role] + 1
+                )
+                shutdown_by_role[role] = shutdown_log
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                (evidence_dir / f"{role}.shutdown.log").write_text(
+                    shutdown_log, encoding="utf-8"
+                )
+            except (B7Error, OSError) as shutdown_error:
+                if failure is None:
+                    failure = (
+                        shutdown_error
+                        if isinstance(shutdown_error, B7Error)
+                        else B7Error(str(shutdown_error))
+                    )
+                manifest["state"] = "stop-failed"
+        if {"parent", "child"}.issubset(shutdown_by_role):
+            try:
+                result["shutdownEvidence"] = analyze_shutdown_evidence(
+                    shutdown_by_role["parent"], shutdown_by_role["child"]
+                )
+            except B7Error as shutdown_error:
+                manifest["state"] = "stop-failed"
+                if failure is None:
+                    failure = shutdown_error
+        if failure is not None:
+            manifest["error"] = str(failure)
         manifest["result"] = result
         write_json(args.manifest, manifest)
     if failure is not None:
@@ -1006,7 +1210,7 @@ def parser() -> argparse.ArgumentParser:
         help="perform the remote mutations; omitted means manifest-only dry-run",
     )
     run = subparsers.add_parser(
-        "run", help="execute one prepared correctness case and collect evidence"
+        "run", help="execute one prepared correctness or performance case"
     )
     run.add_argument("--manifest", type=Path, required=True)
     run.add_argument(
