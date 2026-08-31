@@ -97,6 +97,16 @@ def standard_task_id(url: str, tag: str) -> str:
     return digest.hexdigest()
 
 
+def last_task_id(line: str) -> str | None:
+    matches = list(TASK_ID_RE.finditer(line))
+    return matches[-1].group(1) if matches else None
+
+
+def last_lane_id(line: str) -> int | None:
+    matches = list(LANE_ID_RE.finditer(line))
+    return int(matches[-1].group(1)) if matches else None
+
+
 def default_run_id() -> str:
     return "b7-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ").lower()
 
@@ -868,21 +878,19 @@ def analyze_task_timing(
     ]
     if not completion_lines:
         raise B7Error("no child URMA Piece completion found in task log range")
-    task_id_matches = [TASK_ID_RE.search(line) for line in completion_lines]
-    if any(match is None for match in task_id_matches):
+    completion_task_ids = [last_task_id(line) for line in completion_lines]
+    if any(task_id is None for task_id in completion_task_ids):
         raise B7Error("task log Piece completion is missing task_id")
     if expected_task_id is not None:
         completion_lines = [
-            line
-            for line, match in zip(completion_lines, task_id_matches)
-            if match is not None and match.group(1) == expected_task_id
+            line for line in completion_lines if last_task_id(line) == expected_task_id
         ]
         if not completion_lines:
             raise B7Error(
                 f"no child URMA Piece completion found for task {expected_task_id}"
             )
-        task_id_matches = [TASK_ID_RE.search(line) for line in completion_lines]
-    task_ids = {match.group(1) for match in task_id_matches if match is not None}
+        completion_task_ids = [last_task_id(line) for line in completion_lines]
+    task_ids = {task_id for task_id in completion_task_ids if task_id is not None}
     if len(task_ids) != 1:
         raise B7Error("task log range contains missing or mixed task ids")
     timestamps = [parse_log_timestamp_ns(line) for line in completion_lines]
@@ -913,41 +921,134 @@ def filter_task_scoped_log(task_log: str, task_ids: set[str]) -> str:
         return ""
     selected = []
     for line in task_log.splitlines():
-        match = TASK_ID_RE.search(line)
-        if match is not None and match.group(1) in task_ids:
+        if last_task_id(line) in task_ids:
             selected.append(line)
     return "\n".join(selected) + ("\n" if selected else "")
 
 
 def analyze_fanout_lanes(parent_log: str, task_ids: set[str]) -> dict[str, Any]:
-    """Prove that every fanout task used one distinct server-side lane."""
-    lanes_by_task: dict[str, set[int]] = {task_id: set() for task_id in task_ids}
-    for line in parent_log.splitlines():
-        task_match = TASK_ID_RE.search(line)
-        lane_match = LANE_ID_RE.search(line)
-        if task_match is None or lane_match is None:
-            continue
-        task_id = task_match.group(1)
-        if task_id in lanes_by_task:
-            lanes_by_task[task_id].add(int(lane_match.group(1)))
-    missing = sorted(task_id for task_id, lanes in lanes_by_task.items() if not lanes)
-    mixed = sorted(task_id for task_id, lanes in lanes_by_task.items() if len(lanes) != 1)
-    if missing:
-        raise B7Error(f"fanout parent log has no lane evidence for tasks: {missing}")
-    if mixed:
-        raise B7Error(f"fanout tasks used mixed server lanes: {mixed}")
-    lane_by_task = {
-        task_id: next(iter(lanes)) for task_id, lanes in lanes_by_task.items()
+    """Describe server-side Piece attempts without hiding lane churn."""
+    counts_by_task: dict[str, dict[int, int]] = {
+        task_id: {} for task_id in task_ids
     }
-    distinct_lanes = set(lane_by_task.values())
-    if 0 in distinct_lanes:
-        raise B7Error("fanout parent log contains an unbound lane ID 0")
-    if len(distinct_lanes) != len(task_ids):
-        raise B7Error("fanout tasks did not use distinct server-side lanes")
+    for line in parent_log.splitlines():
+        if "start upload piece content over urma" not in line:
+            continue
+        task_id = last_task_id(line)
+        lane_id = last_lane_id(line)
+        if task_id in counts_by_task and lane_id is not None:
+            counts = counts_by_task[task_id]
+            counts[lane_id] = counts.get(lane_id, 0) + 1
+    lane_ids_by_task = {
+        task_id: sorted(counts) for task_id, counts in counts_by_task.items()
+    }
+    missing = sorted(task_id for task_id, lanes in lane_ids_by_task.items() if not lanes)
+    churn = sorted(task_id for task_id, lanes in lane_ids_by_task.items() if len(lanes) > 1)
+    unbound = sorted(task_id for task_id, lanes in lane_ids_by_task.items() if 0 in lanes)
+    stable_lane_by_task = {
+        task_id: lanes[0]
+        for task_id, lanes in lane_ids_by_task.items()
+        if len(lanes) == 1 and lanes[0] != 0
+    }
+    stable_lanes = list(stable_lane_by_task.values())
+    duplicate_stable_lanes = sorted(
+        lane_id for lane_id in set(stable_lanes) if stable_lanes.count(lane_id) > 1
+    )
+    all_lanes = sorted(
+        {lane_id for lanes in lane_ids_by_task.values() for lane_id in lanes}
+    )
     return {
-        "laneCount": len(distinct_lanes),
-        "laneIds": sorted(distinct_lanes),
-        "laneByTask": lane_by_task,
+        "stable": not missing
+        and not churn
+        and not unbound
+        and not duplicate_stable_lanes
+        and len(stable_lane_by_task) == len(task_ids),
+        "laneCount": len(all_lanes),
+        "laneIds": all_lanes,
+        "laneIdsByTask": lane_ids_by_task,
+        "pieceAttemptsByTaskAndLane": {
+            task_id: {str(lane_id): count for lane_id, count in sorted(counts.items())}
+            for task_id, counts in counts_by_task.items()
+        },
+        "stableLaneByTask": stable_lane_by_task,
+        "missingTaskIds": missing,
+        "churnTaskIds": churn,
+        "unboundLaneTaskIds": unbound,
+        "duplicateStableLaneIds": duplicate_stable_lanes,
+    }
+
+
+def prometheus_counter_value(
+    evidence: str, metric: str, required_labels: tuple[str, ...]
+) -> float:
+    total = 0.0
+    for line in evidence.splitlines():
+        if not line.startswith(metric) or not all(label in line for label in required_labels):
+            continue
+        fields = line.rsplit(None, 1)
+        if len(fields) != 2:
+            continue
+        try:
+            total += float(fields[1])
+        except ValueError:
+            continue
+    return total
+
+
+def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any]:
+    combined = parent + "\n" + children
+    lower_parent = parent.lower()
+    lower_children = children.lower()
+    fallback_patterns = (
+        "urma download failed, fall back to tcp downloader",
+        "restarting over tcp",
+        "recently failed over urma",
+        "failed its previous urma transfer",
+        "failed to download piece over urma",
+    )
+    return {
+        "txBudgetPressure": {
+            "required": prometheus_counter_value(
+                parent,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="tx"', 'stage="required"'),
+            ),
+            "optional": prometheus_counter_value(
+                parent,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="tx"', 'stage="optional"'),
+            ),
+        },
+        "txBufferUnavailableLines": sum(
+            ("bufferunavailable" in line.lower() or "buffer unavailable" in line.lower())
+            and "tx" in line.lower()
+            for line in parent.splitlines()
+        ),
+        "txOptionalSingleRingFallbacks": lower_parent.count(
+            "urma tx second lease unavailable"
+        ),
+        "busyOrRejectLines": sum(
+            any(pattern in line.lower() for pattern in ("peer rejected", "code=busy", "error_code_busy"))
+            for line in combined.splitlines()
+        ),
+        "sessionRetirementLines": sum(
+            any(
+                pattern in line.lower()
+                for pattern in (
+                    "retiring cached urma client",
+                    "retire the cached peer session",
+                    "failed its previous urma transfer",
+                )
+            )
+            for line in children.splitlines()
+        ),
+        "tcpFallbackLines": sum(
+            any(pattern in line.lower() for pattern in fallback_patterns)
+            for line in children.splitlines()
+        ),
+        "previousTransferFailureLines": lower_children.count(
+            "previous urma transfer failed"
+        ),
     }
 
 
@@ -1848,6 +1949,7 @@ def command_run_fanout(
             started.append((role, child_node, layout))
         evidence_dir.mkdir(parents=True, exist_ok=True)
         server_lane_by_role: dict[str, int] = {}
+        fanout_validation_failures: list[str] = []
         for group, index, label, workers in iteration_batches:
             batch_suffix = f"{label}-{index:03d}"
             parent_log_first = remote_log_line_count(
@@ -1899,9 +2001,15 @@ def command_run_fanout(
                     encoding="utf-8",
                 )
                 child_scoped[role] = scoped_name
-                child_transfer["taskTiming"] = analyze_task_timing(
-                    child_transfer, task_log, expected_task_id
-                )
+                try:
+                    child_transfer["taskTiming"] = analyze_task_timing(
+                        child_transfer, task_log, expected_task_id
+                    )
+                except B7Error as timing_error:
+                    child_transfer["taskTimingError"] = str(timing_error)
+                    fanout_validation_failures.append(
+                        f"{batch_suffix}/{role}: {timing_error}"
+                    )
                 parent_transfer = parent_transfers[task_tag]
                 hashes = {
                     manifest["remote"]["origin"]["sha256"],
@@ -1939,13 +2047,23 @@ def command_run_fanout(
             )
             lane_evidence = analyze_fanout_lanes(parent_task_log, task_ids)
             lane_by_role = {}
+            if not lane_evidence["stable"]:
+                fanout_validation_failures.append(
+                    f"{batch_suffix}: unstable server lanes "
+                    f"missing={lane_evidence['missingTaskIds']} "
+                    f"churn={lane_evidence['churnTaskIds']} "
+                    f"unbound={lane_evidence['unboundLaneTaskIds']} "
+                    f"duplicates={lane_evidence['duplicateStableLaneIds']}"
+                )
             for transfer in batch_transfers:
                 role = transfer["role"]
                 task_id = transfer["child"]["expectedTaskId"]
-                lane_id = lane_evidence["laneByTask"][task_id]
+                lane_id = lane_evidence["stableLaneByTask"].get(task_id)
+                if lane_id is None:
+                    continue
                 previous = server_lane_by_role.setdefault(role, lane_id)
                 if previous != lane_id:
-                    raise B7Error(
+                    fanout_validation_failures.append(
                         f"fanout role {role} changed server lane from {previous} to {lane_id}"
                     )
                 lane_by_role[role] = lane_id
@@ -1969,9 +2087,20 @@ def command_run_fanout(
         result["transfer"]["summary"] = transfer_summary(
             result["transfer"]["samples"]
         )
-        result["transfer"]["taskTimingSummary"] = task_timing_summary(
-            result["transfer"]["samples"]
-        )
+        measured_with_timing = [
+            sample
+            for sample in result["transfer"]["samples"]
+            if "taskTiming" in sample["child"]
+        ]
+        if len(measured_with_timing) == len(result["transfer"]["samples"]):
+            result["transfer"]["taskTimingSummary"] = task_timing_summary(
+                measured_with_timing
+            )
+        else:
+            result["transfer"]["taskTimingSummaryError"] = (
+                f"{len(result['transfer']['samples']) - len(measured_with_timing)} "
+                "measured tasks have no valid URMA timing"
+            )
         result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
             result["transfer"]["batches"]["samples"]
         )
@@ -1986,11 +2115,27 @@ def command_run_fanout(
             evidence_by_role[role] = evidence
             (evidence_dir / f"{role}.log").write_text(evidence, encoding="utf-8")
         child_evidence = "\n".join(evidence_by_role[role] for role in children)
-        result["evidence"] = analyze_evidence(
-            evidence_by_role["parent"],
-            child_evidence,
-            expected_parent_marker=f"-{run_id}-parent-",
+        result["fanoutDiagnostics"] = analyze_fanout_transport_health(
+            evidence_by_role["parent"], child_evidence
         )
+        try:
+            result["evidence"] = analyze_evidence(
+                evidence_by_role["parent"],
+                child_evidence,
+                expected_parent_marker=f"-{run_id}-parent-",
+            )
+        except B7Error as evidence_error:
+            result["evidenceError"] = str(evidence_error)
+            fanout_validation_failures.append(str(evidence_error))
+        result["fanoutValidation"] = {
+            "passed": not fanout_validation_failures,
+            "failures": fanout_validation_failures,
+        }
+        if fanout_validation_failures:
+            raise B7Error(
+                "fanout validation failed after complete evidence collection: "
+                + "; ".join(fanout_validation_failures)
+            )
         manifest["state"] = "passed"
     except (B7Error, OSError) as error:
         failure = error if isinstance(error, B7Error) else B7Error(str(error))

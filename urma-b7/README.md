@@ -139,7 +139,9 @@ pool、owner thread 和 JFC。
 
 - `fanout-post1-in32-l2`：低压力双 lane correctness/throughput；
 - `fanout-post1-in32-l4`：四条 required 32-slot window 恰好占满默认 128-slot TX pool；
-- `fanout-post8-in64-l2`：两条 required 64-slot window 恰好占满默认 TX pool。
+- `fanout-post8-in64-l2`：两条 required 64-slot window 恰好占满默认 TX pool；
+- `fanout-post1-in32-l4-pipe1-tx8`：关闭 optional 第二窗口，四条 required window 使用 8 MiB TX；
+- `fanout-post1-in32-l4-pipe2-tx16`：保留双窗口，将总注册预算/TX 调为 48/16 MiB，并保持 RX 32 MiB。
 
 先只运行 l2：
 
@@ -149,14 +151,24 @@ python .\b7.py run --manifest .\results\b72-fanout-post1-l2\manifest.json --exec
 ```
 
 除 B7.1 的 batch 汇总外，每个 `transfer.batches.*[]` 还包含 `laneEvidence`。工具从 Parent 的
-task-scoped 日志提取 `task_id -> lane_id`，并强制同一 batch 的每个 task 对应一个互不相同的 server-side
-lane；缺 lane、同 task 混入多个 lane 或多个 task 复用一个 lane都会使运行失败。`taskScopedEvidence`
-分别记录 Parent 和每个 Child 的证据文件。
+`start upload piece content over urma` 行提取最内层 `task_id`/`lane_id`，记录 `laneIdsByTask`、
+`pieceAttemptsByTaskAndLane`、`churnTaskIds` 和 `stableLaneByTask`。缺 lane、同 task lane churn、未绑定
+lane 0、同 batch task 复用 lane 或同一 role 跨 batch 换 lane都会记入 `fanoutValidation.failures`。
+
+lane 校验失败不会再中断第一个 batch。runner 会完成剩余 batch、全量日志/metrics 采集和有序 shutdown，
+最后统一返回失败。`fanoutDiagnostics` 分开保存 TX required/optional budget pressure、
+BufferUnavailable、BUSY/reject、session retirement 和 TCP fallback；因此失败 manifest 也可用于归因。
+`taskScopedEvidence` 分别记录 Parent 和每个 Child 的证据文件。
 
 当前 fan-out runner 要求所有 Child 位于同一节点，以便使用单一远端 barrier；这正好覆盖当前
 node1 Parent / node2 Children 的实验环境。`fanout-post1-in32-l4` 和 `fanout-post8-in64-l2` 都位于默认
 TX required-window 预算边界，应在 l2 基础 case 通过后再执行，并重点检查 required/optional budget
 pressure、fallback 和跨 lane fairness。RX fan-in 尚未包含在本层。
+
+若默认 l4 出现 lane churn，按顺序运行 `fanout-post1-in32-l4-pipe1-tx8` 和
+`fanout-post1-in32-l4-pipe2-tx16`。两者都通过说明默认 l4 是 optional window 抢占 required admission；
+pipe1 仍失败说明 8 MiB required 边界本身缺少等待/公平性；只有 pipe2 失败则需继续检查 depth2 的多 lane
+生命周期。
 
 每轮 child dfget 还会在远端同一时钟上记录 start/end，并按运行前后的 dfdaemon 日志行号保存
 `evidence/child.warmup-NNN.log` 或 `evidence/child.sample-NNN.log`。工具从该范围内真实的 URMA Piece

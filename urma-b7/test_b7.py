@@ -67,6 +67,16 @@ class B7Tests(unittest.TestCase):
         self.assertEqual(generated["child-001"]["node"], "node2")
         self.assertIn("/child-004/", generated["child-004"]["socket"])
 
+    def test_fanout_budget_comparison_cases_preserve_rx_budget(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        pipe1 = cases["fanout-post1-in32-l4-pipe1-tx8"]
+        pipe2 = cases["fanout-post1-in32-l4-pipe2-tx16"]
+        self.assertEqual(pipe1["pipelineDepth"], 1)
+        self.assertEqual(pipe1["txRegisteredBytes"], "8MiB")
+        self.assertEqual(pipe2["pipelineDepth"], 2)
+        self.assertEqual(pipe2["maxRegisteredBytes"], "48MiB")
+        self.assertEqual(pipe2["txRegisteredBytes"], "16MiB")
+
     def test_generated_paths_stay_in_scoped_roots(self):
         plan = b7.build_plan(self.inventory, "single", "b7-test", "node2")
         for role in ("parent", "child"):
@@ -921,15 +931,21 @@ storage:
     def test_fanout_lane_evidence_requires_distinct_parent_lanes(self):
         log = "\n".join(
             (
-                '2026-08-31T10:41:35Z DEBUG lane_id=3 task_id="task-a" start upload',
-                '2026-08-31T10:41:35Z DEBUG lane_id=4 task_id="task-b" start upload',
+                '2026-08-31T10:41:35Z DEBUG lane_id=3 task_id="task-a" '
+                "start upload piece content over urma",
+                '2026-08-31T10:41:35Z DEBUG lane_id=4 task_id="task-b" '
+                "start upload piece content over urma",
             )
         )
         summary = b7.analyze_fanout_lanes(log, {"task-a", "task-b"})
+        self.assertTrue(summary["stable"])
         self.assertEqual(summary["laneCount"], 2)
         self.assertEqual(summary["laneIds"], [3, 4])
-        with self.assertRaisesRegex(b7.B7Error, "distinct"):
-            b7.analyze_fanout_lanes(log.replace("lane_id=4", "lane_id=3"), {"task-a", "task-b"})
+        shared = b7.analyze_fanout_lanes(
+            log.replace("lane_id=4", "lane_id=3"), {"task-a", "task-b"}
+        )
+        self.assertFalse(shared["stable"])
+        self.assertEqual(shared["duplicateStableLaneIds"], [3])
 
     def test_fanout_lane_evidence_accepts_unquoted_parent_span_task_ids(self):
         log = "\n".join(
@@ -941,10 +957,52 @@ storage:
             )
         )
         summary = b7.analyze_fanout_lanes(log, {"f786", "241f"})
-        self.assertEqual(summary["laneByTask"], {"f786": 1, "241f": 2})
+        self.assertEqual(summary["stableLaneByTask"], {"f786": 1, "241f": 2})
         scoped = b7.filter_task_scoped_log(log, {"f786"})
         self.assertIn("task_id=f786", scoped)
         self.assertNotIn("task_id=241f", scoped)
+
+    def test_fanout_lane_evidence_records_churn_without_raising(self):
+        log = "\n".join(
+            (
+                "task_id=task-a lane_id=1 start upload piece content over urma",
+                "task_id=task-a lane_id=4 start upload piece content over urma",
+                "task_id=task-a lane_id=4 start upload piece content over urma",
+                "task_id=task-b lane_id=2 start upload piece content over urma",
+            )
+        )
+        summary = b7.analyze_fanout_lanes(log, {"task-a", "task-b"})
+        self.assertFalse(summary["stable"])
+        self.assertEqual(summary["churnTaskIds"], ["task-a"])
+        self.assertEqual(summary["laneIdsByTask"]["task-a"], [1, 4])
+        self.assertEqual(
+            summary["pieceAttemptsByTaskAndLane"]["task-a"], {"1": 1, "4": 2}
+        )
+
+    def test_fanout_transport_health_separates_pressure_and_fallback(self):
+        parent = "\n".join(
+            (
+                'dragonfly_client_urma_budget_pressure_total{direction="tx",stage="required"} 3',
+                'dragonfly_client_urma_budget_pressure_total{stage="optional",direction="tx"} 5',
+                "URMA TX second lease unavailable; falling back to single ring",
+                "TX BufferUnavailable while acquiring registered window",
+            )
+        )
+        children = "\n".join(
+            (
+                "retiring cached urma client after transfer failure",
+                "parent failed its previous urma transfer",
+                "urma download failed, fall back to tcp downloader",
+                "peer rejected request",
+            )
+        )
+        summary = b7.analyze_fanout_transport_health(parent, children)
+        self.assertEqual(summary["txBudgetPressure"], {"required": 3.0, "optional": 5.0})
+        self.assertEqual(summary["txBufferUnavailableLines"], 1)
+        self.assertEqual(summary["txOptionalSingleRingFallbacks"], 1)
+        self.assertEqual(summary["busyOrRejectLines"], 1)
+        self.assertEqual(summary["sessionRetirementLines"], 2)
+        self.assertEqual(summary["tcpFallbackLines"], 2)
 
     def test_task_timing_summary_uses_only_supplied_measured_samples(self):
         samples = [
@@ -1260,7 +1318,8 @@ storage:
                             manifest["origin"]["url"], tag
                         )
                         parent_lines.append(
-                            f'lane_id={worker} task_id="{task_id}"'
+                            f'lane_id={worker} task_id="{task_id}" '
+                            "start upload piece content over urma"
                         )
             parent_log = "\n".join(parent_lines)
 
@@ -1320,6 +1379,70 @@ storage:
             )
             self.assertEqual(
                 set(finished["result"]["started"]),
+                {"parent", "child-001", "child-002"},
+            )
+
+            # A lane validation failure must be deferred until all batches,
+            # evidence collection, and owned-daemon shutdown have completed.
+            retry = json.loads(manifest_path.read_text(encoding="utf-8"))
+            retry["state"] = "prepared"
+            retry.pop("result", None)
+            retry.pop("error", None)
+            manifest_path.write_text(json.dumps(retry), encoding="utf-8")
+            real_lane_analysis = b7.analyze_fanout_lanes
+
+            def unstable_lane_analysis(log, task_ids):
+                summary = real_lane_analysis(log, task_ids)
+                summary["stable"] = False
+                summary["churnTaskIds"] = [sorted(task_ids)[0]]
+                return summary
+
+            with (
+                mock.patch.object(
+                    b7, "start_remote_role", return_value={"pid": 1, "target": "test"}
+                ),
+                mock.patch.object(b7, "run_remote_dfget", side_effect=preheat),
+                mock.patch.object(
+                    b7, "run_remote_dfget_fanout_batch", side_effect=fanout
+                ),
+                mock.patch.object(
+                    b7, "collect_remote_log_range", side_effect=collect_range
+                ),
+                mock.patch.object(
+                    b7,
+                    "analyze_task_timing",
+                    return_value={
+                        "taskId": "task",
+                        "pieceCompletions": 1,
+                        "startToFirstPieceNs": 100_000,
+                        "firstToLastPieceNs": 800_000,
+                        "lastPieceToDfgetEndNs": 100_000,
+                        "dfgetElapsedNs": 1_000_000,
+                    },
+                ),
+                mock.patch.object(
+                    b7, "analyze_fanout_lanes", side_effect=unstable_lane_analysis
+                ),
+                mock.patch.object(b7, "collect_remote_evidence", side_effect=evidence),
+                mock.patch.object(b7, "remote_log_line_count", return_value=10),
+                mock.patch.object(b7, "collect_remote_log_since", return_value=""),
+                mock.patch.object(
+                    b7, "stop_remote_role", return_value={"result": "stopped"}
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    2,
+                )
+            failed = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(failed["state"], "run-failed")
+            self.assertEqual(
+                len(failed["result"]["transfer"]["batches"]["samples"]), 3
+            )
+            self.assertFalse(failed["result"]["fanoutValidation"]["passed"])
+            self.assertIn("fanoutDiagnostics", failed["result"])
+            self.assertEqual(
+                set(failed["result"]["stopped"]),
                 {"parent", "child-001", "child-002"},
             )
 
