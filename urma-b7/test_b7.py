@@ -142,6 +142,10 @@ storage:
         script = execute.call_args.args[2]
         self.assertIn("prepare target already exists", script)
         self.assertIn(".b7-preparing", script)
+        self.assertIn("run_parent=/tmp/dragonfly-urma-b7/b7-test", script)
+        self.assertLess(
+            script.index('mkdir -p "$run_parent"'), script.index('mkdir "$staging"')
+        )
         self.assertLess(
             script.index('.b7-owner.json"'), script.index('mv -T "$staging" "$run_dir"')
         )

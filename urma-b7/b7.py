@@ -247,6 +247,7 @@ def prepare_remote_role(
     ports = " ".join(str(port) for port in layout["ports"].values())
     script = f"""set -eu
 run_dir={shlex.quote(layout['runDir'])}
+run_parent={shlex.quote(str(PurePosixPath(layout['runDir']).parent))}
 staging="$run_dir.b7-preparing"
 storage={shlex.quote(layout['storage'])}
 cache={shlex.quote(layout['cache'])}
@@ -264,6 +265,7 @@ for port in {ports}; do
   fi
 done
 umask 077
+mkdir -p "$run_parent"
 mkdir "$staging"
 trap 'rm -rf -- "$staging"' EXIT
 printf '%s' {shlex.quote(marker)} | base64 -d > "$staging/.b7-owner.json"
