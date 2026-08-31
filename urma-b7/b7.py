@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import calendar
 import datetime as dt
 import hashlib
 import json
@@ -25,6 +26,11 @@ from yaml_overlay import OverlayError, apply as apply_yaml_overlays
 
 TOOL_DIR = Path(__file__).resolve().parent
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+LOG_TIMESTAMP_RE = re.compile(
+    r"^(?P<second>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?Z\b"
+)
+TASK_ID_RE = re.compile(r'\btask_id="([^"]+)"')
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
@@ -408,29 +414,37 @@ def run_remote_dfget(
     if disable_back_to_source:
         args.append("--disable-back-to-source")
     command = " ".join(shlex.quote(value) for value in args)
+    daemon_log = shlex.quote(layout["log"])
     script = f"""set -u
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY='*' no_proxy='*'
 export LD_LIBRARY_PATH={shlex.quote(inventory['urma']['libDir'])}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
+log_start=$(wc -l < {daemon_log})
 start=$(date +%s%N)
 timeout 600 {command} >{shlex.quote(transfer_log)} 2>&1
 status=$?
 end=$(date +%s%N)
+log_end=$(wc -l < {daemon_log})
 if [ "$status" -ne 0 ]; then tail -n 100 {shlex.quote(transfer_log)} >&2 || true; exit "$status"; fi
 bytes=$(stat -c %s {shlex.quote(output)})
 sha=$(sha256sum {shlex.quote(output)} | awk '{{print $1}}')
-printf '%s\\t%s\\t%s\\n' "$bytes" "$sha" "$((end-start))"
+printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
+  "$bytes" "$sha" "$((end-start))" "$start" "$end" "$((log_start+1))" "$log_end"
 """
     completed = ssh_script(node, inventory, script, timeout=630)
     if completed.returncode != 0:
         raise B7Error(f"dfget failed on {ssh_target(node)}: {completed.stderr.strip()}")
     fields = completed.stdout.strip().split("\t")
-    if len(fields) != 3:
+    if len(fields) != 7:
         raise B7Error(f"unexpected dfget result from {ssh_target(node)}")
     return {
         "bytes": int(fields[0]),
         "sha256": fields[1],
         "elapsedNs": int(fields[2]),
+        "startedAtUnixNs": int(fields[3]),
+        "finishedAtUnixNs": int(fields[4]),
+        "daemonLogFirstLine": int(fields[5]),
+        "daemonLogLastLine": int(fields[6]),
         "taskTag": task_tag,
         "output": output,
         "transferLog": transfer_log,
@@ -491,6 +505,76 @@ def collect_remote_log_since(
     if completed.returncode != 0:
         raise B7Error(f"cannot collect shutdown log from {ssh_target(node)}")
     return decode_b64(completed.stdout.strip())
+
+
+def collect_remote_log_range(
+    node: dict[str, Any],
+    inventory: dict[str, Any],
+    layout: dict[str, Any],
+    first_line: int,
+    last_line: int,
+) -> str:
+    if first_line < 1 or last_line < 0:
+        raise B7Error("invalid task log line range")
+    if last_line < first_line:
+        return ""
+    log = shlex.quote(layout["log"])
+    script = (
+        f"set -eu\ntest -f {log}\n"
+        f"sed -n '{first_line},{last_line}p' {log} | base64 | tr -d '\\n'\n"
+    )
+    completed = ssh_script(node, inventory, script, timeout=15)
+    if completed.returncode != 0:
+        raise B7Error(f"cannot collect task log from {ssh_target(node)}")
+    return decode_b64(completed.stdout.strip())
+
+
+def parse_log_timestamp_ns(line: str) -> int:
+    match = LOG_TIMESTAMP_RE.match(line)
+    if match is None:
+        raise B7Error("Piece completion log has no UTC timestamp")
+    timestamp = dt.datetime.strptime(match.group("second"), "%Y-%m-%dT%H:%M:%S")
+    seconds = calendar.timegm(timestamp.timetuple())
+    fraction = (match.group("fraction") or "").ljust(9, "0")
+    return seconds * 1_000_000_000 + int(fraction or "0")
+
+
+def analyze_task_timing(transfer: dict[str, Any], task_log: str) -> dict[str, Any]:
+    completion_lines = [
+        line
+        for line in task_log.splitlines()
+        if "finished piece " in line
+        and " from parent Some(" in line
+        and " using protocol urma" in line
+    ]
+    if not completion_lines:
+        raise B7Error("no child URMA Piece completion found in task log range")
+    task_id_matches = [TASK_ID_RE.search(line) for line in completion_lines]
+    if any(match is None for match in task_id_matches):
+        raise B7Error("task log Piece completion is missing task_id")
+    task_ids = {match.group(1) for match in task_id_matches if match is not None}
+    if len(task_ids) != 1:
+        raise B7Error("task log range contains missing or mixed task ids")
+    timestamps = [parse_log_timestamp_ns(line) for line in completion_lines]
+    started = int(transfer["startedAtUnixNs"])
+    finished = int(transfer["finishedAtUnixNs"])
+    elapsed = int(transfer["elapsedNs"])
+    first_piece = min(timestamps)
+    last_piece = max(timestamps)
+    if finished - started != elapsed:
+        raise B7Error("dfget wall-clock timestamps do not match elapsedNs")
+    if not started <= first_piece <= last_piece <= finished:
+        raise B7Error("Piece completion timestamps are outside the dfget interval")
+    return {
+        "taskId": next(iter(task_ids)),
+        "pieceCompletions": len(completion_lines),
+        "firstPieceAtUnixNs": first_piece,
+        "lastPieceAtUnixNs": last_piece,
+        "startToFirstPieceNs": first_piece - started,
+        "firstToLastPieceNs": last_piece - first_piece,
+        "lastPieceToDfgetEndNs": finished - last_piece,
+        "dfgetElapsedNs": elapsed,
+    }
 
 
 def analyze_evidence(
@@ -616,6 +700,52 @@ def transfer_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "p95": ordered[p95_index],
             "max": max(rates),
             "aggregate": total_bytes * 1_000_000_000 / total_elapsed_ns / (1024 * 1024),
+        },
+    }
+
+
+def task_timing_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise B7Error("at least one measured task timing sample is required")
+    fields = (
+        "startToFirstPieceNs",
+        "firstToLastPieceNs",
+        "lastPieceToDfgetEndNs",
+        "dfgetElapsedNs",
+    )
+
+    def distribution(values: list[int]) -> dict[str, float | int]:
+        ordered = sorted(values)
+        p95_index = max(0, (len(ordered) * 95 + 99) // 100 - 1)
+        return {
+            "meanNs": statistics.fmean(values),
+            "medianNs": statistics.median(values),
+            "p95Ns": ordered[p95_index],
+            "maxNs": max(values),
+        }
+
+    values_by_field = {
+        field: [int(sample["child"]["taskTiming"][field]) for sample in samples]
+        for field in fields
+    }
+    total_elapsed = sum(values_by_field["dfgetElapsedNs"])
+    aggregate: dict[str, int | float] = {
+        field: sum(values_by_field[field]) for field in fields
+    }
+    aggregate["startToFirstPieceFraction"] = (
+        aggregate["startToFirstPieceNs"] / total_elapsed
+    )
+    aggregate["firstToLastPieceFraction"] = (
+        aggregate["firstToLastPieceNs"] / total_elapsed
+    )
+    aggregate["lastPieceToDfgetEndFraction"] = (
+        aggregate["lastPieceToDfgetEndNs"] / total_elapsed
+    )
+    return {
+        "samples": len(samples),
+        "aggregate": aggregate,
+        "distribution": {
+            field: distribution(values) for field, values in values_by_field.items()
         },
     }
 
@@ -1157,6 +1287,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "preheat each unique task on parent",
         "start child",
         "download each task on child with --disable-back-to-source",
+        "split each child task into startup, Piece span, and completion tail",
         "compare SHA-256 and collect evidence",
         "SIGTERM only the two manifest-owned dfdaemon PIDs",
         "collect and analyze post-SIGTERM log evidence",
@@ -1211,6 +1342,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             child_node, inventory, child_layout, "child", run_id
         )
         started.append(("child", child_node, child_layout))
+        evidence_dir.mkdir(parents=True, exist_ok=True)
         for group, index, task_tag in iteration_specs:
             suffix = f"{'warmup' if group == 'warmups' else 'sample'}-{index:03d}"
             parent_transfer = parent_transfers[task_tag]
@@ -1222,6 +1354,19 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 True,
                 task_tag,
                 suffix,
+            )
+            task_log = collect_remote_log_range(
+                child_node,
+                inventory,
+                child_layout,
+                child_transfer["daemonLogFirstLine"],
+                child_transfer["daemonLogLastLine"],
+            )
+            (evidence_dir / f"child.{suffix}.log").write_text(
+                task_log, encoding="utf-8"
+            )
+            child_transfer["taskTiming"] = analyze_task_timing(
+                child_transfer, task_log
             )
             hashes = {
                 manifest["remote"]["origin"]["sha256"],
@@ -1253,7 +1398,9 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         result["transfer"]["summary"] = transfer_summary(
             result["transfer"]["samples"]
         )
-        evidence_dir.mkdir(parents=True, exist_ok=True)
+        result["transfer"]["taskTimingSummary"] = task_timing_summary(
+            result["transfer"]["samples"]
+        )
         evidence_by_role = {}
         for role, node, layout in (
             ("parent", parent_node, parent_layout),

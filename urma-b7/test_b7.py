@@ -244,7 +244,13 @@ storage:
     def test_dfget_uses_iteration_specific_output_and_log(self):
         _, _, generated = b7.generated_layout(self.inventory, "dual", "b7-test", None)
         completed = b7.subprocess.CompletedProcess(
-            [], 0, stdout="1048576\tsame\t1000000\n", stderr=""
+            [],
+            0,
+            stdout=(
+                "1048576\tsame\t1000000\t1788158495000000000\t"
+                "1788158495001000000\t11\t20\n"
+            ),
+            stderr="",
         )
         with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
             result = b7.run_remote_dfget(
@@ -259,6 +265,7 @@ storage:
         script = execute.call_args.args[2]
         self.assertIn("output.bin.sample-001", script)
         self.assertIn("dfget.log.sample-001", script)
+        self.assertIn("log_start=$(wc -l", script)
         self.assertEqual(
             result["output"],
             "/tmp/dragonfly-urma-b7/b7-test/parent/output.bin.sample-001",
@@ -267,6 +274,8 @@ storage:
             result["transferLog"],
             "/tmp/dragonfly-urma-b7/b7-test/parent/dfget.log.sample-001",
         )
+        self.assertEqual(result["daemonLogFirstLine"], 11)
+        self.assertEqual(result["daemonLogLastLine"], 20)
 
     def test_run_and_cleanup_default_to_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -407,6 +416,10 @@ storage:
                     "bytes": 10,
                     "sha256": "same",
                     "elapsedNs": 100,
+                    "startedAtUnixNs": 1000,
+                    "finishedAtUnixNs": 1100,
+                    "daemonLogFirstLine": 1,
+                    "daemonLogLastLine": 2,
                     "taskTag": task_tag,
                 }
 
@@ -417,6 +430,21 @@ storage:
             with (
                 mock.patch.object(b7, "start_remote_role", side_effect=start),
                 mock.patch.object(b7, "run_remote_dfget", side_effect=transfer),
+                mock.patch.object(
+                    b7, "collect_remote_log_range", return_value="task log"
+                ),
+                mock.patch.object(
+                    b7,
+                    "analyze_task_timing",
+                    return_value={
+                        "taskId": "task",
+                        "pieceCompletions": 1,
+                        "startToFirstPieceNs": 10,
+                        "firstToLastPieceNs": 70,
+                        "lastPieceToDfgetEndNs": 20,
+                        "dfgetElapsedNs": 100,
+                    },
+                ),
                 mock.patch.object(
                     b7,
                     "collect_remote_evidence",
@@ -541,6 +569,67 @@ storage:
         self.assertEqual(summary["throughputMiBps"]["median"], 1.5)
         self.assertEqual(summary["throughputMiBps"]["aggregate"], 1.5)
 
+    def test_task_timing_splits_dfget_wall_time(self):
+        first_line = (
+            '2026-08-31T10:41:35.100000000Z DEBUG finished piece task-0 '
+            'from parent Some("parent") using protocol urma task_id="task-id"'
+        )
+        last_line = (
+            '2026-08-31T10:41:35.600000000Z DEBUG finished piece task-255 '
+            'from parent Some("parent") using protocol urma task_id="task-id"'
+        )
+        started = b7.parse_log_timestamp_ns(first_line) - 100_000_000
+        finished = b7.parse_log_timestamp_ns(last_line) + 200_000_000
+        timing = b7.analyze_task_timing(
+            {
+                "startedAtUnixNs": started,
+                "finishedAtUnixNs": finished,
+                "elapsedNs": finished - started,
+            },
+            first_line + "\n" + last_line + "\n",
+        )
+        self.assertEqual(timing["pieceCompletions"], 2)
+        self.assertEqual(timing["startToFirstPieceNs"], 100_000_000)
+        self.assertEqual(timing["firstToLastPieceNs"], 500_000_000)
+        self.assertEqual(timing["lastPieceToDfgetEndNs"], 200_000_000)
+        self.assertEqual(
+            timing["startToFirstPieceNs"]
+            + timing["firstToLastPieceNs"]
+            + timing["lastPieceToDfgetEndNs"],
+            timing["dfgetElapsedNs"],
+        )
+
+    def test_task_timing_summary_uses_only_supplied_measured_samples(self):
+        samples = [
+            {
+                "child": {
+                    "taskTiming": {
+                        "startToFirstPieceNs": 10,
+                        "firstToLastPieceNs": 70,
+                        "lastPieceToDfgetEndNs": 20,
+                        "dfgetElapsedNs": 100,
+                    }
+                }
+            },
+            {
+                "child": {
+                    "taskTiming": {
+                        "startToFirstPieceNs": 20,
+                        "firstToLastPieceNs": 160,
+                        "lastPieceToDfgetEndNs": 20,
+                        "dfgetElapsedNs": 200,
+                    }
+                }
+            },
+        ]
+        summary = b7.task_timing_summary(samples)
+        self.assertEqual(summary["samples"], 2)
+        self.assertEqual(summary["aggregate"]["dfgetElapsedNs"], 300)
+        self.assertEqual(summary["aggregate"]["firstToLastPieceNs"], 230)
+        self.assertAlmostEqual(
+            summary["aggregate"]["firstToLastPieceFraction"], 230 / 300
+        )
+
     def test_performance_case_runs_warmups_and_repetitions_with_unique_tags(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -577,6 +666,10 @@ storage:
                     "bytes": 1024 * 1024,
                     "sha256": "same",
                     "elapsedNs": 1_000_000,
+                    "startedAtUnixNs": 1_000_000_000,
+                    "finishedAtUnixNs": 1_001_000_000,
+                    "daemonLogFirstLine": 1,
+                    "daemonLogLastLine": 2,
                     "taskTag": task_tag,
                 }
 
@@ -585,6 +678,21 @@ storage:
                     b7, "start_remote_role", return_value={"pid": 1, "target": "test"}
                 ),
                 mock.patch.object(b7, "run_remote_dfget", side_effect=transfer),
+                mock.patch.object(
+                    b7, "collect_remote_log_range", return_value="task log"
+                ),
+                mock.patch.object(
+                    b7,
+                    "analyze_task_timing",
+                    return_value={
+                        "taskId": "task",
+                        "pieceCompletions": 256,
+                        "startToFirstPieceNs": 100_000,
+                        "firstToLastPieceNs": 800_000,
+                        "lastPieceToDfgetEndNs": 100_000,
+                        "dfgetElapsedNs": 1_000_000,
+                    },
+                ),
                 mock.patch.object(
                     b7,
                     "collect_remote_evidence",
@@ -623,6 +731,11 @@ storage:
             self.assertEqual(len(transfer_result["warmups"]), 2)
             self.assertEqual(len(transfer_result["samples"]), 5)
             self.assertEqual(transfer_result["summary"]["samples"], 5)
+            self.assertEqual(transfer_result["taskTimingSummary"]["samples"], 5)
+            self.assertIn("taskTiming", transfer_result["warmups"][0]["child"])
+            self.assertTrue(
+                (Path(directory) / "evidence" / "child.sample-005.log").is_file()
+            )
 
 
 if __name__ == "__main__":
