@@ -127,6 +127,37 @@ B7 不设置 application、revision、piece length 或 filtered query parameters
 persistent lane 上；它建立的是“上层并发、单 lane 排队”基线。多 Child fan-out 和多 Parent fan-in
 需要扩展为多 role manifest，不能用本模式冒充多 lane transport concurrency。
 
+### TX fan-out（B7.2）
+
+`topology: fanout` 将 `concurrency` 解释为 Child daemon/lane 数，而不是同一 Child 内的 task 数。工具在
+node1 启动一个 Parent，在 node2 启动 `child-001..NNN` 多个隔离 daemon；每个 Child 都有独立的
+hostname、socket、端口组、storage 和日志。每个 batch 为每个 Child 分配一个唯一 task，再由 node2 上
+一个 host-local barrier 同时释放所有 `dfget`。这样 Parent 侧的 lane 才会真实共享同一个 TX registered
+pool、owner thread 和 JFC。
+
+第一轮内置 case：
+
+- `fanout-post1-in32-l2`：低压力双 lane correctness/throughput；
+- `fanout-post1-in32-l4`：四条 required 32-slot window 恰好占满默认 128-slot TX pool；
+- `fanout-post8-in64-l2`：两条 required 64-slot window 恰好占满默认 TX pool。
+
+先只运行 l2：
+
+```powershell
+python .\b7.py prepare --mode dual --run-id b72-fanout-post1-l2 --case fanout-post1-in32-l2 --execute
+python .\b7.py run --manifest .\results\b72-fanout-post1-l2\manifest.json --execute
+```
+
+除 B7.1 的 batch 汇总外，每个 `transfer.batches.*[]` 还包含 `laneEvidence`。工具从 Parent 的
+task-scoped 日志提取 `task_id -> lane_id`，并强制同一 batch 的每个 task 对应一个互不相同的 server-side
+lane；缺 lane、同 task 混入多个 lane 或多个 task 复用一个 lane都会使运行失败。`taskScopedEvidence`
+分别记录 Parent 和每个 Child 的证据文件。
+
+当前 fan-out runner 要求所有 Child 位于同一节点，以便使用单一远端 barrier；这正好覆盖当前
+node1 Parent / node2 Children 的实验环境。`fanout-post1-in32-l4` 和 `fanout-post8-in64-l2` 都位于默认
+TX required-window 预算边界，应在 l2 基础 case 通过后再执行，并重点检查 required/optional budget
+pressure、fallback 和跨 lane fairness。RX fan-in 尚未包含在本层。
+
 每轮 child dfget 还会在远端同一时钟上记录 start/end，并按运行前后的 dfdaemon 日志行号保存
 `evidence/child.warmup-NNN.log` 或 `evidence/child.sample-NNN.log`。工具从该范围内真实的 URMA Piece
 completion 提取 first/last Piece，把任务墙钟时间拆成 `startToFirstPieceNs`（调度、建连及首 Piece）、
@@ -149,8 +180,8 @@ downloader` 及 parent penalty 文本同样作为真实 fallback 处理。
 
 ## 当前限制与后续层
 
-当前 `run` 支持 standard-task correctness、顺序 performance repetitions，以及同一 parent/child 上的
-并发 task batch：唯一 origin、全量 parent preheat、child `--disable-back-to-source`、逐 task 三方
-SHA-256、固定拓扑校验、task-ID scoped 日志、URMA 日志/metrics 证据以及有序 shutdown。后续仍需增加
-多 role fan-out/fan-in、persistent/persistent-cache、failpoint、双 lane 定向中断和带 outstanding WR 的
-专项 shutdown case。
+当前 `run` 支持 standard-task correctness、顺序 performance repetitions、同一 parent/child 上的并发
+task batch，以及一个 Parent/多个隔离 Child 的 TX fan-out：唯一 origin、全量 parent preheat、child
+`--disable-back-to-source`、逐 task 三方 SHA-256、固定拓扑与 lane-ID 校验、task-ID scoped 日志、URMA
+日志/metrics 证据以及有序 shutdown。后续仍需增加 RX fan-in、persistent/persistent-cache、failpoint、
+双 lane 定向中断和带 outstanding WR 的专项 shutdown case。

@@ -32,6 +32,7 @@ LOG_TIMESTAMP_RE = re.compile(
     r"(?:\.(?P<fraction>\d{1,9}))?Z\b"
 )
 TASK_ID_RE = re.compile(r'\btask_id="([^"]+)"')
+LANE_ID_RE = re.compile(r"\blane_id=(\d+)")
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
@@ -614,6 +615,156 @@ def run_remote_dfget_batch(
     return results
 
 
+def run_remote_dfget_fanout_batch(
+    node: dict[str, Any],
+    inventory: dict[str, Any],
+    url: str,
+    transfers: list[tuple[str, dict[str, Any], str, str]],
+    batch_suffix: str,
+) -> list[dict[str, Any]]:
+    """Release one dfget per child daemon behind a host-local barrier."""
+    if len(transfers) < 2:
+        raise B7Error("fanout batch requires at least two child roles")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", batch_suffix):
+        raise B7Error(f"invalid fanout batch suffix: {batch_suffix}")
+    binary = str(
+        PurePosixPath(node["repo"])
+        / inventory["dragonfly"]["binaryRelativePaths"]["dfget"]
+    )
+    barrier = str(
+        PurePosixPath(transfers[0][1]["runDir"]) / f".{batch_suffix}.fanout-start"
+    )
+    result_paths: list[str] = []
+    launch_blocks: list[str] = []
+    range_blocks: list[str] = []
+    for worker, (role, layout, task_tag, artifact_suffix) in enumerate(transfers, 1):
+        if layout["node"] not in inventory["nodes"]:
+            raise B7Error(f"fanout role {role} uses unknown node {layout['node']}")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", artifact_suffix):
+            raise B7Error(f"invalid fanout artifact suffix: {artifact_suffix}")
+        output = f"{layout['output']}.{artifact_suffix}"
+        transfer_log = f"{layout['transferLog']}.{artifact_suffix}"
+        result_path = str(
+            PurePosixPath(layout["runDir"])
+            / f".{batch_suffix}.worker-{worker:03d}.result"
+        )
+        result_paths.append(result_path)
+        args = [
+            binary,
+            "--endpoint",
+            layout["socket"],
+            url,
+            "-O",
+            output,
+            "--overwrite",
+            "--tag",
+            task_tag,
+            "--disable-back-to-source",
+        ]
+        command = " ".join(shlex.quote(value) for value in args)
+        launch_blocks.extend(
+            [
+                f"log_start_{worker}=$(wc -l < {shlex.quote(layout['log'])})",
+                "\n".join(
+                    [
+                        "(",
+                        f"  while [ ! -e {shlex.quote(barrier)} ]; do :; done",
+                        "  start=$(date +%s%N)",
+                        f"  timeout 600 {command} >{shlex.quote(transfer_log)} 2>&1",
+                        "  status=$?",
+                        "  end=$(date +%s%N)",
+                        "  bytes=0",
+                        "  sha=-",
+                        '  if [ "$status" -eq 0 ]; then',
+                        f"    bytes=$(stat -c %s {shlex.quote(output)})",
+                        f"    sha=$(sha256sum {shlex.quote(output)} | awk '{{print $1}}')",
+                        "  fi",
+                        "  printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\",
+                        f'    {worker} "$status" "$bytes" "$sha" "$((end-start))" '
+                        f'"$start" "$end" >{shlex.quote(result_path)}',
+                        '  exit "$status"',
+                        ") &",
+                        'pids="$pids $!"',
+                    ]
+                ),
+            ]
+        )
+        range_blocks.append(
+            f"printf 'RANGE\\t{worker}\\t%s\\t%s\\n' "
+            f'"$((log_start_{worker}+1))" "$(wc -l < {shlex.quote(layout["log"])})"'
+        )
+
+    cleanup_paths = " ".join(shlex.quote(path) for path in [barrier, *result_paths])
+    result_paths_shell = " ".join(shlex.quote(path) for path in result_paths)
+    script = "\n".join(
+        [
+            "set -u",
+            "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy",
+            "export NO_PROXY='*' no_proxy='*'",
+            "export LD_LIBRARY_PATH="
+            f"{shlex.quote(inventory['urma']['libDir'])}"
+            "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}",
+            f"rm -f {cleanup_paths}",
+            'pids=""',
+            *launch_blocks,
+            f"touch {shlex.quote(barrier)}",
+            "batch_status=0",
+            'for pid in $pids; do if ! wait "$pid"; then batch_status=1; fi; done',
+            f"cat {result_paths_shell}",
+            *range_blocks,
+            f"rm -f {cleanup_paths}",
+            'exit "$batch_status"',
+        ]
+    )
+    completed = ssh_script(node, inventory, script, timeout=630)
+    worker_results: dict[int, dict[str, Any]] = {}
+    log_ranges: dict[int, tuple[int, int]] = {}
+    for line in completed.stdout.strip().splitlines():
+        fields = line.split("\t")
+        if fields[0] == "RANGE":
+            if len(fields) != 4:
+                raise B7Error(f"invalid fanout log range from {ssh_target(node)}")
+            log_ranges[int(fields[1])] = (int(fields[2]), int(fields[3]))
+            continue
+        if len(fields) != 7:
+            raise B7Error(f"invalid fanout worker result from {ssh_target(node)}")
+        worker_results[int(fields[0])] = {
+            "status": int(fields[1]),
+            "bytes": int(fields[2]),
+            "sha256": fields[3],
+            "elapsedNs": int(fields[4]),
+            "startedAtUnixNs": int(fields[5]),
+            "finishedAtUnixNs": int(fields[6]),
+        }
+    expected_workers = set(range(1, len(transfers) + 1))
+    if set(worker_results) != expected_workers or set(log_ranges) != expected_workers:
+        raise B7Error(f"fanout batch returned incomplete results from {ssh_target(node)}")
+    failures = [
+        worker for worker, value in worker_results.items() if value["status"] != 0
+    ]
+    if completed.returncode != 0 or failures:
+        raise B7Error(f"fanout batch failed on {ssh_target(node)} workers={failures}")
+    results = []
+    for worker, (role, layout, task_tag, artifact_suffix) in enumerate(transfers, 1):
+        value = worker_results[worker]
+        first_line, last_line = log_ranges[worker]
+        value.update(
+            {
+                "daemonLogFirstLine": first_line,
+                "daemonLogLastLine": last_line,
+                "taskTag": task_tag,
+                "expectedTaskId": standard_task_id(url, task_tag),
+                "output": f"{layout['output']}.{artifact_suffix}",
+                "transferLog": f"{layout['transferLog']}.{artifact_suffix}",
+                "workerIndex": worker,
+                "role": role,
+            }
+        )
+        value.pop("status")
+        results.append(value)
+    return results
+
+
 def collect_remote_evidence(
     node: dict[str, Any], inventory: dict[str, Any], layout: dict[str, Any]
 ) -> str:
@@ -763,6 +914,38 @@ def filter_task_scoped_log(task_log: str, task_ids: set[str]) -> str:
         if match is not None and match.group(1) in task_ids:
             selected.append(line)
     return "\n".join(selected) + ("\n" if selected else "")
+
+
+def analyze_fanout_lanes(parent_log: str, task_ids: set[str]) -> dict[str, Any]:
+    """Prove that every fanout task used one distinct server-side lane."""
+    lanes_by_task: dict[str, set[int]] = {task_id: set() for task_id in task_ids}
+    for line in parent_log.splitlines():
+        task_match = TASK_ID_RE.search(line)
+        lane_match = LANE_ID_RE.search(line)
+        if task_match is None or lane_match is None:
+            continue
+        task_id = task_match.group(1)
+        if task_id in lanes_by_task:
+            lanes_by_task[task_id].add(int(lane_match.group(1)))
+    missing = sorted(task_id for task_id, lanes in lanes_by_task.items() if not lanes)
+    mixed = sorted(task_id for task_id, lanes in lanes_by_task.items() if len(lanes) != 1)
+    if missing:
+        raise B7Error(f"fanout parent log has no lane evidence for tasks: {missing}")
+    if mixed:
+        raise B7Error(f"fanout tasks used mixed server lanes: {mixed}")
+    lane_by_task = {
+        task_id: next(iter(lanes)) for task_id, lanes in lanes_by_task.items()
+    }
+    distinct_lanes = set(lane_by_task.values())
+    if 0 in distinct_lanes:
+        raise B7Error("fanout parent log contains an unbound lane ID 0")
+    if len(distinct_lanes) != len(task_ids):
+        raise B7Error("fanout tasks did not use distinct server-side lanes")
+    return {
+        "laneCount": len(distinct_lanes),
+        "laneIds": sorted(distinct_lanes),
+        "laneByTask": lane_by_task,
+    }
 
 
 def analyze_evidence(
@@ -1155,7 +1338,8 @@ def rollback_preparation(
     generated = manifest["generated"]
     remote = manifest["remote"]
     failures: list[str] = []
-    for resource in ("origin", "child", "parent"):
+    role_resources = [*reversed(child_roles(generated)), "parent"]
+    for resource in ["origin", *role_resources]:
         record = remote.get(resource)
         if not isinstance(record, dict) or record.get("status") == "rolled-back":
             continue
@@ -1254,32 +1438,57 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         concurrency = case.get("concurrency", 1)
         if not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
             raise B7Error(f"case {case['name']} requires concurrency in 1..=16")
+        topology = case.get("topology", "queue")
+        if topology not in ("queue", "fanout"):
+            raise B7Error(f"case {case['name']} has unsupported topology {topology!r}")
+        if topology == "fanout" and concurrency < 2:
+            raise B7Error(f"case {case['name']} fanout requires concurrency >= 2")
         result[case["name"]] = case
     return result
 
 
 def generated_layout(
-    inventory: dict[str, Any], mode: str, run_id: str, host: str | None
+    inventory: dict[str, Any],
+    mode: str,
+    run_id: str,
+    host: str | None,
+    child_count: int = 1,
 ) -> tuple[str, str, dict[str, dict[str, Any]]]:
+    if not 1 <= child_count <= 16:
+        raise B7Error("child count must be in 1..=16")
     if mode == "dual":
         parent_node, child_node = "node1", "node2"
     else:
         parent_node = child_node = host or inventory["singleHost"]["defaultNode"]
         if parent_node not in inventory["nodes"]:
             raise B7Error(f"unknown single-host node {parent_node}")
-    generated = {
+    generated: dict[str, dict[str, Any]] = {
         "parent": {
             **role_paths(inventory, run_id, "parent"),
             "node": parent_node,
             "ports": inventory["singleHost"]["parentPorts"],
         },
-        "child": {
-            **role_paths(inventory, run_id, "child"),
-            "node": child_node,
-            "ports": inventory["singleHost"]["childPorts"],
-        },
     }
+    base_ports = inventory["singleHost"]["childPorts"]
+    for index in range(1, child_count + 1):
+        role = "child" if child_count == 1 else f"child-{index:03d}"
+        offset = (index - 1) * 100
+        ports = {name: int(port) + offset for name, port in base_ports.items()}
+        if any(port > 65535 for port in ports.values()):
+            raise B7Error(f"generated port exceeds 65535 for {role}")
+        generated[role] = {
+            **role_paths(inventory, run_id, role),
+            "node": child_node,
+            "ports": ports,
+        }
     return parent_node, child_node, generated
+
+
+def child_roles(generated: dict[str, dict[str, Any]]) -> list[str]:
+    roles = sorted(role for role in generated if role == "child" or role.startswith("child-"))
+    if not roles:
+        raise B7Error("manifest has no generated child layout")
+    return roles
 
 
 def role_overlays(
@@ -1437,8 +1646,10 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     if args.case not in cases:
         raise B7Error(f"unknown case {args.case}")
     case = cases[args.case]
+    topology = case.get("topology", "queue")
+    child_count = case.get("concurrency", 1) if topology == "fanout" else 1
     parent_node, child_node, generated = generated_layout(
-        inventory, args.mode, args.run_id, args.host
+        inventory, args.mode, args.run_id, args.host, child_count
     )
     origin = origin_artifact(inventory, args.run_id, case.get("fileClass", "1g"))
     output = args.output or TOOL_DIR / "results" / args.run_id / "manifest.json"
@@ -1447,6 +1658,7 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "runId": args.run_id,
         "mode": args.mode,
         "case": case,
+        "topology": topology,
         "parentNode": parent_node,
         "childNode": child_node,
         "origin": origin,
@@ -1472,7 +1684,7 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest["state"] = "preparing"
     write_json(output, manifest)
     try:
-        for role in ("parent", "child"):
+        for role in generated:
             layout = generated[role]
             node = inventory["nodes"][layout["node"]]
             source = read_remote_file(node, inventory, node["config"])
@@ -1522,8 +1734,334 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     return 0
 
 
+def command_run_fanout(
+    args: argparse.Namespace,
+    inventory: dict[str, Any],
+    manifest: dict[str, Any],
+) -> int:
+    run_id = validate_run_id(str(manifest.get("runId", "")))
+    generated = manifest.get("generated")
+    if not isinstance(generated, dict) or "parent" not in generated:
+        raise B7Error("fanout manifest has no generated parent layout")
+    children = child_roles(generated)
+    case = manifest.get("case")
+    if not isinstance(case, dict):
+        raise B7Error("fanout manifest has no case")
+    concurrency = case.get("concurrency")
+    repetitions = case.get("repetitions")
+    warmups = case.get("warmups", 0)
+    if (
+        not isinstance(concurrency, int)
+        or not 2 <= concurrency <= 16
+        or concurrency != len(children)
+    ):
+        raise B7Error("fanout concurrency must equal the generated child count")
+    if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
+        raise B7Error("fanout repetitions must be in 1..=100")
+    if not isinstance(warmups, int) or not 0 <= warmups <= 20:
+        raise B7Error("fanout warmups must be in 0..=20")
+    for role in ["parent", *children]:
+        layout = generated[role]
+        expected_output = str(PurePosixPath(layout["storage"]) / "output.bin")
+        if layout.get("output") != expected_output:
+            raise B7Error(f"fanout {role} output is not storage-local")
+    child_nodes = {generated[role]["node"] for role in children}
+    if len(child_nodes) != 1:
+        raise B7Error("fanout barrier currently requires all child roles on one node")
+    operations = [
+        "start one parent",
+        f"preheat {concurrency} unique tasks per batch on the parent",
+        f"start {concurrency} isolated child daemons",
+        "release one dfget per child behind one host-local barrier",
+        "prove distinct parent-side lane IDs for every batch",
+        "compare per-task SHA-256 and aggregate throughput/fairness",
+        "stop only manifest-owned daemons and inspect shutdown evidence",
+    ]
+    if not args.execute:
+        print(
+            json.dumps(
+                {
+                    "runId": run_id,
+                    "topology": "fanout",
+                    "dryRun": True,
+                    "operations": operations,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if manifest.get("state") != "prepared":
+        raise B7Error("--execute requires a manifest in prepared state")
+
+    parent_layout = generated["parent"]
+    parent_node = inventory["nodes"][parent_layout["node"]]
+    child_node = inventory["nodes"][next(iter(child_nodes))]
+    started: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    result: dict[str, Any] = {
+        "started": {},
+        "transfer": {
+            "topology": "fanout",
+            "concurrency": concurrency,
+            "warmups": [],
+            "samples": [],
+            "batches": {"warmups": [], "samples": []},
+        },
+        "stopped": {},
+    }
+    failure: B7Error | None = None
+    evidence_dir = args.manifest.parent / "evidence"
+    shutdown_offsets: dict[str, int] = {}
+    try:
+        result["started"]["parent"] = start_remote_role(
+            parent_node, inventory, parent_layout, "parent", run_id
+        )
+        started.append(("parent", parent_node, parent_layout))
+        iteration_batches = []
+        for group, count in (("warmups", warmups), ("samples", repetitions)):
+            label = "warmup" if group == "warmups" else "sample"
+            for index in range(1, count + 1):
+                workers = []
+                for worker, role in enumerate(children, 1):
+                    suffix = f"{label}-{index:03d}-lane-{worker:03d}"
+                    workers.append((worker, role, f"{run_id}-{suffix}", suffix))
+                iteration_batches.append((group, index, label, workers))
+        parent_transfers: dict[str, dict[str, Any]] = {}
+        for _group, _index, _label, workers in iteration_batches:
+            for _worker, _role, task_tag, suffix in workers:
+                parent_transfers[task_tag] = run_remote_dfget(
+                    parent_node,
+                    inventory,
+                    parent_layout,
+                    manifest["origin"]["url"],
+                    False,
+                    task_tag,
+                    suffix,
+                )
+        for role in children:
+            layout = generated[role]
+            result["started"][role] = start_remote_role(
+                child_node, inventory, layout, role, run_id
+            )
+            started.append((role, child_node, layout))
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        server_lane_by_role: dict[str, int] = {}
+        for group, index, label, workers in iteration_batches:
+            batch_suffix = f"{label}-{index:03d}"
+            parent_log_first = remote_log_line_count(
+                parent_node, inventory, parent_layout
+            ) + 1
+            specs = [
+                (role, generated[role], task_tag, suffix)
+                for _worker, role, task_tag, suffix in workers
+            ]
+            child_transfers = run_remote_dfget_fanout_batch(
+                child_node,
+                inventory,
+                manifest["origin"]["url"],
+                specs,
+                batch_suffix,
+            )
+            parent_log_last = remote_log_line_count(
+                parent_node, inventory, parent_layout
+            )
+            parent_task_log = collect_remote_log_range(
+                parent_node,
+                inventory,
+                parent_layout,
+                parent_log_first,
+                parent_log_last,
+            )
+            (evidence_dir / f"parent.{batch_suffix}.log").write_text(
+                parent_task_log, encoding="utf-8"
+            )
+            batch_transfers = []
+            child_scoped: dict[str, str] = {}
+            for (worker, role, task_tag, _suffix), child_transfer in zip(
+                workers, child_transfers
+            ):
+                layout = generated[role]
+                task_log = collect_remote_log_range(
+                    child_node,
+                    inventory,
+                    layout,
+                    child_transfer["daemonLogFirstLine"],
+                    child_transfer["daemonLogLastLine"],
+                )
+                full_name = f"{role}.{batch_suffix}.log"
+                scoped_name = f"{role}.{batch_suffix}.tasks.log"
+                (evidence_dir / full_name).write_text(task_log, encoding="utf-8")
+                expected_task_id = child_transfer["expectedTaskId"]
+                (evidence_dir / scoped_name).write_text(
+                    filter_task_scoped_log(task_log, {expected_task_id}),
+                    encoding="utf-8",
+                )
+                child_scoped[role] = scoped_name
+                child_transfer["taskTiming"] = analyze_task_timing(
+                    child_transfer, task_log, expected_task_id
+                )
+                parent_transfer = parent_transfers[task_tag]
+                hashes = {
+                    manifest["remote"]["origin"]["sha256"],
+                    parent_transfer["sha256"],
+                    child_transfer["sha256"],
+                }
+                lengths = {parent_transfer["bytes"], child_transfer["bytes"]}
+                if len(hashes) != 1 or len(lengths) != 1:
+                    raise B7Error(
+                        f"origin/parent/{role} identity check failed for {task_tag}"
+                    )
+                child_transfer["throughputMiBps"] = (
+                    child_transfer["bytes"]
+                    * 1_000_000_000
+                    / child_transfer["elapsedNs"]
+                    / (1024 * 1024)
+                )
+                transfer_result = {
+                    "index": index,
+                    "batchIndex": index,
+                    "workerIndex": worker,
+                    "role": role,
+                    "taskTag": task_tag,
+                    "parent": parent_transfer,
+                    "child": child_transfer,
+                }
+                result["transfer"][group].append(transfer_result)
+                batch_transfers.append(transfer_result)
+            task_ids = {
+                transfer["child"]["expectedTaskId"] for transfer in batch_transfers
+            }
+            parent_scoped_name = f"parent.{batch_suffix}.tasks.log"
+            (evidence_dir / parent_scoped_name).write_text(
+                filter_task_scoped_log(parent_task_log, task_ids), encoding="utf-8"
+            )
+            lane_evidence = analyze_fanout_lanes(parent_task_log, task_ids)
+            lane_by_role = {}
+            for transfer in batch_transfers:
+                role = transfer["role"]
+                task_id = transfer["child"]["expectedTaskId"]
+                lane_id = lane_evidence["laneByTask"][task_id]
+                previous = server_lane_by_role.setdefault(role, lane_id)
+                if previous != lane_id:
+                    raise B7Error(
+                        f"fanout role {role} changed server lane from {previous} to {lane_id}"
+                    )
+                lane_by_role[role] = lane_id
+            lane_evidence["laneByRole"] = lane_by_role
+            result["transfer"]["batches"][group].append(
+                {
+                    "index": index,
+                    "taskIds": sorted(task_ids),
+                    "laneEvidence": lane_evidence,
+                    "taskScopedEvidence": {
+                        "parent": parent_scoped_name,
+                        "children": child_scoped,
+                    },
+                    "transfers": batch_transfers,
+                    "summary": concurrent_batch_summary(batch_transfers),
+                }
+            )
+        first_sample = result["transfer"]["samples"][0]
+        result["transfer"]["parent"] = first_sample["parent"]
+        result["transfer"]["child"] = first_sample["child"]
+        result["transfer"]["summary"] = transfer_summary(
+            result["transfer"]["samples"]
+        )
+        result["transfer"]["taskTimingSummary"] = task_timing_summary(
+            result["transfer"]["samples"]
+        )
+        result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
+            result["transfer"]["batches"]["samples"]
+        )
+        result["transfer"]["measuredTaskIds"] = [
+            sample["child"]["expectedTaskId"]
+            for sample in result["transfer"]["samples"]
+        ]
+        result["transfer"]["serverLaneByRole"] = server_lane_by_role
+        evidence_by_role = {}
+        for role, node, layout in started:
+            evidence = collect_remote_evidence(node, inventory, layout)
+            evidence_by_role[role] = evidence
+            (evidence_dir / f"{role}.log").write_text(evidence, encoding="utf-8")
+        child_evidence = "\n".join(evidence_by_role[role] for role in children)
+        result["evidence"] = analyze_evidence(
+            evidence_by_role["parent"],
+            child_evidence,
+            expected_parent_marker=f"-{run_id}-parent-",
+        )
+        manifest["state"] = "passed"
+    except (B7Error, OSError) as error:
+        failure = error if isinstance(error, B7Error) else B7Error(str(error))
+        manifest["state"] = "run-failed"
+        manifest["error"] = str(failure)
+    finally:
+        for role, node, layout in started:
+            try:
+                shutdown_offsets[role] = remote_log_line_count(node, inventory, layout)
+            except B7Error as offset_error:
+                if failure is None:
+                    failure = offset_error
+                manifest["state"] = "stop-failed"
+        for role, node, layout in reversed(started):
+            try:
+                result["stopped"][role] = stop_remote_role(
+                    node, inventory, layout, role, run_id
+                )
+            except B7Error as stop_error:
+                result["stopped"][role] = {"error": str(stop_error)}
+                manifest["state"] = "stop-failed"
+                if failure is None:
+                    failure = stop_error
+        shutdown_by_role: dict[str, str] = {}
+        for role, node, layout in started:
+            if role not in shutdown_offsets:
+                continue
+            try:
+                shutdown_log = collect_remote_log_since(
+                    node, inventory, layout, shutdown_offsets[role] + 1
+                )
+                shutdown_by_role[role] = shutdown_log
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                (evidence_dir / f"{role}.shutdown.log").write_text(
+                    shutdown_log, encoding="utf-8"
+                )
+            except (B7Error, OSError) as shutdown_error:
+                if failure is None:
+                    failure = (
+                        shutdown_error
+                        if isinstance(shutdown_error, B7Error)
+                        else B7Error(str(shutdown_error))
+                    )
+                manifest["state"] = "stop-failed"
+        if "parent" in shutdown_by_role and all(
+            role in shutdown_by_role for role in children
+        ):
+            try:
+                result["shutdownEvidence"] = analyze_shutdown_evidence(
+                    shutdown_by_role["parent"],
+                    "\n".join(shutdown_by_role[role] for role in children),
+                )
+            except B7Error as shutdown_error:
+                manifest["state"] = "stop-failed"
+                if failure is None:
+                    failure = shutdown_error
+        if failure is not None:
+            manifest["error"] = str(failure)
+        manifest["result"] = result
+        write_json(args.manifest, manifest)
+    if failure is not None:
+        raise failure
+    print(args.manifest)
+    return 0
+
+
 def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest = load_json(args.manifest)
+    case_value = manifest.get("case")
+    topology = manifest.get("topology")
+    if topology is None and isinstance(case_value, dict):
+        topology = case_value.get("topology", "queue")
+    if topology == "fanout":
+        return command_run_fanout(args, inventory, manifest)
     run_id = validate_run_id(str(manifest.get("runId", "")))
     generated = manifest.get("generated")
     if not isinstance(generated, dict) or not {"parent", "child"}.issubset(generated):
@@ -1833,8 +2371,10 @@ def command_cleanup(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest = load_json(args.manifest)
     run_id = validate_run_id(str(manifest.get("runId", "")))
     generated = manifest.get("generated")
-    if not isinstance(generated, dict) or not {"parent", "child"}.issubset(generated):
-        raise B7Error("manifest has no generated parent/child layout")
+    if not isinstance(generated, dict) or "parent" not in generated:
+        raise B7Error("manifest has no generated parent layout")
+    children = child_roles(generated)
+    roles = ["parent", *children]
     targets = {
         "roles": {
             role: {
@@ -1842,7 +2382,7 @@ def command_cleanup(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 "runDir": generated[role]["runDir"],
                 "storage": generated[role]["storage"],
             }
-            for role in ("parent", "child")
+            for role in roles
         },
         "origin": manifest["origin"]["path"],
     }
@@ -1853,7 +2393,7 @@ def command_cleanup(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     prepared_roles = manifest.get("remote", {})
     if not isinstance(prepared_roles, dict):
         raise B7Error("manifest remote resources must be an object")
-    for role in ("child", "parent"):
+    for role in [*reversed(children), "parent"]:
         record = prepared_roles.get(role)
         if record is None:
             record = {"status": "recovering-legacy"}

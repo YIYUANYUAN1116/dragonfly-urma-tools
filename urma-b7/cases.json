@@ -9,6 +9,9 @@
     {"name": "concurrent-post1-in32-c8", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 8, "repetitions": 3, "warmups": 1, "category": "concurrency"},
     {"name": "concurrent-post8-in64-c2", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "concurrency"},
     {"name": "concurrent-post8-in64-c4", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "concurrency"},
-    {"name": "concurrent-post8-in64-c8", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 8, "repetitions": 3, "warmups": 1, "category": "concurrency"}
+    {"name": "concurrent-post8-in64-c8", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 8, "repetitions": 3, "warmups": 1, "category": "concurrency"},
+    {"name": "fanout-post1-in32-l2", "fileClass": "1g", "topology": "fanout", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
+    {"name": "fanout-post1-in32-l4", "fileClass": "1g", "topology": "fanout", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
+    {"name": "fanout-post8-in64-l2", "fileClass": "1g", "topology": "fanout", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "multi-lane"}
   ]
 }

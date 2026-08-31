@@ -50,6 +50,23 @@ class B7Tests(unittest.TestCase):
         self.assertTrue(set(parent["ports"].values()).isdisjoint(child["ports"].values()))
         self.assertEqual(plan["parentNode"], plan["childNode"])
 
+    def test_fanout_layout_isolates_child_roles_and_ports(self):
+        _, _, generated = b7.generated_layout(
+            self.inventory, "dual", "b7-fanout", None, child_count=4
+        )
+        children = b7.child_roles(generated)
+        self.assertEqual(
+            children,
+            ["child-001", "child-002", "child-003", "child-004"],
+        )
+        port_sets = [set(generated[role]["ports"].values()) for role in children]
+        for index, ports in enumerate(port_sets):
+            self.assertTrue(
+                all(ports.isdisjoint(other) for other in port_sets[index + 1 :])
+            )
+        self.assertEqual(generated["child-001"]["node"], "node2")
+        self.assertIn("/child-004/", generated["child-004"]["socket"])
+
     def test_generated_paths_stay_in_scoped_roots(self):
         plan = b7.build_plan(self.inventory, "single", "b7-test", "node2")
         for role in ("parent", "child"):
@@ -126,6 +143,74 @@ storage:
             manifest = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(manifest["state"], "planned")
             self.assertEqual(manifest["remote"], {})
+
+    def test_prepare_fanout_generates_one_layout_per_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "manifest.json"
+            status = b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-fanout",
+                    "--case",
+                    "fanout-post1-in32-l2",
+                    "--output",
+                    str(output),
+                ]
+            )
+            self.assertEqual(status, 0)
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["topology"], "fanout")
+            self.assertEqual(
+                b7.child_roles(manifest["generated"]), ["child-001", "child-002"]
+            )
+
+    def test_execute_prepare_creates_every_fanout_role(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "manifest.json"
+            prepared_roles = []
+
+            def prepare_role(
+                _node, _inventory, _layout, role, _run_id, _rendered
+            ):
+                prepared_roles.append(role)
+                return {"configSha256": f"sha-{role}"}
+
+            with (
+                mock.patch.object(b7, "read_remote_file", return_value="host: {}\n"),
+                mock.patch.object(
+                    b7, "prepare_remote_role", side_effect=prepare_role
+                ),
+                mock.patch.object(
+                    b7,
+                    "prepare_origin",
+                    return_value={"sha256": "same", "ownerMarker": "marker"},
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(
+                        [
+                            "prepare",
+                            "--mode",
+                            "dual",
+                            "--run-id",
+                            "b7-fanout-prepare",
+                            "--case",
+                            "fanout-post1-in32-l2",
+                            "--output",
+                            str(output),
+                            "--execute",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                prepared_roles, ["parent", "child-001", "child-002"]
+            )
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["state"], "prepared")
 
     def test_prepare_remote_role_uses_scoped_paths_and_port_gate(self):
         _, _, generated = b7.generated_layout(self.inventory, "single", "b7-test", "node1")
@@ -333,6 +418,50 @@ storage:
         self.assertTrue(all(result["daemonLogLastLine"] == 80 for result in results))
         self.assertEqual(len({result["expectedTaskId"] for result in results}), 2)
 
+    def test_fanout_dfget_batch_uses_distinct_endpoints_and_one_barrier(self):
+        _, _, generated = b7.generated_layout(
+            self.inventory, "dual", "b7-fanout", None, child_count=2
+        )
+        completed = b7.subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                "1\t0\t1048576\tsame\t1000000\t1000000000\t1001000000\n"
+                "2\t0\t1048576\tsame\t1100000\t1000000100\t1001100100\n"
+                "RANGE\t1\t11\t30\n"
+                "RANGE\t2\t21\t40\n"
+            ),
+            stderr="",
+        )
+        specs = [
+            (
+                role,
+                generated[role],
+                f"b7-fanout-sample-001-lane-{index:03d}",
+                f"sample-001-lane-{index:03d}",
+            )
+            for index, role in enumerate(b7.child_roles(generated), 1)
+        ]
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            results = b7.run_remote_dfget_fanout_batch(
+                self.inventory["nodes"]["node2"],
+                self.inventory,
+                "http://example.test/input.bin",
+                specs,
+                "sample-001",
+            )
+        script = execute.call_args.args[2]
+        syntax = b7.subprocess.run(
+            ["bash", "-n"], input=script, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        self.assertIn(generated["child-001"]["socket"], script)
+        self.assertIn(generated["child-002"]["socket"], script)
+        self.assertEqual(script.count("while [ ! -e"), 2)
+        self.assertEqual([result["role"] for result in results], b7.child_roles(generated))
+        self.assertEqual(results[0]["daemonLogFirstLine"], 11)
+        self.assertEqual(results[1]["daemonLogLastLine"], 40)
+
     def test_run_rejects_legacy_cross_filesystem_output_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -449,6 +578,49 @@ storage:
                     recovered["remote"][resource]["status"] == "cleaned"
                     for resource in ("parent", "child", "origin")
                 )
+            )
+
+    def test_cleanup_covers_every_fanout_role(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-fanout-clean",
+                    "--case",
+                    "fanout-post1-in32-l2",
+                    "--output",
+                    str(manifest_path),
+                ]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["state"] = "prepare-failed"
+            manifest["remote"] = {}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            cleaned = []
+            with (
+                mock.patch.object(
+                    b7,
+                    "cleanup_remote_role",
+                    side_effect=lambda _node, _inventory, _layout, role, _run_id: cleaned.append(role),
+                ),
+                mock.patch.object(
+                    b7,
+                    "cleanup_legacy_origin",
+                    side_effect=lambda *_args: cleaned.append("origin"),
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(
+                        ["cleanup", "--manifest", str(manifest_path), "--execute"]
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                cleaned, ["child-002", "child-001", "parent", "origin"]
             )
 
     def test_legacy_origin_cleanup_requires_seed_hard_link(self):
@@ -746,6 +918,19 @@ storage:
         self.assertIn("task-a", scoped)
         self.assertNotIn("task-b", scoped)
 
+    def test_fanout_lane_evidence_requires_distinct_parent_lanes(self):
+        log = "\n".join(
+            (
+                '2026-08-31T10:41:35Z DEBUG lane_id=3 task_id="task-a" start upload',
+                '2026-08-31T10:41:35Z DEBUG lane_id=4 task_id="task-b" start upload',
+            )
+        )
+        summary = b7.analyze_fanout_lanes(log, {"task-a", "task-b"})
+        self.assertEqual(summary["laneCount"], 2)
+        self.assertEqual(summary["laneIds"], [3, 4])
+        with self.assertRaisesRegex(b7.B7Error, "distinct"):
+            b7.analyze_fanout_lanes(log.replace("lane_id=4", "lane_id=3"), {"task-a", "task-b"})
+
     def test_task_timing_summary_uses_only_supplied_measured_samples(self):
         samples = [
             {
@@ -986,6 +1171,142 @@ storage:
             self.assertEqual(len(transfer["batches"]["samples"]), 3)
             self.assertEqual(transfer["concurrentSummary"]["concurrency"], 2)
             self.assertEqual(len(transfer["measuredTaskIds"]), 6)
+
+    def test_fanout_case_records_distinct_lane_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-fanout",
+                    "--case",
+                    "fanout-post1-in32-l2",
+                    "--output",
+                    str(manifest_path),
+                ]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["state"] = "prepared"
+            manifest["remote"] = {"origin": {"sha256": "same"}}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            task_logs = {}
+
+            def preheat(
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+            ):
+                return {
+                    "bytes": 1024 * 1024,
+                    "sha256": "same",
+                    "elapsedNs": 1_000_000,
+                    "startedAtUnixNs": 1_000_000_000,
+                    "finishedAtUnixNs": 1_001_000_000,
+                    "taskTag": task_tag,
+                    "expectedTaskId": b7.standard_task_id(url, task_tag),
+                }
+
+            def fanout(_node, _inventory, url, specs, _suffix):
+                results = []
+                for worker, (role, _layout, task_tag, _artifact) in enumerate(specs, 1):
+                    task_id = b7.standard_task_id(url, task_tag)
+                    first = len(task_logs) + 100
+                    task_logs[(role, first)] = (
+                        f'2026-08-31T10:41:35.100000000Z DEBUG finished piece '
+                        f'{task_id}-0 from parent Some("parent") using protocol urma '
+                        f'task_id="{task_id}"\n'
+                    )
+                    results.append(
+                        {
+                            "bytes": 1024 * 1024,
+                            "sha256": "same",
+                            "elapsedNs": 1_000_000,
+                            "startedAtUnixNs": 1_000_000_000 + worker,
+                            "finishedAtUnixNs": 1_001_000_000 + worker,
+                            "daemonLogFirstLine": first,
+                            "daemonLogLastLine": first,
+                            "taskTag": task_tag,
+                            "expectedTaskId": task_id,
+                            "workerIndex": worker,
+                            "role": role,
+                        }
+                    )
+                return results
+
+            parent_lines = []
+            for label, count in (("warmup", 1), ("sample", 3)):
+                for batch in range(1, count + 1):
+                    for worker in (1, 2):
+                        tag = (
+                            f"b7-fanout-{label}-{batch:03d}-lane-{worker:03d}"
+                        )
+                        task_id = b7.standard_task_id(
+                            manifest["origin"]["url"], tag
+                        )
+                        parent_lines.append(
+                            f'lane_id={worker} task_id="{task_id}"'
+                        )
+            parent_log = "\n".join(parent_lines)
+
+            def collect_range(_node, _inventory, layout, first, _last):
+                role = PurePosixPath(layout["runDir"]).name
+                if role == "parent":
+                    return parent_log
+                return task_logs[(role, first)]
+
+            def evidence(_node, _inventory, layout):
+                role = PurePosixPath(layout["runDir"]).name
+                if role == "parent":
+                    return "finished uploading piece content over urma\n" * 2
+                return "finished dragonfly urma piece attempt success=true\n"
+
+            with (
+                mock.patch.object(
+                    b7, "start_remote_role", return_value={"pid": 1, "target": "test"}
+                ),
+                mock.patch.object(b7, "run_remote_dfget", side_effect=preheat),
+                mock.patch.object(
+                    b7, "run_remote_dfget_fanout_batch", side_effect=fanout
+                ),
+                mock.patch.object(
+                    b7, "collect_remote_log_range", side_effect=collect_range
+                ),
+                mock.patch.object(
+                    b7,
+                    "analyze_task_timing",
+                    return_value={
+                        "taskId": "task",
+                        "pieceCompletions": 1,
+                        "startToFirstPieceNs": 100_000,
+                        "firstToLastPieceNs": 800_000,
+                        "lastPieceToDfgetEndNs": 100_000,
+                        "dfgetElapsedNs": 1_000_000,
+                    },
+                ),
+                mock.patch.object(b7, "collect_remote_evidence", side_effect=evidence),
+                mock.patch.object(b7, "remote_log_line_count", return_value=10),
+                mock.patch.object(b7, "collect_remote_log_since", return_value=""),
+                mock.patch.object(
+                    b7, "stop_remote_role", return_value={"result": "stopped"}
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    0,
+                )
+            finished = json.loads(manifest_path.read_text(encoding="utf-8"))
+            transfer = finished["result"]["transfer"]
+            self.assertEqual(transfer["topology"], "fanout")
+            self.assertEqual(len(transfer["samples"]), 6)
+            self.assertEqual(
+                transfer["batches"]["samples"][0]["laneEvidence"]["laneCount"],
+                2,
+            )
+            self.assertEqual(
+                set(finished["result"]["started"]),
+                {"parent", "child-001", "child-002"},
+            )
 
 
 if __name__ == "__main__":
