@@ -289,6 +289,50 @@ storage:
         self.assertEqual(result["daemonLogFirstLine"], 11)
         self.assertEqual(result["daemonLogLastLine"], 20)
 
+    def test_standard_task_id_matches_dragonfly_url_based_vector(self):
+        self.assertEqual(
+            b7.standard_task_id("https://example.com", "foo"),
+            "3c3f230ef9f191dd2821510346a7bc138e4894bee9aee184ba250a3040701d2a",
+        )
+
+    def test_concurrent_dfget_batch_uses_remote_barrier_and_shared_log_range(self):
+        _, _, generated = b7.generated_layout(self.inventory, "dual", "b7-test", None)
+        completed = b7.subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                "1\t0\t1048576\tsame\t1000000\t1000000000\t1001000000\n"
+                "2\t0\t1048576\tsame\t1200000\t1000000100\t1001200100\n"
+                "LOG\t21\t80\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            results = b7.run_remote_dfget_batch(
+                self.inventory["nodes"]["node2"],
+                self.inventory,
+                generated["child"],
+                "http://example.test/input.bin",
+                True,
+                [
+                    ("b7-test-sample-001-worker-001", "sample-001-worker-001"),
+                    ("b7-test-sample-001-worker-002", "sample-001-worker-002"),
+                ],
+                "sample-001",
+            )
+        script = execute.call_args.args[2]
+        syntax = b7.subprocess.run(
+            ["bash", "-n"], input=script, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        self.assertIn(".sample-001.start", script)
+        self.assertEqual(script.count("while [ ! -e"), 2)
+        self.assertLess(script.index(") &"), script.index("touch "))
+        self.assertEqual([result["workerIndex"] for result in results], [1, 2])
+        self.assertTrue(all(result["daemonLogFirstLine"] == 21 for result in results))
+        self.assertTrue(all(result["daemonLogLastLine"] == 80 for result in results))
+        self.assertEqual(len({result["expectedTaskId"] for result in results}), 2)
+
     def test_run_rejects_legacy_cross_filesystem_output_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -607,6 +651,39 @@ storage:
         self.assertEqual(summary["throughputMiBps"]["median"], 1.5)
         self.assertEqual(summary["throughputMiBps"]["aggregate"], 1.5)
 
+    def test_concurrent_batch_summary_uses_makespan_and_reports_fairness(self):
+        transfers = [
+            {
+                "child": {
+                    "bytes": 1024 * 1024,
+                    "elapsedNs": 1_000_000_000,
+                    "startedAtUnixNs": 1_000_000_000,
+                    "finishedAtUnixNs": 2_000_000_000,
+                    "throughputMiBps": 1.0,
+                }
+            },
+            {
+                "child": {
+                    "bytes": 1024 * 1024,
+                    "elapsedNs": 1_000_000_000,
+                    "startedAtUnixNs": 1_100_000_000,
+                    "finishedAtUnixNs": 2_100_000_000,
+                    "throughputMiBps": 1.0,
+                }
+            },
+        ]
+        summary = b7.concurrent_batch_summary(transfers)
+        self.assertEqual(summary["concurrency"], 2)
+        self.assertEqual(summary["makespanNs"], 1_100_000_000)
+        self.assertAlmostEqual(summary["aggregateThroughputMiBps"], 2 / 1.1)
+        self.assertEqual(summary["jainFairnessIndex"], 1.0)
+        aggregate = b7.concurrent_batches_summary(
+            [{"summary": summary}, {"summary": summary}]
+        )
+        self.assertEqual(aggregate["batches"], 2)
+        self.assertEqual(aggregate["concurrency"], 2)
+        self.assertAlmostEqual(aggregate["aggregateThroughputMiBps"], 2 / 1.1)
+
     def test_task_timing_splits_dfget_wall_time(self):
         first_line = (
             '2026-08-31T10:41:35.100000000Z DEBUG finished piece task-0 '
@@ -636,6 +713,38 @@ storage:
             + timing["lastPieceToDfgetEndNs"],
             timing["dfgetElapsedNs"],
         )
+
+    def test_task_timing_filters_overlapping_concurrent_task_logs(self):
+        task_a = (
+            '2026-08-31T10:41:35.100000000Z DEBUG finished piece task-a-0 '
+            'from parent Some("parent") using protocol urma task_id="task-a"'
+        )
+        task_b = (
+            '2026-08-31T10:41:35.200000000Z DEBUG finished piece task-b-0 '
+            'from parent Some("parent") using protocol urma task_id="task-b"'
+        )
+        task_a_last = (
+            '2026-08-31T10:41:35.500000000Z DEBUG finished piece task-a-1 '
+            'from parent Some("parent") using protocol urma task_id="task-a"'
+        )
+        started = b7.parse_log_timestamp_ns(task_a) - 50_000_000
+        finished = b7.parse_log_timestamp_ns(task_a_last) + 50_000_000
+        timing = b7.analyze_task_timing(
+            {
+                "startedAtUnixNs": started,
+                "finishedAtUnixNs": finished,
+                "elapsedNs": finished - started,
+            },
+            "\n".join((task_a, task_b, task_a_last)),
+            "task-a",
+        )
+        self.assertEqual(timing["taskId"], "task-a")
+        self.assertEqual(timing["pieceCompletions"], 2)
+        scoped = b7.filter_task_scoped_log(
+            "\n".join((task_a, task_b, task_a_last)), {"task-a"}
+        )
+        self.assertIn("task-a", scoped)
+        self.assertNotIn("task-b", scoped)
 
     def test_task_timing_summary_uses_only_supplied_measured_samples(self):
         samples = [
@@ -774,6 +883,109 @@ storage:
             self.assertTrue(
                 (Path(directory) / "evidence" / "child.sample-005.log").is_file()
             )
+
+    def test_concurrent_case_runs_measured_batches_and_records_task_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-concurrent",
+                    "--case",
+                    "concurrent-post8-in64-c2",
+                    "--output",
+                    str(manifest_path),
+                ]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["state"] = "prepared"
+            manifest["remote"] = {"origin": {"sha256": "same"}}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            def preheat(
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+            ):
+                return {
+                    "bytes": 1024 * 1024,
+                    "sha256": "same",
+                    "elapsedNs": 1_000_000,
+                    "startedAtUnixNs": 1_000_000_000,
+                    "finishedAtUnixNs": 1_001_000_000,
+                    "daemonLogFirstLine": 1,
+                    "daemonLogLastLine": 2,
+                    "taskTag": task_tag,
+                    "expectedTaskId": b7.standard_task_id(url, task_tag),
+                }
+
+            batch_calls = []
+
+            def batch(_node, _inventory, _layout, url, _disable, specs, suffix):
+                batch_calls.append((suffix, list(specs)))
+                return [
+                    {
+                        "bytes": 1024 * 1024,
+                        "sha256": "same",
+                        "elapsedNs": 1_000_000,
+                        "startedAtUnixNs": 1_000_000_000 + worker,
+                        "finishedAtUnixNs": 1_001_000_000 + worker,
+                        "daemonLogFirstLine": 1,
+                        "daemonLogLastLine": 20,
+                        "taskTag": task_tag,
+                        "expectedTaskId": b7.standard_task_id(url, task_tag),
+                        "workerIndex": worker,
+                    }
+                    for worker, (task_tag, _artifact) in enumerate(specs, 1)
+                ]
+
+            with (
+                mock.patch.object(
+                    b7, "start_remote_role", return_value={"pid": 1, "target": "test"}
+                ),
+                mock.patch.object(b7, "run_remote_dfget", side_effect=preheat),
+                mock.patch.object(b7, "run_remote_dfget_batch", side_effect=batch),
+                mock.patch.object(b7, "collect_remote_log_range", return_value="task log"),
+                mock.patch.object(
+                    b7,
+                    "analyze_task_timing",
+                    return_value={
+                        "taskId": "task",
+                        "pieceCompletions": 256,
+                        "startToFirstPieceNs": 100_000,
+                        "firstToLastPieceNs": 800_000,
+                        "lastPieceToDfgetEndNs": 100_000,
+                        "dfgetElapsedNs": 1_000_000,
+                    },
+                ),
+                mock.patch.object(
+                    b7,
+                    "collect_remote_evidence",
+                    side_effect=[
+                        "finished uploading piece content over urma\n" * 8,
+                        "finished dragonfly urma piece attempt success=true\n" * 8,
+                    ],
+                ),
+                mock.patch.object(b7, "remote_log_line_count", return_value=10),
+                mock.patch.object(b7, "collect_remote_log_since", return_value=""),
+                mock.patch.object(
+                    b7, "stop_remote_role", return_value={"result": "stopped"}
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    0,
+                )
+            self.assertEqual(len(batch_calls), 4)
+            self.assertTrue(all(len(specs) == 2 for _suffix, specs in batch_calls))
+            finished = json.loads(manifest_path.read_text(encoding="utf-8"))
+            transfer = finished["result"]["transfer"]
+            self.assertEqual(transfer["concurrency"], 2)
+            self.assertEqual(len(transfer["samples"]), 6)
+            self.assertEqual(len(transfer["batches"]["samples"]), 3)
+            self.assertEqual(transfer["concurrentSummary"]["concurrency"], 2)
+            self.assertEqual(len(transfer["measuredTaskIds"]), 6)
 
 
 if __name__ == "__main__":

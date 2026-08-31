@@ -20,6 +20,7 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from yaml_overlay import OverlayError, apply as apply_yaml_overlays
 
@@ -70,6 +71,26 @@ def validate_run_id(run_id: str) -> str:
     if not RUN_ID_RE.fullmatch(run_id):
         raise B7Error("run id must match [a-z0-9][a-z0-9._-]{0,63}")
     return run_id
+
+
+def standard_task_id(url: str, tag: str) -> str:
+    """Reproduce Dragonfly's URL-based standard task ID for B7-owned dfget calls.
+
+    B7 does not pass application, revision, piece-length, or filtered query parameters. Keeping
+    this helper explicit lets concurrent daemon-log ranges be split by task ID instead of by
+    overlapping wall-clock intervals.
+    """
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        raise B7Error(f"cannot derive task ID from invalid URL: {url}")
+    normalized = urlunsplit(parts)
+    if parts.path == "/" and normalized.endswith("/"):
+        normalized = normalized[:-1]
+    digest = hashlib.sha256()
+    digest.update(normalized.encode())
+    digest.update(tag.encode())
+    digest.update(b"STANDARD")
+    return digest.hexdigest()
 
 
 def default_run_id() -> str:
@@ -448,9 +469,149 @@ printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
         "daemonLogFirstLine": int(fields[5]),
         "daemonLogLastLine": int(fields[6]),
         "taskTag": task_tag,
+        "expectedTaskId": standard_task_id(url, task_tag),
         "output": output,
         "transferLog": transfer_log,
     }
+
+
+def run_remote_dfget_batch(
+    node: dict[str, Any],
+    inventory: dict[str, Any],
+    layout: dict[str, Any],
+    url: str,
+    disable_back_to_source: bool,
+    transfers: list[tuple[str, str]],
+    batch_suffix: str,
+) -> list[dict[str, Any]]:
+    """Start several dfget processes behind one remote barrier and wait for all of them."""
+    if not transfers:
+        raise B7Error("concurrent dfget batch cannot be empty")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", batch_suffix):
+        raise B7Error(f"invalid transfer batch suffix: {batch_suffix}")
+    binary = str(
+        PurePosixPath(node["repo"])
+        / inventory["dragonfly"]["binaryRelativePaths"]["dfget"]
+    )
+    barrier = str(PurePosixPath(layout["runDir"]) / f".{batch_suffix}.start")
+    result_paths: list[str] = []
+    launch_blocks: list[str] = []
+    for worker, (task_tag, artifact_suffix) in enumerate(transfers, 1):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", artifact_suffix):
+            raise B7Error(f"invalid transfer artifact suffix: {artifact_suffix}")
+        output = f"{layout['output']}.{artifact_suffix}"
+        transfer_log = f"{layout['transferLog']}.{artifact_suffix}"
+        result_path = str(
+            PurePosixPath(layout["runDir"])
+            / f".{batch_suffix}.worker-{worker:03d}.result"
+        )
+        result_paths.append(result_path)
+        args = [
+            binary,
+            "--endpoint",
+            layout["socket"],
+            url,
+            "-O",
+            output,
+            "--overwrite",
+            "--tag",
+            task_tag,
+        ]
+        if disable_back_to_source:
+            args.append("--disable-back-to-source")
+        command = " ".join(shlex.quote(value) for value in args)
+        launch_blocks.append(
+            "\n".join(
+                [
+                    "(",
+                    f"  while [ ! -e {shlex.quote(barrier)} ]; do :; done",
+                    "  start=$(date +%s%N)",
+                    f"  timeout 600 {command} >{shlex.quote(transfer_log)} 2>&1",
+                    "  status=$?",
+                    "  end=$(date +%s%N)",
+                    "  bytes=0",
+                    "  sha=-",
+                    '  if [ "$status" -eq 0 ]; then',
+                    f"    bytes=$(stat -c %s {shlex.quote(output)})",
+                    f"    sha=$(sha256sum {shlex.quote(output)} | awk '{{print $1}}')",
+                    "  fi",
+                    "  printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \\",
+                    f'    {worker} "$status" "$bytes" "$sha" "$((end-start))" "$start" "$end" >{shlex.quote(result_path)}',
+                    '  exit "$status"',
+                    ") &",
+                    'pids="$pids $!"',
+                ]
+            )
+        )
+
+    daemon_log = shlex.quote(layout["log"])
+    cleanup_paths = " ".join(shlex.quote(path) for path in [barrier, *result_paths])
+    result_paths_shell = " ".join(shlex.quote(path) for path in result_paths)
+    script = "\n".join(
+        [
+            "set -u",
+            "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy",
+            "export NO_PROXY='*' no_proxy='*'",
+            f"export LD_LIBRARY_PATH={shlex.quote(inventory['urma']['libDir'])}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}",
+            f"rm -f {cleanup_paths}",
+            f"log_start=$(wc -l < {daemon_log})",
+            'pids=""',
+            *launch_blocks,
+            f"touch {shlex.quote(barrier)}",
+            "batch_status=0",
+            'for pid in $pids; do if ! wait "$pid"; then batch_status=1; fi; done',
+            f"log_end=$(wc -l < {daemon_log})",
+            f"cat {result_paths_shell}",
+            "printf 'LOG\\t%s\\t%s\\n' \"$((log_start+1))\" \"$log_end\"",
+            'exit "$batch_status"',
+        ]
+    )
+    completed = ssh_script(node, inventory, script, timeout=630)
+    lines = completed.stdout.strip().splitlines()
+    if not lines or not lines[-1].startswith("LOG\t"):
+        raise B7Error(f"unexpected concurrent dfget result from {ssh_target(node)}")
+    log_fields = lines.pop().split("\t")
+    if len(log_fields) != 3:
+        raise B7Error(f"invalid concurrent daemon log range from {ssh_target(node)}")
+    first_line, last_line = int(log_fields[1]), int(log_fields[2])
+    parsed: dict[int, dict[str, Any]] = {}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 7:
+            raise B7Error(f"invalid concurrent dfget worker result from {ssh_target(node)}")
+        worker = int(fields[0])
+        parsed[worker] = {
+            "status": int(fields[1]),
+            "bytes": int(fields[2]),
+            "sha256": fields[3],
+            "elapsedNs": int(fields[4]),
+            "startedAtUnixNs": int(fields[5]),
+            "finishedAtUnixNs": int(fields[6]),
+        }
+    if len(parsed) != len(transfers):
+        raise B7Error(f"concurrent dfget batch returned {len(parsed)} workers")
+    failures = [worker for worker, value in parsed.items() if value["status"] != 0]
+    if completed.returncode != 0 or failures:
+        raise B7Error(
+            f"concurrent dfget batch failed on {ssh_target(node)} workers={failures}"
+        )
+    results = []
+    for worker, (task_tag, artifact_suffix) in enumerate(transfers, 1):
+        value = parsed[worker]
+        value.update(
+            {
+                "daemonLogFirstLine": first_line,
+                "daemonLogLastLine": last_line,
+                "taskTag": task_tag,
+                "expectedTaskId": standard_task_id(url, task_tag),
+                "output": f"{layout['output']}.{artifact_suffix}",
+                "transferLog": f"{layout['transferLog']}.{artifact_suffix}",
+                "workerIndex": worker,
+            }
+        )
+        value.pop("status")
+        results.append(value)
+    return results
 
 
 def collect_remote_evidence(
@@ -541,7 +702,9 @@ def parse_log_timestamp_ns(line: str) -> int:
     return seconds * 1_000_000_000 + int(fraction or "0")
 
 
-def analyze_task_timing(transfer: dict[str, Any], task_log: str) -> dict[str, Any]:
+def analyze_task_timing(
+    transfer: dict[str, Any], task_log: str, expected_task_id: str | None = None
+) -> dict[str, Any]:
     completion_lines = [
         line
         for line in task_log.splitlines()
@@ -554,6 +717,17 @@ def analyze_task_timing(transfer: dict[str, Any], task_log: str) -> dict[str, An
     task_id_matches = [TASK_ID_RE.search(line) for line in completion_lines]
     if any(match is None for match in task_id_matches):
         raise B7Error("task log Piece completion is missing task_id")
+    if expected_task_id is not None:
+        completion_lines = [
+            line
+            for line, match in zip(completion_lines, task_id_matches)
+            if match is not None and match.group(1) == expected_task_id
+        ]
+        if not completion_lines:
+            raise B7Error(
+                f"no child URMA Piece completion found for task {expected_task_id}"
+            )
+        task_id_matches = [TASK_ID_RE.search(line) for line in completion_lines]
     task_ids = {match.group(1) for match in task_id_matches if match is not None}
     if len(task_ids) != 1:
         raise B7Error("task log range contains missing or mixed task ids")
@@ -577,6 +751,18 @@ def analyze_task_timing(transfer: dict[str, Any], task_log: str) -> dict[str, An
         "lastPieceToDfgetEndNs": finished - last_piece,
         "dfgetElapsedNs": elapsed,
     }
+
+
+def filter_task_scoped_log(task_log: str, task_ids: set[str]) -> str:
+    """Keep structured daemon lines belonging to measured task IDs only."""
+    if not task_ids:
+        return ""
+    selected = []
+    for line in task_log.splitlines():
+        match = TASK_ID_RE.search(line)
+        if match is not None and match.group(1) in task_ids:
+            selected.append(line)
+    return "\n".join(selected) + ("\n" if selected else "")
 
 
 def analyze_evidence(
@@ -703,6 +889,68 @@ def transfer_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "max": max(rates),
             "aggregate": total_bytes * 1_000_000_000 / total_elapsed_ns / (1024 * 1024),
         },
+    }
+
+
+def concurrent_batch_summary(transfers: list[dict[str, Any]]) -> dict[str, Any]:
+    if not transfers:
+        raise B7Error("concurrent batch requires at least one transfer")
+    children = [transfer["child"] for transfer in transfers]
+    started = min(int(child["startedAtUnixNs"]) for child in children)
+    finished = max(int(child["finishedAtUnixNs"]) for child in children)
+    makespan = finished - started
+    if makespan <= 0:
+        raise B7Error("concurrent batch has a non-positive makespan")
+    rates = [float(child["throughputMiBps"]) for child in children]
+    total_bytes = sum(int(child["bytes"]) for child in children)
+    squared_sum = sum(rate * rate for rate in rates)
+    fairness = (sum(rates) ** 2 / (len(rates) * squared_sum)) if squared_sum else 1.0
+    return {
+        "concurrency": len(children),
+        "startedAtUnixNs": started,
+        "finishedAtUnixNs": finished,
+        "makespanNs": makespan,
+        "completionSkewNs": max(int(child["finishedAtUnixNs"]) for child in children)
+        - min(int(child["finishedAtUnixNs"]) for child in children),
+        "totalBytes": total_bytes,
+        "aggregateThroughputMiBps": total_bytes
+        * 1_000_000_000
+        / makespan
+        / (1024 * 1024),
+        "perTaskThroughputMiBps": {
+            "min": min(rates),
+            "median": statistics.median(rates),
+            "mean": statistics.fmean(rates),
+            "max": max(rates),
+        },
+        "jainFairnessIndex": fairness,
+    }
+
+
+def concurrent_batches_summary(batches: list[dict[str, Any]]) -> dict[str, Any]:
+    if not batches:
+        raise B7Error("at least one measured concurrent batch is required")
+    summaries = [batch["summary"] for batch in batches]
+    concurrency = {int(summary["concurrency"]) for summary in summaries}
+    if len(concurrency) != 1:
+        raise B7Error("measured batches use mixed concurrency")
+    total_bytes = sum(int(summary["totalBytes"]) for summary in summaries)
+    total_makespan = sum(int(summary["makespanNs"]) for summary in summaries)
+    return {
+        "batches": len(batches),
+        "concurrency": concurrency.pop(),
+        "totalBytes": total_bytes,
+        "totalMakespanNs": total_makespan,
+        "aggregateThroughputMiBps": total_bytes
+        * 1_000_000_000
+        / total_makespan
+        / (1024 * 1024),
+        "meanJainFairnessIndex": statistics.fmean(
+            float(summary["jainFairnessIndex"]) for summary in summaries
+        ),
+        "meanCompletionSkewNs": statistics.fmean(
+            int(summary["completionSkewNs"]) for summary in summaries
+        ),
     }
 
 
@@ -1003,6 +1251,9 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         warmups = case.get("warmups", 0)
         if not isinstance(warmups, int) or not 0 <= warmups <= 20:
             raise B7Error(f"case {case['name']} requires warmups in 0..=20")
+        concurrency = case.get("concurrency", 1)
+        if not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
+            raise B7Error(f"case {case['name']} requires concurrency in 1..=16")
         result[case["name"]] = case
     return result
 
@@ -1290,16 +1541,19 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         raise B7Error("manifest has no case")
     repetitions = case.get("repetitions")
     warmups = case.get("warmups", 0)
+    concurrency = case.get("concurrency", 1)
     if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
         raise B7Error("manifest repetitions must be in 1..=100")
     if not isinstance(warmups, int) or not 0 <= warmups <= 20:
         raise B7Error("manifest warmups must be in 0..=20")
+    if not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
+        raise B7Error("manifest concurrency must be in 1..=16")
     operations = [
         "start parent",
-        f"run {warmups} warmup and {repetitions} measured uniquely tagged tasks",
+        f"run {warmups} warmup and {repetitions} measured batches at concurrency {concurrency}",
         "preheat each unique task on parent",
         "start child",
-        "download each task on child with --disable-back-to-source",
+        "release each child batch behind one remote start barrier",
         "split each child task into startup, Piece span, and completion tail",
         "compare SHA-256 and collect evidence",
         "SIGTERM only the two manifest-owned dfdaemon PIDs",
@@ -1318,7 +1572,12 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     started: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     result: dict[str, Any] = {
         "started": {},
-        "transfer": {"warmups": [], "samples": []},
+        "transfer": {
+            "concurrency": concurrency,
+            "warmups": [],
+            "samples": [],
+            "batches": {"warmups": [], "samples": []},
+        },
         "stopped": {},
     }
     failure: B7Error | None = None
@@ -1329,79 +1588,152 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             parent_node, inventory, parent_layout, "parent", run_id
         )
         started.append(("parent", parent_node, parent_layout))
-        iteration_specs = [
-            ("warmups", index, f"{run_id}-warmup-{index:03d}")
-            for index in range(1, warmups + 1)
-        ] + [
-            ("samples", index, f"{run_id}-sample-{index:03d}")
-            for index in range(1, repetitions + 1)
-        ]
+        iteration_batches = []
+        for group, count in (("warmups", warmups), ("samples", repetitions)):
+            label = "warmup" if group == "warmups" else "sample"
+            for index in range(1, count + 1):
+                workers = []
+                for worker in range(1, concurrency + 1):
+                    base = f"{label}-{index:03d}"
+                    suffix = base if concurrency == 1 else f"{base}-worker-{worker:03d}"
+                    tag = f"{run_id}-{suffix}"
+                    workers.append((worker, tag, suffix))
+                iteration_batches.append((group, index, label, workers))
         parent_transfers: dict[str, dict[str, Any]] = {}
         # Preheat every uniquely tagged task before the child joins the scheduler. Once the
         # child is active it can be selected as a reverse parent, which contaminates the fixed
         # origin -> parent -> child benchmark topology.
-        for group, index, task_tag in iteration_specs:
-            suffix = f"{'warmup' if group == 'warmups' else 'sample'}-{index:03d}"
-            parent_transfers[task_tag] = run_remote_dfget(
-                parent_node,
-                inventory,
-                parent_layout,
-                manifest["origin"]["url"],
-                False,
-                task_tag,
-                suffix,
-            )
+        for _group, _index, _label, workers in iteration_batches:
+            for _worker, task_tag, suffix in workers:
+                parent_transfers[task_tag] = run_remote_dfget(
+                    parent_node,
+                    inventory,
+                    parent_layout,
+                    manifest["origin"]["url"],
+                    False,
+                    task_tag,
+                    suffix,
+                )
         result["started"]["child"] = start_remote_role(
             child_node, inventory, child_layout, "child", run_id
         )
         started.append(("child", child_node, child_layout))
         evidence_dir.mkdir(parents=True, exist_ok=True)
-        for group, index, task_tag in iteration_specs:
-            suffix = f"{'warmup' if group == 'warmups' else 'sample'}-{index:03d}"
-            parent_transfer = parent_transfers[task_tag]
-            child_transfer = run_remote_dfget(
-                child_node,
-                inventory,
-                child_layout,
-                manifest["origin"]["url"],
-                True,
-                task_tag,
-                suffix,
+        for group, index, label, workers in iteration_batches:
+            batch_suffix = f"{label}-{index:03d}"
+            parent_log_first = remote_log_line_count(
+                parent_node, inventory, parent_layout
+            ) + 1
+            child_specs = [(task_tag, suffix) for _worker, task_tag, suffix in workers]
+            if concurrency == 1:
+                task_tag, suffix = child_specs[0]
+                child_transfers = [
+                    run_remote_dfget(
+                        child_node,
+                        inventory,
+                        child_layout,
+                        manifest["origin"]["url"],
+                        True,
+                        task_tag,
+                        suffix,
+                    )
+                ]
+            else:
+                child_transfers = run_remote_dfget_batch(
+                    child_node,
+                    inventory,
+                    child_layout,
+                    manifest["origin"]["url"],
+                    True,
+                    child_specs,
+                    batch_suffix,
+                )
+            parent_log_last = remote_log_line_count(parent_node, inventory, parent_layout)
+            child_first = min(
+                int(transfer["daemonLogFirstLine"]) for transfer in child_transfers
+            )
+            child_last = max(
+                int(transfer["daemonLogLastLine"]) for transfer in child_transfers
             )
             task_log = collect_remote_log_range(
                 child_node,
                 inventory,
                 child_layout,
-                child_transfer["daemonLogFirstLine"],
-                child_transfer["daemonLogLastLine"],
+                child_first,
+                child_last,
             )
-            (evidence_dir / f"child.{suffix}.log").write_text(
+            parent_task_log = collect_remote_log_range(
+                parent_node,
+                inventory,
+                parent_layout,
+                parent_log_first,
+                parent_log_last,
+            )
+            (evidence_dir / f"child.{batch_suffix}.log").write_text(
                 task_log, encoding="utf-8"
             )
-            child_transfer["taskTiming"] = analyze_task_timing(
-                child_transfer, task_log
+            (evidence_dir / f"parent.{batch_suffix}.log").write_text(
+                parent_task_log, encoding="utf-8"
             )
-            hashes = {
-                manifest["remote"]["origin"]["sha256"],
-                parent_transfer["sha256"],
-                child_transfer["sha256"],
-            }
-            lengths = {parent_transfer["bytes"], child_transfer["bytes"]}
-            if len(hashes) != 1 or len(lengths) != 1:
-                raise B7Error(
-                    f"origin/parent/child identity check failed for {task_tag}"
+            batch_transfers = []
+            for (worker, task_tag, _suffix), child_transfer in zip(
+                workers, child_transfers
+            ):
+                parent_transfer = parent_transfers[task_tag]
+                expected_task_id = child_transfer.get("expectedTaskId") or standard_task_id(
+                    manifest["origin"]["url"], task_tag
                 )
-            child_transfer["throughputMiBps"] = (
-                child_transfer["bytes"] * 1_000_000_000
-                / child_transfer["elapsedNs"]
-                / (1024 * 1024)
-            )
-            result["transfer"][group].append(
-                {
+                child_transfer["expectedTaskId"] = expected_task_id
+                child_transfer["taskTiming"] = analyze_task_timing(
+                    child_transfer, task_log, expected_task_id
+                )
+                hashes = {
+                    manifest["remote"]["origin"]["sha256"],
+                    parent_transfer["sha256"],
+                    child_transfer["sha256"],
+                }
+                lengths = {parent_transfer["bytes"], child_transfer["bytes"]}
+                if len(hashes) != 1 or len(lengths) != 1:
+                    raise B7Error(
+                        f"origin/parent/child identity check failed for {task_tag}"
+                    )
+                child_transfer["throughputMiBps"] = (
+                    child_transfer["bytes"]
+                    * 1_000_000_000
+                    / child_transfer["elapsedNs"]
+                    / (1024 * 1024)
+                )
+                transfer_result = {
                     "index": index,
+                    "batchIndex": index,
+                    "workerIndex": worker,
                     "taskTag": task_tag,
                     "parent": parent_transfer,
                     "child": child_transfer,
+                }
+                result["transfer"][group].append(transfer_result)
+                batch_transfers.append(transfer_result)
+            task_ids = {
+                transfer["child"]["expectedTaskId"] for transfer in batch_transfers
+            }
+            child_scoped_name = f"child.{batch_suffix}.tasks.log"
+            parent_scoped_name = f"parent.{batch_suffix}.tasks.log"
+            (evidence_dir / child_scoped_name).write_text(
+                filter_task_scoped_log(task_log, task_ids), encoding="utf-8"
+            )
+            (evidence_dir / parent_scoped_name).write_text(
+                filter_task_scoped_log(parent_task_log, task_ids), encoding="utf-8"
+            )
+            result["transfer"]["batches"][group].append(
+                {
+                    "index": index,
+                    "taskIds": sorted(task_ids),
+                    "taskScopedEvidence": {
+                        "parent": parent_scoped_name,
+                        "child": child_scoped_name,
+                    },
+                    "transfers": batch_transfers,
+                    "summary": concurrent_batch_summary(batch_transfers),
                 }
             )
         first_sample = result["transfer"]["samples"][0]
@@ -1414,6 +1746,13 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         result["transfer"]["taskTimingSummary"] = task_timing_summary(
             result["transfer"]["samples"]
         )
+        result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
+            result["transfer"]["batches"]["samples"]
+        )
+        result["transfer"]["measuredTaskIds"] = [
+            sample["child"]["expectedTaskId"]
+            for sample in result["transfer"]["samples"]
+        ]
         evidence_by_role = {}
         for role, node, layout in (
             ("parent", parent_node, parent_layout),

@@ -95,6 +95,38 @@ child 启动前完成全部唯一 task 的 parent preheat，再启动 child 并�
 2 warmup + 5 repetitions 的 1 GiB case 会在 parent/child 各创建 7 个独立 task，执行前需要为两侧
 隔离 storage 和 run directory 预留足够空间，结束后使用 `cleanup` 回收。
 
+### 并发 batch（B7.1）
+
+case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含
+`concurrency` 个唯一 tag/task/output。Parent 仍在 Child 启动前顺序预热全部 task；Child 侧由一个远端
+SSH 脚本启动所有 `dfget` 子进程，待它们全部到达 run-scoped barrier 后统一释放，避免把控制机线程调度
+误当作并发起点。
+
+当前内置第一轮矩阵为 `post1-in32` 与 `post8-in64` 的 `c2/c4/c8`。例如：
+
+```powershell
+python .\b7.py prepare --mode dual --run-id b7-queue-c4 --case concurrent-post8-in64-c4 --execute
+python .\b7.py run --manifest .\results\b7-queue-c4\manifest.json --execute
+```
+
+manifest 同时保留：
+
+- `transfer.samples`：所有 measured task 的平铺明细，供既有逐任务汇总继续使用；
+- `transfer.batches.samples`：每个 measured batch 的 makespan、aggregate MiB/s、completion skew、
+  per-task throughput 和 Jain fairness；
+- `transfer.concurrentSummary`：按 batch makespan 汇总的并发吞吐与平均公平性；
+- `transfer.measuredTaskIds`：本轮 measured task ID；
+- `evidence/{parent,child}.sample-NNN.tasks.log`：只保留对应 batch task ID 的结构化 daemon 行，warmup
+  不会混入 measured 内部 TX/RX/Storage 分解。
+
+task ID 按本工具实际调用的 Dragonfly standard URL-based 规则计算：规范化 URL + tag + `STANDARD`；
+B7 不设置 application、revision、piece length 或 filtered query parameters。若后续 case 增加这些参数，
+必须同步扩展 task-ID helper，不能继续套用当前公式。
+
+这一模式使用同一个 Child daemon 和同一个 Parent，因此当前 URMA `SessionSlot` 会把 Piece 排到一条
+persistent lane 上；它建立的是“上层并发、单 lane 排队”基线。多 Child fan-out 和多 Parent fan-in
+需要扩展为多 role manifest，不能用本模式冒充多 lane transport concurrency。
+
 每轮 child dfget 还会在远端同一时钟上记录 start/end，并按运行前后的 dfdaemon 日志行号保存
 `evidence/child.warmup-NNN.log` 或 `evidence/child.sample-NNN.log`。工具从该范围内真实的 URMA Piece
 completion 提取 first/last Piece，把任务墙钟时间拆成 `startToFirstPieceNs`（调度、建连及首 Piece）、
@@ -117,7 +149,8 @@ downloader` 及 parent penalty 文本同样作为真实 fallback 处理。
 
 ## 当前限制与后续层
 
-当前 `run` 支持 standard-task correctness 与顺序执行的 performance repetitions：唯一 origin、全量
-parent preheat、child `--disable-back-to-source`、逐轮三方 SHA-256、固定拓扑校验、URMA 日志/metrics
-证据以及有序 shutdown。后续仍需增加 persistent/persistent-cache、failpoint、双 lane 定向中断和带
-outstanding WR 的专项 shutdown case。
+当前 `run` 支持 standard-task correctness、顺序 performance repetitions，以及同一 parent/child 上的
+并发 task batch：唯一 origin、全量 parent preheat、child `--disable-back-to-source`、逐 task 三方
+SHA-256、固定拓扑校验、task-ID scoped 日志、URMA 日志/metrics 证据以及有序 shutdown。后续仍需增加
+多 role fan-out/fan-in、persistent/persistent-cache、failpoint、双 lane 定向中断和带 outstanding WR 的
+专项 shutdown case。

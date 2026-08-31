@@ -3,7 +3,12 @@
   "cases": [
     {"name": "smoke-post1-pipe1", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 16, "repetitions": 1, "category": "correctness"},
     {"name": "baseline-post1-pipe2", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 5, "warmups": 2, "category": "performance"},
-    {"name": "batch-post8-pipe2", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "repetitions": 5, "warmups": 2, "category": "performance"}
+    {"name": "batch-post8-pipe2", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "repetitions": 5, "warmups": 2, "category": "performance"},
+    {"name": "concurrent-post1-in32-c2", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "concurrency"},
+    {"name": "concurrent-post1-in32-c4", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "concurrency"},
+    {"name": "concurrent-post1-in32-c8", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 8, "repetitions": 3, "warmups": 1, "category": "concurrency"},
+    {"name": "concurrent-post8-in64-c2", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "concurrency"},
+    {"name": "concurrent-post8-in64-c4", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "concurrency"},
+    {"name": "concurrent-post8-in64-c8", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "concurrency": 8, "repetitions": 3, "warmups": 1, "category": "concurrency"}
   ]
 }
-
