@@ -74,21 +74,27 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 
 ## Performance case
 
-`cases.json` 中的 performance case 会真实执行 `warmups` 和 `repetitions`，不是只记录矩阵参数。每轮
-parent 先完成 preheat，child 再使用 `--disable-back-to-source` 下载；父子使用相同的 `--tag`，而不同
-轮次使用不同 tag，避免后续轮次命中前一轮 task cache。warmup 结果保存但不参与汇总，measured sample
-输出单轮耗时/吞吐及 min、median、mean、p95、max、aggregate 吞吐。一次 2 warmup + 5 repetitions 的
-1 GiB case 会在 parent/child 各创建 7 个独立 task，执行前需要为两侧隔离 storage 预留足够空间，结束后
-使用 `cleanup` 回收。
+`cases.json` 中的 performance case 会真实执行 `warmups` 和 `repetitions`，不是只记录矩阵参数。工具先在
+child 启动前完成全部唯一 task 的 parent preheat，再启动 child 并按相同顺序使用
+`--disable-back-to-source` 下载，避免 scheduler 在后续 preheat 中反向选择已经活跃的 child。父子同一轮
+使用相同 `--tag`，不同轮次使用不同 tag，并分别写入 `output.bin.warmup-NNN` 或
+`output.bin.sample-NNN`，避免 task cache 命中、hard-link 冲突和额外 output copy。warmup 结果保存但不
+参与汇总，measured sample 输出单轮耗时/吞吐及 min、median、mean、p95、max、aggregate 吞吐。一次
+2 warmup + 5 repetitions 的 1 GiB case 会在 parent/child 各创建 7 个独立 task，执行前需要为两侧
+隔离 storage 和 run directory 预留足够空间，结束后使用 `cleanup` 回收。
 
 主证据文件只包含一次 selected-events 扫描和运行中 metrics，不再拼接可能重复的 log tail。工具在发送
 SIGTERM 前记录日志行偏移，停止两端后将新增内容分别保存为 `parent.shutdown.log` 和
 `child.shutdown.log`。受控停机引发的 peer `early eof` 单独计为 `peerCloseEvents`；其他 CQE、completion、
 protocol、digest、Jetty 或 panic 错误会使本轮失败。
 
+证据分析还会固定方向：parent preheat 日志中出现任何从 peer 下载的 Piece，或 child 的 URMA Piece
+来自非预期 parent，都会以 `topology contamination` 失败。`urma download failed, fall back to tcp
+downloader` 及 parent penalty 文本同样作为真实 fallback 处理。
+
 ## 当前限制与后续层
 
-当前 `run` 支持 standard-task correctness 与顺序执行的 performance repetitions：唯一 origin、逐轮
-parent preheat、child `--disable-back-to-source`、逐轮三方 SHA-256、URMA 日志/metrics 证据以及有序
-shutdown。后续仍需增加 persistent/persistent-cache、failpoint、双 lane 定向中断和带 outstanding WR
-的专项 shutdown case。
+当前 `run` 支持 standard-task correctness 与顺序执行的 performance repetitions：唯一 origin、全量
+parent preheat、child `--disable-back-to-source`、逐轮三方 SHA-256、固定拓扑校验、URMA 日志/metrics
+证据以及有序 shutdown。后续仍需增加 persistent/persistent-cache、failpoint、双 lane 定向中断和带
+outstanding WR 的专项 shutdown case。

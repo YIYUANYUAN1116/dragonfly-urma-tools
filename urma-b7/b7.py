@@ -369,6 +369,7 @@ def run_remote_dfget(
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", artifact_suffix):
         raise B7Error(f"invalid transfer artifact suffix: {artifact_suffix}")
     binary = str(PurePosixPath(node["repo"]) / inventory["dragonfly"]["binaryRelativePaths"]["dfget"])
+    output = f"{layout['output']}.{artifact_suffix}"
     transfer_log = f"{layout['transferLog']}.{artifact_suffix}"
     args = [
         binary,
@@ -376,7 +377,7 @@ def run_remote_dfget(
         layout["socket"],
         url,
         "-O",
-        layout["output"],
+        output,
         "--overwrite",
         "--tag",
         task_tag,
@@ -393,8 +394,8 @@ timeout 600 {command} >{shlex.quote(transfer_log)} 2>&1
 status=$?
 end=$(date +%s%N)
 if [ "$status" -ne 0 ]; then tail -n 100 {shlex.quote(transfer_log)} >&2 || true; exit "$status"; fi
-bytes=$(stat -c %s {shlex.quote(layout['output'])})
-sha=$(sha256sum {shlex.quote(layout['output'])} | awk '{{print $1}}')
+bytes=$(stat -c %s {shlex.quote(output)})
+sha=$(sha256sum {shlex.quote(output)} | awk '{{print $1}}')
 printf '%s\\t%s\\t%s\\n' "$bytes" "$sha" "$((end-start))"
 """
     completed = ssh_script(node, inventory, script, timeout=630)
@@ -408,6 +409,7 @@ printf '%s\\t%s\\t%s\\n' "$bytes" "$sha" "$((end-start))"
         "sha256": fields[1],
         "elapsedNs": int(fields[2]),
         "taskTag": task_tag,
+        "output": output,
         "transferLog": transfer_log,
     }
 
@@ -468,10 +470,31 @@ def collect_remote_log_since(
     return decode_b64(completed.stdout.strip())
 
 
-def analyze_evidence(parent: str, child: str) -> dict[str, int]:
+def analyze_evidence(
+    parent: str, child: str, expected_parent_marker: str | None = None
+) -> dict[str, int]:
     child_attempt_lines = [
         line for line in child.splitlines() if "finished dragonfly urma piece attempt" in line
     ]
+    parent_peer_piece_lines = [
+        line
+        for line in parent.splitlines()
+        if "finished piece " in line and " from parent Some(" in line
+    ]
+    child_peer_piece_lines = [
+        line
+        for line in child.splitlines()
+        if "finished piece " in line
+        and " from parent Some(" in line
+        and " using protocol urma" in line
+    ]
+    fallback_patterns = (
+        "urma download failed, fall back to tcp downloader",
+        "restarting over tcp",
+        "recently failed over urma",
+        "failed its previous urma transfer",
+        "failed to download piece over urma",
+    )
     summary = {
         "parentUrmaFinished": parent.count("finished uploading piece content over urma"),
         "childUrmaAttempts": len(child_attempt_lines),
@@ -484,14 +507,16 @@ def analyze_evidence(parent: str, child: str) -> dict[str, int]:
         + child.count("reused_session=false"),
         "reusedSessionTrue": parent.count("reused_session=true")
         + child.count("reused_session=true"),
+        "parentPeerPieces": len(parent_peer_piece_lines),
+        "unexpectedChildParentPieces": sum(
+            expected_parent_marker is not None
+            and expected_parent_marker not in line
+            for line in child_peer_piece_lines
+        ),
         "fallbackErrors": sum(
-            text.count(pattern)
+            any(pattern in line for pattern in fallback_patterns)
             for text in (parent, child)
-            for pattern in (
-                "restarting over tcp",
-                "recently failed over urma",
-                "failed to download piece over urma",
-            )
+            for line in text.splitlines()
         ),
         "transferErrors": sum(
             bool(
@@ -508,6 +533,12 @@ def analyze_evidence(parent: str, child: str) -> dict[str, int]:
     }
     if summary["parentUrmaFinished"] == 0 or summary["childUrmaSuccesses"] == 0:
         raise B7Error("content matched but logs do not prove an URMA Piece transfer")
+    if summary["parentPeerPieces"] != 0:
+        raise B7Error(
+            "topology contamination: parent preheat downloaded Piece content from a peer"
+        )
+    if summary["unexpectedChildParentPieces"] != 0:
+        raise B7Error("topology contamination: child used an unexpected parent peer")
     if summary["fallbackErrors"] != 0:
         raise B7Error("URMA fallback/error evidence was found in the correctness run")
     if summary["childUrmaAttempts"] != summary["childUrmaSuccesses"]:
@@ -991,10 +1022,13 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             ("samples", index, f"{run_id}-sample-{index:03d}")
             for index in range(1, repetitions + 1)
         ]
-        child_started = False
+        parent_transfers: dict[str, dict[str, Any]] = {}
+        # Preheat every uniquely tagged task before the child joins the scheduler. Once the
+        # child is active it can be selected as a reverse parent, which contaminates the fixed
+        # origin -> parent -> child benchmark topology.
         for group, index, task_tag in iteration_specs:
             suffix = f"{'warmup' if group == 'warmups' else 'sample'}-{index:03d}"
-            parent_transfer = run_remote_dfget(
+            parent_transfers[task_tag] = run_remote_dfget(
                 parent_node,
                 inventory,
                 parent_layout,
@@ -1003,12 +1037,13 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 task_tag,
                 suffix,
             )
-            if not child_started:
-                result["started"]["child"] = start_remote_role(
-                    child_node, inventory, child_layout, "child", run_id
-                )
-                started.append(("child", child_node, child_layout))
-                child_started = True
+        result["started"]["child"] = start_remote_role(
+            child_node, inventory, child_layout, "child", run_id
+        )
+        started.append(("child", child_node, child_layout))
+        for group, index, task_tag in iteration_specs:
+            suffix = f"{'warmup' if group == 'warmups' else 'sample'}-{index:03d}"
+            parent_transfer = parent_transfers[task_tag]
             child_transfer = run_remote_dfget(
                 child_node,
                 inventory,
@@ -1058,7 +1093,9 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             evidence_by_role[role] = evidence
             (evidence_dir / f"{role}.log").write_text(evidence, encoding="utf-8")
         result["evidence"] = analyze_evidence(
-            evidence_by_role["parent"], evidence_by_role["child"]
+            evidence_by_role["parent"],
+            evidence_by_role["child"],
+            expected_parent_marker=f"-{run_id}-parent-",
         )
         manifest["state"] = "passed"
     except (B7Error, OSError) as error:

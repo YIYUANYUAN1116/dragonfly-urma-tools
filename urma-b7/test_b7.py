@@ -137,6 +137,33 @@ storage:
         self.assertIn("/tmp/dragonfly-urma-b7/b7-test/parent", script)
         self.assertEqual(result["configSha256"], "abc123")
 
+    def test_dfget_uses_iteration_specific_output_and_log(self):
+        _, _, generated = b7.generated_layout(self.inventory, "dual", "b7-test", None)
+        completed = b7.subprocess.CompletedProcess(
+            [], 0, stdout="1048576\tsame\t1000000\n", stderr=""
+        )
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            result = b7.run_remote_dfget(
+                self.inventory["nodes"]["node1"],
+                self.inventory,
+                generated["parent"],
+                "http://example.test/input.bin",
+                False,
+                "b7-test-sample-001",
+                "sample-001",
+            )
+        script = execute.call_args.args[2]
+        self.assertIn("output.bin.sample-001", script)
+        self.assertIn("dfget.log.sample-001", script)
+        self.assertEqual(
+            result["output"],
+            "/tmp/dragonfly-urma-b7/b7-test/parent/output.bin.sample-001",
+        )
+        self.assertEqual(
+            result["transferLog"],
+            "/tmp/dragonfly-urma-b7/b7-test/parent/dfget.log.sample-001",
+        )
+
     def test_run_and_cleanup_default_to_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
@@ -293,6 +320,30 @@ storage:
                 "finished dragonfly urma piece attempt success=true\n",
             )
 
+    def test_evidence_rejects_reverse_topology_and_current_fallback_message(self):
+        with self.assertRaisesRegex(b7.B7Error, "topology contamination"):
+            b7.analyze_evidence(
+                "finished uploading piece content over urma\n"
+                "finished piece task-0 from parent Some(\"child\") using protocol urma\n",
+                "finished dragonfly urma piece attempt success=true\n",
+            )
+        with self.assertRaisesRegex(b7.B7Error, "fallback/error"):
+            b7.analyze_evidence(
+                "finished uploading piece content over urma\n",
+                "finished dragonfly urma piece attempt success=true\n"
+                "urma download failed, fall back to tcp downloader: unavailable\n",
+            )
+
+    def test_evidence_rejects_unexpected_child_parent(self):
+        with self.assertRaisesRegex(b7.B7Error, "unexpected parent"):
+            b7.analyze_evidence(
+                "finished uploading piece content over urma\n",
+                "finished dragonfly urma piece attempt success=true\n"
+                "finished piece task-0 from parent Some(\"wrong-parent\") "
+                "using protocol urma\n",
+                expected_parent_marker="-b7-test-parent-",
+            )
+
     def test_shutdown_evidence_classifies_peer_close_but_rejects_other_errors(self):
         summary = b7.analyze_shutdown_evidence(
             "protocol error: URMA rendezvous failed: early eof\n",
@@ -389,7 +440,19 @@ storage:
                 )
             self.assertEqual(len(tags), 14)
             self.assertEqual(len(set(tags)), 7)
-            self.assertEqual(tags[0], tags[1])
+            self.assertEqual(tags[:7], tags[7:])
+            self.assertEqual(
+                tags[:7],
+                [
+                    "b7-perf-warmup-001",
+                    "b7-perf-warmup-002",
+                    "b7-perf-sample-001",
+                    "b7-perf-sample-002",
+                    "b7-perf-sample-003",
+                    "b7-perf-sample-004",
+                    "b7-perf-sample-005",
+                ],
+            )
             finished = json.loads(manifest_path.read_text(encoding="utf-8"))
             transfer_result = finished["result"]["transfer"]
             self.assertEqual(len(transfer_result["warmups"]), 2)
