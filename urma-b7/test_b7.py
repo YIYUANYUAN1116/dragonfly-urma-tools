@@ -39,6 +39,14 @@ class B7Tests(unittest.TestCase):
         child = plan["generated"]["child"]
         self.assertNotEqual(parent["socket"], child["socket"])
         self.assertNotEqual(parent["storage"], child["storage"])
+        self.assertEqual(
+            PurePosixPath(parent["output"]).parent,
+            PurePosixPath(parent["storage"]),
+        )
+        self.assertEqual(
+            PurePosixPath(child["output"]).parent,
+            PurePosixPath(child["storage"]),
+        )
         self.assertTrue(set(parent["ports"].values()).isdisjoint(child["ports"].values()))
         self.assertEqual(plan["parentNode"], plan["childNode"])
 
@@ -268,7 +276,7 @@ storage:
         self.assertIn("log_start=$(wc -l", script)
         self.assertEqual(
             result["output"],
-            "/tmp/dragonfly-urma-b7/b7-test/parent/output.bin.sample-001",
+            "/var/lib/dragonfly-b7/b7-test/parent/output.bin.sample-001",
         )
         self.assertEqual(
             result["transferLog"],
@@ -276,6 +284,32 @@ storage:
         )
         self.assertEqual(result["daemonLogFirstLine"], 11)
         self.assertEqual(result["daemonLogLastLine"], 20)
+
+    def test_run_rejects_legacy_cross_filesystem_output_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "runId": "b7-legacy-output",
+                        "generated": {
+                            "parent": {
+                                "storage": "/var/lib/dragonfly-b7/b7-legacy-output/parent",
+                                "output": "/tmp/dragonfly-urma-b7/b7-legacy-output/parent/output.bin",
+                            },
+                            "child": {
+                                "storage": "/var/lib/dragonfly-b7/b7-legacy-output/child",
+                                "output": "/tmp/dragonfly-urma-b7/b7-legacy-output/child/output.bin",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(b7.B7Error, "output is not storage-local"):
+                b7.command_run(
+                    mock.Mock(manifest=manifest_path, execute=False), self.inventory
+                )
 
     def test_run_and_cleanup_default_to_dry_run(self):
         with tempfile.TemporaryDirectory() as directory:

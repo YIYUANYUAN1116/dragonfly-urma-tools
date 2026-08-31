@@ -88,9 +88,10 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 `cases.json` 中的 performance case 会真实执行 `warmups` 和 `repetitions`，不是只记录矩阵参数。工具先在
 child 启动前完成全部唯一 task 的 parent preheat，再启动 child 并按相同顺序使用
 `--disable-back-to-source` 下载，避免 scheduler 在后续 preheat 中反向选择已经活跃的 child。父子同一轮
-使用相同 `--tag`，不同轮次使用不同 tag，并分别写入 `output.bin.warmup-NNN` 或
-`output.bin.sample-NNN`，避免 task cache 命中、hard-link 冲突和额外 output copy。warmup 结果保存但不
-参与汇总，measured sample 输出单轮耗时/吞吐及 min、median、mean、p95、max、aggregate 吞吐。一次
+使用相同 `--tag`，不同轮次使用不同 tag，并分别写入 storage 目录下的 `output.bin.warmup-NNN` 或
+`output.bin.sample-NNN`。output 与 Dragonfly content storage 位于同一文件系统且每轮目标唯一，使正常
+路径可以 hard link，避免 task cache 命中、目标冲突和跨文件系统的 1 GiB output copy。warmup 结果保存
+但不参与汇总，measured sample 输出单轮耗时/吞吐及 min、median、mean、p95、max、aggregate 吞吐。一次
 2 warmup + 5 repetitions 的 1 GiB case 会在 parent/child 各创建 7 个独立 task，执行前需要为两侧
 隔离 storage 和 run directory 预留足够空间，结束后使用 `cleanup` 回收。
 
@@ -101,6 +102,9 @@ completion 提取 first/last Piece，把任务墙钟时间拆成 `startToFirstPi
 三段必须精确覆盖 `dfgetElapsedNs`，时间戳越界、没有 URMA Piece completion 或混入多个 task id 都会
 使运行失败。每轮明细保存在 child 的 `taskTiming`；`taskTimingSummary` 只汇总 measured samples，warmup
 只保留明细，不参与 mean/median/p95/max 和 aggregate 占比。
+
+output 布局是在 `prepare` 时固化进 manifest 的。旧 manifest 若仍把 output 指向 `/tmp`，新版 `run` 会
+拒绝执行并要求重新 prepare，避免性能结果继续混入跨文件系统 copy；不要直接手工修改已准备的 manifest。
 
 主证据文件只包含一次 selected-events 扫描和运行中 metrics，不再拼接可能重复的 log tail。工具在发送
 SIGTERM 前记录日志行偏移，停止两端后将新增内容分别保存为 `parent.shutdown.log` 和

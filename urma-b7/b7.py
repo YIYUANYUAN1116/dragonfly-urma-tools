@@ -950,7 +950,10 @@ def role_paths(inventory: dict[str, Any], run_id: str, role: str) -> dict[str, s
         "log": safe_remote_path(run_root / role / "dfdaemon.log"),
         "pid": safe_remote_path(run_root / role / "dfdaemon.pid"),
         "cache": safe_remote_path(run_root / role / "cache"),
-        "output": safe_remote_path(run_root / role / "output.bin"),
+        # Keep the dfget destination on the same filesystem as Dragonfly storage so
+        # the completed task can be materialized with a hard link instead of a full
+        # cross-filesystem copy. Per-iteration suffixes keep every destination unique.
+        "output": safe_remote_path(storage_root / "output.bin"),
         "transferLog": safe_remote_path(run_root / role / "dfget.log"),
         "storage": safe_remote_path(storage_root),
     }
@@ -1272,6 +1275,14 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     generated = manifest.get("generated")
     if not isinstance(generated, dict) or not {"parent", "child"}.issubset(generated):
         raise B7Error("manifest has no generated parent/child layout")
+    for role in ("parent", "child"):
+        layout = generated[role]
+        expected_output = str(PurePosixPath(layout["storage"]) / "output.bin")
+        if layout.get("output") != expected_output:
+            raise B7Error(
+                f"manifest {role} output is not storage-local; prepare a new run "
+                "to avoid cross-filesystem output copy"
+            )
     case = manifest.get("case")
     if not isinstance(case, dict):
         raise B7Error("manifest has no case")
