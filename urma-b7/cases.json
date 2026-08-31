@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {"name": "smoke-post1-pipe1", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 16, "repetitions": 1, "category": "correctness"},
+    {"name": "baseline-post1-pipe2", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 5, "warmups": 2, "category": "performance"},
+    {"name": "batch-post8-pipe2", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "repetitions": 5, "warmups": 2, "category": "performance"}
+  ]
+}
+
