@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "ssh": {
+    "connectTimeoutSeconds": 8,
+    "commandTimeoutSeconds": 30,
+    "options": ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+  },
+  "nodes": {
+    "node1": {
+      "host": "90.91.177.158",
+      "user": "root",
+      "roles": ["scheduler", "origin", "parent"],
+      "repo": "/home/yzd/dragonfly/dragonfly-client-urma-private",
+      "config": "/home/yzd/dragonfly/config/dfdaemon-parent.yaml",
+      "schedulerConfig": "/home/yzd/dragonfly/config/scheduler.yaml",
+      "schedulerBinary": "/home/yzd/dragonfly/scheduler"
+    },
+    "node2": {
+      "host": "90.91.177.157",
+      "user": "root",
+      "roles": ["child"],
+      "repo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
+      "config": "/home/y30083740/dragonfly/config/dfdaemon-child.yaml"
+    }
+  },
+  "urma": {
+    "device": "udmac0d1e2",
+    "eidIndex": 1,
+    "fabricTag": "validation-domain",
+    "includeDir": "/usr/include/ub/umdk/urma",
+    "libDir": "/usr/lib64"
+  },
+  "origin": {
+    "node": "node1",
+    "baseUrl": "http://90.91.177.158:8080",
+    "directory": "/var/www/dragonfly",
+    "seedFiles": {"1g": "input-1g.bin"}
+  },
+  "dragonfly": {
+    "defaultSocket": "/var/run/dragonfly/dfdaemon.sock",
+    "defaultStorage": "/var/lib/dragonfly",
+    "binaryRelativePaths": {
+      "dfdaemon": "target/release/dfdaemon",
+      "dfget": "target/release/dfget"
+    }
+  },
+  "singleHost": {
+    "defaultNode": "node1",
+    "runRoot": "/tmp/dragonfly-urma-b7",
+    "storageRoot": "/var/lib/dragonfly-b7",
+    "parentPorts": {"upload": 44000, "health": 44001, "metrics": 44002, "proxy": 44003, "tcp": 44005, "quic": 44006, "stats": 44007, "urma": 44008},
+    "childPorts": {"upload": 44100, "health": 44101, "metrics": 44102, "proxy": 44103, "tcp": 44105, "quic": 44106, "stats": 44107, "urma": 44108}
+  }
+}
