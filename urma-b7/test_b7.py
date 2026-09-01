@@ -1715,6 +1715,23 @@ dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 13
             (2, "16MiB", "8MiB"),
         )
 
+    def test_fanin_l1_l2_pipeline_matrix(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        expected = {
+            "fanin-post1-in32-l1-pipe1": (1, 1),
+            "fanin-post1-in32-l1-pipe2": (1, 2),
+            "fanin-post1-in32-l2-pipe1": (2, 1),
+            "fanin-post1-in32-l2": (2, 2),
+        }
+        for name, (concurrency, pipeline_depth) in expected.items():
+            with self.subTest(case=name):
+                case = cases[name]
+                self.assertEqual(case["topology"], "fanin")
+                self.assertEqual(case["postListSize"], 1)
+                self.assertEqual(case["maxInflightChunks"], 32)
+                self.assertEqual(case["concurrency"], concurrency)
+                self.assertEqual(case["pipelineDepth"], pipeline_depth)
+
     def test_fanin_case_records_per_child_lane_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
