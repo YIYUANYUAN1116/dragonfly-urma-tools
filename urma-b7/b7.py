@@ -1052,6 +1052,187 @@ def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any
     }
 
 
+def analyze_fanin_child_lanes(child_log: str, task_id: str) -> dict[str, Any]:
+    """Per-child server lane evidence for one fanin batch task.
+
+    The scheduler decides which children serve pieces, so a child that did not
+    serve this task (no URMA upload lines) is reported as unserved instead of
+    failing; every served child must keep exactly one stable non-zero lane.
+    """
+    evidence = analyze_fanout_lanes(child_log, {task_id})
+    served = not evidence["missingTaskIds"]
+    stable = (
+        served
+        and not evidence["churnTaskIds"]
+        and not evidence["unboundLaneTaskIds"]
+        and not evidence["duplicateStableLaneIds"]
+    )
+    return {
+        "served": served,
+        "stable": stable,
+        "laneCount": evidence["laneCount"],
+        "laneIds": evidence["laneIds"],
+        "pieceAttemptsByLane": evidence["pieceAttemptsByTaskAndLane"].get(task_id, {}),
+        "stableLaneId": evidence["stableLaneByTask"].get(task_id),
+        "churnTaskIds": evidence["churnTaskIds"],
+        "unboundLaneTaskIds": evidence["unboundLaneTaskIds"],
+        "duplicateStableLaneIds": evidence["duplicateStableLaneIds"],
+    }
+
+
+def analyze_fanin_evidence(parent: str, children: dict[str, str]) -> dict[str, Any]:
+    """Correctness evidence for fanin: children are URMA servers, parent is client.
+
+    Parent client URMA piece completions must match the aggregate child server
+    upload completions; any fallback or transport error fails the run.
+    """
+    fallback_patterns = (
+        "urma download failed, fall back to tcp downloader",
+        "restarting over tcp",
+        "recently failed over urma",
+        "failed its previous urma transfer",
+        "failed to download piece over urma",
+    )
+    per_child: dict[str, Any] = {}
+    total_server_uploads = 0
+    for role in sorted(children):
+        text = children[role]
+        uploads = text.count("finished uploading piece content over urma")
+        total_server_uploads += uploads
+        per_child[role] = {
+            "urmaUploadFinished": uploads,
+            "laneEstablished": text.count("urma peer lane established"),
+            "laneFinished": text.count("urma piece finished on peer lane"),
+        }
+    client_piece_lines = [
+        line
+        for line in parent.splitlines()
+        if "finished piece " in line
+        and " from parent Some(" in line
+        and " using protocol urma" in line
+    ]
+    summary = {
+        "topology": "fanin",
+        "perChild": per_child,
+        "totalServerUploads": total_server_uploads,
+        "clientUrmaPieces": len(client_piece_lines),
+        "fallbackErrors": sum(
+            any(pattern in line for pattern in fallback_patterns)
+            for text in (parent, *children.values())
+            for line in text.splitlines()
+        ),
+        "transferErrors": sum(
+            bool(
+                re.search(
+                    r"cqe.*error|completion error|protocol error|"
+                    r"digest.*(?:error|mismatch)|unknown.*jetty|panic",
+                    line,
+                    re.IGNORECASE,
+                )
+            )
+            for text in (parent, *children.values())
+            for line in text.splitlines()
+        ),
+    }
+    if summary["totalServerUploads"] == 0:
+        raise B7Error("fanin evidence: no child served content over URMA")
+    if summary["clientUrmaPieces"] == 0:
+        raise B7Error("fanin evidence: parent client has no URMA Piece completions")
+    if summary["totalServerUploads"] != summary["clientUrmaPieces"]:
+        raise B7Error(
+            "fanin evidence: child server upload count differs from parent client "
+            "URMA piece completions"
+        )
+    if summary["fallbackErrors"] != 0:
+        raise B7Error("URMA fallback/error evidence was found in the fanin run")
+    if summary["transferErrors"] != 0:
+        raise B7Error("URMA transport error evidence was found before shutdown")
+    return summary
+
+
+def analyze_fanin_transport_health(
+    parent: str, children: dict[str, str]
+) -> dict[str, Any]:
+    """Transport diagnostics for the shared-RX side of a fanin run."""
+    combined_children = "\n".join(children[role] for role in sorted(children))
+    combined = parent + "\n" + combined_children
+    lower_parent = parent.lower()
+    fallback_patterns = (
+        "urma download failed, fall back to tcp downloader",
+        "restarting over tcp",
+        "recently failed over urma",
+        "failed its previous urma transfer",
+        "failed to download piece over urma",
+    )
+    per_child_tx_pressure = {
+        role: {
+            "required": prometheus_counter_value(
+                text,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="tx"', 'stage="required"'),
+            ),
+            "optional": prometheus_counter_value(
+                text,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="tx"', 'stage="optional"'),
+            ),
+        }
+        for role, text in sorted(children.items())
+    }
+    return {
+        "rxBudgetPressure": {
+            "required": prometheus_counter_value(
+                parent,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="rx"', 'stage="required"'),
+            ),
+            "optional": prometheus_counter_value(
+                parent,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="rx"', 'stage="optional"'),
+            ),
+        },
+        "rxBufferUnavailableLines": sum(
+            ("bufferunavailable" in line.lower() or "buffer unavailable" in line.lower())
+            and "rx" in line.lower()
+            for line in parent.splitlines()
+        ),
+        "rxOptionalSingleWindowFallbacks": lower_parent.count(
+            "urma rx second window unavailable"
+        ),
+        "txBudgetPressureByChild": per_child_tx_pressure,
+        "txBudgetPressure": {
+            stage: sum(values[stage] for values in per_child_tx_pressure.values())
+            for stage in ("required", "optional")
+        },
+        "busyOrRejectLines": sum(
+            any(
+                pattern in line.lower()
+                for pattern in ("peer rejected", "code=busy", "error_code_busy")
+            )
+            for line in combined.splitlines()
+        ),
+        "sessionRetirementLines": sum(
+            any(
+                pattern in line.lower()
+                for pattern in (
+                    "retiring cached urma client",
+                    "retire the cached peer session",
+                    "failed its previous urma transfer",
+                )
+            )
+            for line in parent.splitlines()
+        ),
+        "tcpFallbackLines": sum(
+            any(pattern in line.lower() for pattern in fallback_patterns)
+            for line in parent.splitlines()
+        ),
+        "previousTransferFailureLines": lower_parent.count(
+            "previous urma transfer failed"
+        ),
+    }
+
+
 def analyze_evidence(
     parent: str, child: str, expected_parent_marker: str | None = None
 ) -> dict[str, int]:
@@ -1543,10 +1724,12 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         if not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
             raise B7Error(f"case {case['name']} requires concurrency in 1..=16")
         topology = case.get("topology", "queue")
-        if topology not in ("queue", "fanout"):
+        if topology not in ("queue", "fanout", "fanin"):
             raise B7Error(f"case {case['name']} has unsupported topology {topology!r}")
-        if topology == "fanout" and concurrency < 2:
-            raise B7Error(f"case {case['name']} fanout requires concurrency >= 2")
+        if topology in ("fanout", "fanin") and concurrency < 2:
+            raise B7Error(
+                f"case {case['name']} {topology} requires concurrency >= 2"
+            )
         result[case["name"]] = case
     return result
 
@@ -1605,6 +1788,13 @@ def role_overlays(
     node = inventory["nodes"][layout["node"]]
     ports = layout["ports"]
     is_parent = role == "parent"
+    # fanout: only the parent is the URMA server; fanin: every child seeds content
+    # to the parent client, so each child must run its own URMA server on its
+    # offset port range.
+    topology = case.get("topology", "queue")
+    is_urma_server = (topology == "fanin" and not is_parent) or (
+        topology != "fanin" and is_parent
+    )
     return {
         ("host", "hostname"): f"{run_id}-{role}",
         ("host", "ip"): node["host"],
@@ -1616,7 +1806,7 @@ def role_overlays(
         ("storage", "server", "ip"): node["host"],
         ("storage", "server", "tcpPort"): ports["tcp"],
         ("storage", "server", "quicPort"): ports["quic"],
-        ("storage", "server", "urma", "enable"): is_parent,
+        ("storage", "server", "urma", "enable"): is_urma_server,
         ("storage", "server", "urma", "port"): ports["urma"],
         ("storage", "server", "urma", "device"): inventory["urma"]["device"],
         ("storage", "server", "urma", "eidIndex"): inventory["urma"]["eidIndex"],
@@ -1628,7 +1818,7 @@ def role_overlays(
         ("storage", "server", "urma", "pipelineDepth"): case["pipelineDepth"],
         ("storage", "server", "urma", "maxConcurrentTransfers"): case.get("maxConcurrentTransfers", 16),
         ("storage", "server", "urma", "transferTimeout"): case.get("transferTimeout", "30s"),
-        ("storage", "server", "urma", "mmapContent"): is_parent,
+        ("storage", "server", "urma", "mmapContent"): is_urma_server,
         ("proxy", "server", "port"): ports["proxy"],
         ("health", "server", "port"): ports["health"],
         ("metrics", "server", "port"): ports["metrics"],
@@ -1751,7 +1941,7 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         raise B7Error(f"unknown case {args.case}")
     case = cases[args.case]
     topology = case.get("topology", "queue")
-    child_count = case.get("concurrency", 1) if topology == "fanout" else 1
+    child_count = case.get("concurrency", 1) if topology in ("fanout", "fanin") else 1
     parent_node, child_node, generated = generated_layout(
         inventory, args.mode, args.run_id, args.host, child_count
     )
@@ -2202,6 +2392,396 @@ def command_run_fanout(
     return 0
 
 
+def command_run_fanin(
+    args: argparse.Namespace,
+    inventory: dict[str, Any],
+    manifest: dict[str, Any],
+) -> int:
+    """Fanin topology: N child URMA servers seed the single parent client.
+
+    Direction-reversed fanout. Children preheat unique tasks back-to-source
+    from the origin, then the parent daemon concurrently pulls one unique task
+    per child behind a host-local barrier on the parent node. Each child serves
+    pieces over its own URMA lane on its offset urma port.
+    """
+    run_id = validate_run_id(str(manifest.get("runId", "")))
+    generated = manifest.get("generated")
+    if not isinstance(generated, dict) or "parent" not in generated:
+        raise B7Error("fanin manifest has no generated parent layout")
+    children = child_roles(generated)
+    case = manifest.get("case")
+    if not isinstance(case, dict):
+        raise B7Error("fanin manifest has no case")
+    concurrency = case.get("concurrency")
+    repetitions = case.get("repetitions")
+    warmups = case.get("warmups", 0)
+    if (
+        not isinstance(concurrency, int)
+        or not 2 <= concurrency <= 16
+        or concurrency != len(children)
+    ):
+        raise B7Error("fanin concurrency must equal the generated child count")
+    if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
+        raise B7Error("fanin repetitions must be in 1..=100")
+    if not isinstance(warmups, int) or not 0 <= warmups <= 20:
+        raise B7Error("fanin warmups must be in 0..=20")
+    for role in ["parent", *children]:
+        layout = generated[role]
+        expected_output = str(PurePosixPath(layout["storage"]) / "output.bin")
+        if layout.get("output") != expected_output:
+            raise B7Error(f"fanin {role} output is not storage-local")
+    operations = [
+        "start one parent and N child daemons with child URMA servers enabled",
+        f"preheat {concurrency} unique tasks per batch back-to-source on the children",
+        "release one parent-client dfget per task behind one host-local barrier",
+        "prove stable per-child server lane IDs for every batch",
+        "compare per-task SHA-256 and aggregate throughput/fairness",
+        "stop only manifest-owned daemons and inspect shutdown evidence",
+    ]
+    if not args.execute:
+        print(
+            json.dumps(
+                {
+                    "runId": run_id,
+                    "topology": "fanin",
+                    "dryRun": True,
+                    "operations": operations,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if manifest.get("state") != "prepared":
+        raise B7Error("--execute requires a manifest in prepared state")
+
+    parent_layout = generated["parent"]
+    parent_node = inventory["nodes"][parent_layout["node"]]
+    child_nodes = {
+        role: inventory["nodes"][generated[role]["node"]] for role in children
+    }
+    started: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    result: dict[str, Any] = {
+        "started": {},
+        "transfer": {
+            "topology": "fanin",
+            "concurrency": concurrency,
+            "warmups": [],
+            "samples": [],
+            "batches": {"warmups": [], "samples": []},
+        },
+        "stopped": {},
+    }
+    failure: B7Error | None = None
+    evidence_dir = args.manifest.parent / "evidence"
+    shutdown_offsets: dict[str, int] = {}
+    try:
+        result["started"]["parent"] = start_remote_role(
+            parent_node, inventory, parent_layout, "parent", run_id
+        )
+        started.append(("parent", parent_node, parent_layout))
+        for role in children:
+            result["started"][role] = start_remote_role(
+                child_nodes[role], inventory, generated[role], role, run_id
+            )
+            started.append((role, child_nodes[role], generated[role]))
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        iteration_batches = []
+        for group, count in (("warmups", warmups), ("samples", repetitions)):
+            label = "warmup" if group == "warmups" else "sample"
+            for index in range(1, count + 1):
+                workers = []
+                for worker, role in enumerate(children, 1):
+                    suffix = f"{label}-{index:03d}-lane-{worker:03d}"
+                    workers.append((worker, role, f"{run_id}-{suffix}", suffix))
+                iteration_batches.append((group, index, label, workers))
+        server_lane_by_role: dict[str, int] = {}
+        fanin_validation_failures: list[str] = []
+        for group, index, label, workers in iteration_batches:
+            batch_suffix = f"{label}-{index:03d}"
+            # Seed each child server back-to-source before measuring; unique
+            # per-batch tags mean no peer can serve the task except the origin.
+            server_preheat: dict[str, dict[str, Any]] = {}
+            for _worker, role, task_tag, suffix in workers:
+                server_preheat[task_tag] = run_remote_dfget(
+                    child_nodes[role],
+                    inventory,
+                    generated[role],
+                    manifest["origin"]["url"],
+                    False,
+                    task_tag,
+                    suffix,
+                )
+            parent_log_first = remote_log_line_count(
+                parent_node, inventory, parent_layout
+            ) + 1
+            child_log_starts = {
+                role: remote_log_line_count(
+                    child_nodes[role], inventory, generated[role]
+                )
+                for role in children
+            }
+            # All client workers share the parent daemon; the per-role spec only
+            # labels which child server each task is expected to come from.
+            specs = [
+                (role, parent_layout, task_tag, suffix)
+                for _worker, role, task_tag, suffix in workers
+            ]
+            client_transfers = run_remote_dfget_fanout_batch(
+                parent_node,
+                inventory,
+                manifest["origin"]["url"],
+                specs,
+                batch_suffix,
+            )
+            parent_log_last = remote_log_line_count(
+                parent_node, inventory, parent_layout
+            )
+            parent_task_log = collect_remote_log_range(
+                parent_node,
+                inventory,
+                parent_layout,
+                parent_log_first,
+                parent_log_last,
+            )
+            (evidence_dir / f"parent.{batch_suffix}.log").write_text(
+                parent_task_log, encoding="utf-8"
+            )
+            child_logs: dict[str, str] = {}
+            for role in children:
+                child_log_last = remote_log_line_count(
+                    child_nodes[role], inventory, generated[role]
+                )
+                child_logs[role] = collect_remote_log_range(
+                    child_nodes[role],
+                    inventory,
+                    generated[role],
+                    child_log_starts[role] + 1,
+                    child_log_last,
+                )
+                (evidence_dir / f"{role}.{batch_suffix}.log").write_text(
+                    child_logs[role], encoding="utf-8"
+                )
+            batch_transfers = []
+            batch_task_ids: dict[str, str] = {}
+            for (worker, role, task_tag, _suffix), client in zip(
+                workers, client_transfers
+            ):
+                server = server_preheat[task_tag]
+                expected_task_id = client["expectedTaskId"]
+                batch_task_ids[role] = expected_task_id
+                try:
+                    client["taskTiming"] = analyze_task_timing(
+                        client, parent_task_log, expected_task_id
+                    )
+                except B7Error as timing_error:
+                    client["taskTimingError"] = str(timing_error)
+                    fanin_validation_failures.append(
+                        f"{batch_suffix}/{role}: {timing_error}"
+                    )
+                hashes = {
+                    manifest["remote"]["origin"]["sha256"],
+                    server["sha256"],
+                    client["sha256"],
+                }
+                lengths = {server["bytes"], client["bytes"]}
+                if len(hashes) != 1 or len(lengths) != 1:
+                    raise B7Error(
+                        f"origin/server/{role} identity check failed for {task_tag}"
+                    )
+                client["throughputMiBps"] = (
+                    client["bytes"]
+                    * 1_000_000_000
+                    / client["elapsedNs"]
+                    / (1024 * 1024)
+                )
+                transfer_result = {
+                    "index": index,
+                    "batchIndex": index,
+                    "workerIndex": worker,
+                    "role": role,
+                    "serverRole": role,
+                    "clientRole": "parent",
+                    "taskTag": task_tag,
+                    # Fanout-style key semantics: "parent" is the seeded server
+                    # side (here a child daemon), "child" is the measured client
+                    # transfer (here the parent daemon).
+                    "parent": server,
+                    "child": client,
+                }
+                result["transfer"][group].append(transfer_result)
+                batch_transfers.append(transfer_result)
+            task_ids = set(batch_task_ids.values())
+            parent_scoped_name = f"parent.{batch_suffix}.tasks.log"
+            (evidence_dir / parent_scoped_name).write_text(
+                filter_task_scoped_log(parent_task_log, task_ids), encoding="utf-8"
+            )
+            child_scoped: dict[str, str] = {}
+            for role in children:
+                scoped_name = f"{role}.{batch_suffix}.tasks.log"
+                (evidence_dir / scoped_name).write_text(
+                    filter_task_scoped_log(child_logs[role], {batch_task_ids[role]}),
+                    encoding="utf-8",
+                )
+                child_scoped[role] = scoped_name
+            lane_evidence_by_role = {}
+            lane_by_role = {}
+            for role in children:
+                lane_ev = analyze_fanin_child_lanes(
+                    child_logs[role], batch_task_ids[role]
+                )
+                lane_evidence_by_role[role] = lane_ev
+                if not lane_ev["stable"]:
+                    fanin_validation_failures.append(
+                        f"{batch_suffix}/{role}: unstable server lanes "
+                        f"served={lane_ev['served']} lanes={lane_ev['laneIds']} "
+                        f"churn={lane_ev['churnTaskIds']} "
+                        f"unbound={lane_ev['unboundLaneTaskIds']} "
+                        f"duplicates={lane_ev['duplicateStableLaneIds']}"
+                    )
+                    continue
+                lane_id = lane_ev["stableLaneId"]
+                previous = server_lane_by_role.setdefault(role, lane_id)
+                if previous != lane_id:
+                    fanin_validation_failures.append(
+                        f"fanin role {role} changed server lane from {previous} to {lane_id}"
+                    )
+                lane_by_role[role] = lane_id
+            result["transfer"]["batches"][group].append(
+                {
+                    "index": index,
+                    "taskIds": sorted(task_ids),
+                    "laneEvidenceByRole": lane_evidence_by_role,
+                    "laneByRole": lane_by_role,
+                    "taskScopedEvidence": {
+                        "parent": parent_scoped_name,
+                        "children": child_scoped,
+                    },
+                    "transfers": batch_transfers,
+                    "summary": concurrent_batch_summary(batch_transfers),
+                }
+            )
+        first_sample = result["transfer"]["samples"][0]
+        result["transfer"]["parent"] = first_sample["parent"]
+        result["transfer"]["child"] = first_sample["child"]
+        result["transfer"]["summary"] = transfer_summary(
+            result["transfer"]["samples"]
+        )
+        measured_with_timing = [
+            sample
+            for sample in result["transfer"]["samples"]
+            if "taskTiming" in sample["child"]
+        ]
+        if len(measured_with_timing) == len(result["transfer"]["samples"]):
+            result["transfer"]["taskTimingSummary"] = task_timing_summary(
+                measured_with_timing
+            )
+        else:
+            result["transfer"]["taskTimingSummaryError"] = (
+                f"{len(result['transfer']['samples']) - len(measured_with_timing)} "
+                "measured tasks have no valid URMA timing"
+            )
+        result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
+            result["transfer"]["batches"]["samples"]
+        )
+        result["transfer"]["measuredTaskIds"] = [
+            sample["child"]["expectedTaskId"]
+            for sample in result["transfer"]["samples"]
+        ]
+        result["transfer"]["serverLaneByRole"] = server_lane_by_role
+        evidence_by_role = {}
+        for role, node, layout in started:
+            evidence = collect_remote_evidence(node, inventory, layout)
+            evidence_by_role[role] = evidence
+            (evidence_dir / f"{role}.log").write_text(evidence, encoding="utf-8")
+        children_evidence = {role: evidence_by_role[role] for role in children}
+        result["faninDiagnostics"] = analyze_fanin_transport_health(
+            evidence_by_role["parent"], children_evidence
+        )
+        try:
+            result["evidence"] = analyze_fanin_evidence(
+                evidence_by_role["parent"], children_evidence
+            )
+        except B7Error as evidence_error:
+            result["evidenceError"] = str(evidence_error)
+            fanin_validation_failures.append(str(evidence_error))
+        result["faninValidation"] = {
+            "passed": not fanin_validation_failures,
+            "failures": fanin_validation_failures,
+        }
+        if fanin_validation_failures:
+            raise B7Error(
+                "fanin validation failed after complete evidence collection: "
+                + "; ".join(fanin_validation_failures)
+            )
+        manifest["state"] = "passed"
+    except (B7Error, OSError) as error:
+        failure = error if isinstance(error, B7Error) else B7Error(str(error))
+        manifest["state"] = "run-failed"
+        manifest["error"] = str(failure)
+    finally:
+        for role, node, layout in started:
+            try:
+                shutdown_offsets[role] = remote_log_line_count(node, inventory, layout)
+            except B7Error as offset_error:
+                if failure is None:
+                    failure = offset_error
+                manifest["state"] = "stop-failed"
+        # The parent is the client in fanin. Stop it before the child servers
+        # so cached client sessions close from the owning side instead of
+        # observing server resets during an otherwise orderly shutdown.
+        for role, node, layout in started:
+            try:
+                result["stopped"][role] = stop_remote_role(
+                    node, inventory, layout, role, run_id
+                )
+            except B7Error as stop_error:
+                result["stopped"][role] = {"error": str(stop_error)}
+                manifest["state"] = "stop-failed"
+                if failure is None:
+                    failure = stop_error
+        shutdown_by_role: dict[str, str] = {}
+        for role, node, layout in started:
+            if role not in shutdown_offsets:
+                continue
+            try:
+                shutdown_log = collect_remote_log_since(
+                    node, inventory, layout, shutdown_offsets[role] + 1
+                )
+                shutdown_by_role[role] = shutdown_log
+                evidence_dir.mkdir(parents=True, exist_ok=True)
+                (evidence_dir / f"{role}.shutdown.log").write_text(
+                    shutdown_log, encoding="utf-8"
+                )
+            except (B7Error, OSError) as shutdown_error:
+                if failure is None:
+                    failure = (
+                        shutdown_error
+                        if isinstance(shutdown_error, B7Error)
+                        else B7Error(str(shutdown_error))
+                    )
+                manifest["state"] = "stop-failed"
+        if "parent" in shutdown_by_role and all(
+            role in shutdown_by_role for role in children
+        ):
+            try:
+                result["shutdownEvidence"] = analyze_shutdown_evidence(
+                    shutdown_by_role["parent"],
+                    "\n".join(shutdown_by_role[role] for role in children),
+                )
+            except B7Error as shutdown_error:
+                manifest["state"] = "stop-failed"
+                if failure is None:
+                    failure = shutdown_error
+        if failure is not None:
+            manifest["error"] = str(failure)
+        manifest["result"] = result
+        write_json(args.manifest, manifest)
+    if failure is not None:
+        raise failure
+    print(args.manifest)
+    return 0
+
+
 def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest = load_json(args.manifest)
     case_value = manifest.get("case")
@@ -2210,6 +2790,8 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         topology = case_value.get("topology", "queue")
     if topology == "fanout":
         return command_run_fanout(args, inventory, manifest)
+    if topology == "fanin":
+        return command_run_fanin(args, inventory, manifest)
     run_id = validate_run_id(str(manifest.get("runId", "")))
     generated = manifest.get("generated")
     if not isinstance(generated, dict) or not {"parent", "child"}.issubset(generated):

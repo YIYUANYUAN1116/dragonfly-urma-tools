@@ -163,12 +163,20 @@ BufferUnavailable、BUSY/reject、session retirement 和 TCP fallback；因此�
 当前 fan-out runner 要求所有 Child 位于同一节点，以便使用单一远端 barrier；这正好覆盖当前
 node1 Parent / node2 Children 的实验环境。`fanout-post1-in32-l4` 和 `fanout-post8-in64-l2` 都位于默认
 TX required-window 预算边界，应在 l2 基础 case 通过后再执行，并重点检查 required/optional budget
-pressure、fallback 和跨 lane fairness。RX fan-in 尚未包含在本层。
+pressure、fallback 和跨 lane fairness。RX fan-in 使用一个 Parent client 同时从多个隔离 Child server
+拉取唯一 task，验证共享 RX pool、并发 lane、公平性和 fallback。
 
 若默认 l4 出现 lane churn，按顺序运行 `fanout-post1-in32-l4-pipe1-tx8` 和
 `fanout-post1-in32-l4-pipe2-tx16`。两者都通过说明默认 l4 是 optional window 抢占 required admission；
 pipe1 仍失败说明 8 MiB required 边界本身缺少等待/公平性；只有 pipe2 失败则需继续检查 depth2 的多 lane
 生命周期。
+
+fan-in 先运行 `fanin-post1-in32-l2` 和 `fanin-post1-in32-l4` 建立多 lane 基线，再依次运行
+`fanin-post1-in32-l4-pipe1-rx8`、`fanin-post1-in32-l4-pipe2-rx16` 和
+`fanin-post1-in32-l4-pipe2-rx8`。前两组预算 case 分别验证 4 个 required RX window 和 4 条双 window
+pipeline 的充足预算；最后一组验证 RX8 下 optional window 能否受控退化而不造成 session retirement 或
+TCP fallback。`faninDiagnostics` 从 Parent client 记录 RX required/optional pressure、BufferUnavailable、
+single-window fallback 和 session 健康，并按 Child server 分开保留 TX pressure。
 
 每轮 child dfget 还会在远端同一时钟上记录 start/end，并按运行前后的 dfdaemon 日志行号保存
 `evidence/child.warmup-NNN.log` 或 `evidence/child.sample-NNN.log`。工具从该范围内真实的 URMA Piece
@@ -193,7 +201,7 @@ downloader` 及 parent penalty 文本同样作为真实 fallback 处理。
 ## 当前限制与后续层
 
 当前 `run` 支持 standard-task correctness、顺序 performance repetitions、同一 parent/child 上的并发
-task batch，以及一个 Parent/多个隔离 Child 的 TX fan-out：唯一 origin、全量 parent preheat、child
-`--disable-back-to-source`、逐 task 三方 SHA-256、固定拓扑与 lane-ID 校验、task-ID scoped 日志、URMA
-日志/metrics 证据以及有序 shutdown。后续仍需增加 RX fan-in、persistent/persistent-cache、failpoint、
-双 lane 定向中断和带 outstanding WR 的专项 shutdown case。
+task batch、一个 Parent/多个隔离 Child 的 TX fan-out，以及多个 Child server/一个 Parent client 的 RX
+fan-in：唯一 origin、逐 task 预热、`--disable-back-to-source`、逐 task 三方 SHA-256、固定拓扑与 lane-ID
+校验、task-ID scoped 日志、URMA 日志/metrics 证据以及有序 shutdown。后续仍需增加
+persistent/persistent-cache、failpoint、双 lane 定向中断和带 outstanding WR 的专项 shutdown case。

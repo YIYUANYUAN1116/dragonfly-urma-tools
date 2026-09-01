@@ -1446,6 +1446,322 @@ storage:
                 {"parent", "child-001", "child-002"},
             )
 
+    def test_prepare_fanin_generates_one_layout_per_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "manifest.json"
+            status = b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-fanin",
+                    "--case",
+                    "fanin-post1-in32-l2",
+                    "--output",
+                    str(output),
+                ]
+            )
+            self.assertEqual(status, 0)
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["topology"], "fanin")
+            self.assertEqual(
+                b7.child_roles(manifest["generated"]), ["child-001", "child-002"]
+            )
+
+    def test_fanin_render_enables_child_urma_server(self):
+        source = """host: {}
+download:
+  protocol: tcp
+storage:
+  server:
+    urma:
+      enable: false
+      mmapContent: false
+"""
+        _, _, generated = b7.generated_layout(
+            self.inventory, "dual", "b7-fanin", None, child_count=2
+        )
+        case = b7.load_cases(TOOL_DIR / "cases.json")["fanin-post1-in32-l2"]
+        rendered_child = b7.render_role_config(
+            source, self.inventory, generated["child-001"], "child-001", "b7-fanin", case
+        )
+        child_lines = [
+            line.strip()
+            for line in rendered_child.splitlines()
+            if line.strip().startswith(("enable:", "mmapContent:", "port:"))
+        ]
+        self.assertIn("enable: true", child_lines)
+        self.assertIn("mmapContent: true", child_lines)
+        self.assertIn("port: 44108", child_lines)
+        rendered_parent = b7.render_role_config(
+            source, self.inventory, generated["parent"], "parent", "b7-fanin", case
+        )
+        parent_lines = [
+            line.strip()
+            for line in rendered_parent.splitlines()
+            if line.strip().startswith(("enable:", "mmapContent:"))
+        ]
+        self.assertIn("enable: false", parent_lines)
+        self.assertIn("mmapContent: false", parent_lines)
+        queue_case = dict(case, topology="queue")
+        rendered_queue_child = b7.render_role_config(
+            source, self.inventory, generated["child-001"], "child-001", "b7-fanin", queue_case
+        )
+        self.assertIn("enable: false", rendered_queue_child)
+
+    def test_fanin_child_lane_evidence_allows_unserved_children(self):
+        served = (
+            'lane_id=3 task_id="task-a" start upload piece content over urma\n'
+            'lane_id=3 task_id="task-a" start upload piece content over urma\n'
+        )
+        evidence = b7.analyze_fanin_child_lanes(served, "task-a")
+        self.assertTrue(evidence["served"])
+        self.assertTrue(evidence["stable"])
+        self.assertEqual(evidence["stableLaneId"], 3)
+        unserved = b7.analyze_fanin_child_lanes("", "task-a")
+        self.assertFalse(unserved["served"])
+        self.assertFalse(unserved["stable"])
+        churn = (
+            'lane_id=1 task_id="task-a" start upload piece content over urma\n'
+            'lane_id=2 task_id="task-a" start upload piece content over urma\n'
+        )
+        unstable = b7.analyze_fanin_child_lanes(churn, "task-a")
+        self.assertTrue(unstable["served"])
+        self.assertFalse(unstable["stable"])
+        self.assertEqual(unstable["churnTaskIds"], ["task-a"])
+
+    def test_fanin_evidence_requires_matching_upload_and_client_counts(self):
+        parent_client = (
+            "finished piece x from parent Some(\"c\") using protocol urma\n" * 2
+        )
+        children = {
+            "child-001": "finished uploading piece content over urma\n",
+            "child-002": "finished uploading piece content over urma\n",
+        }
+        summary = b7.analyze_fanin_evidence(parent_client, children)
+        self.assertEqual(summary["totalServerUploads"], 2)
+        self.assertEqual(summary["clientUrmaPieces"], 2)
+        with self.assertRaisesRegex(b7.B7Error, "differs"):
+            b7.analyze_fanin_evidence("finished piece x from parent Some(\"c\") using protocol urma\n", children)
+        with self.assertRaisesRegex(b7.B7Error, "no child served"):
+            b7.analyze_fanin_evidence(parent_client, {"child-001": "", "child-002": ""})
+        with self.assertRaisesRegex(b7.B7Error, "fallback"):
+            b7.analyze_fanin_evidence(
+                parent_client,
+                {
+                    "child-001": "finished uploading piece content over urma\n",
+                    "child-002": "finished uploading piece content over urma\nurma download failed, fall back to tcp downloader\n",
+                },
+            )
+
+    def test_fanin_transport_health_reads_parent_rx_and_per_child_tx(self):
+        parent = """
+dragonfly_client_urma_budget_pressure_total{direction="rx",stage="required"} 2
+dragonfly_client_urma_budget_pressure_total{direction="rx",stage="optional"} 3
+URMA RX second window unavailable; continuing with one-window pipeline
+RX BufferUnavailable
+retire the cached peer session
+urma download failed, fall back to tcp downloader: busy
+"""
+        children = {
+            "child-001": """
+dragonfly_client_urma_budget_pressure_total{direction="tx",stage="required"} 5
+dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 7
+""",
+            "child-002": """
+dragonfly_client_urma_budget_pressure_total{direction="tx",stage="required"} 11
+dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 13
+""",
+        }
+        summary = b7.analyze_fanin_transport_health(parent, children)
+        self.assertEqual(summary["rxBudgetPressure"], {"required": 2.0, "optional": 3.0})
+        self.assertEqual(summary["rxBufferUnavailableLines"], 1)
+        self.assertEqual(summary["rxOptionalSingleWindowFallbacks"], 1)
+        self.assertEqual(summary["txBudgetPressure"], {"required": 16.0, "optional": 20.0})
+        self.assertEqual(
+            summary["txBudgetPressureByChild"]["child-002"],
+            {"required": 11.0, "optional": 13.0},
+        )
+        self.assertEqual(summary["sessionRetirementLines"], 1)
+        self.assertEqual(summary["tcpFallbackLines"], 1)
+
+    def test_fanin_budget_cases_cover_rx_required_and_pipeline_capacity(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        pipe1 = cases["fanin-post1-in32-l4-pipe1-rx8"]
+        pipe2 = cases["fanin-post1-in32-l4-pipe2-rx16"]
+        constrained = cases["fanin-post1-in32-l4-pipe2-rx8"]
+        self.assertEqual(
+            (pipe1["pipelineDepth"], pipe1["maxRegisteredBytes"], pipe1["txRegisteredBytes"]),
+            (1, "16MiB", "8MiB"),
+        )
+        self.assertEqual(
+            (pipe2["pipelineDepth"], pipe2["maxRegisteredBytes"], pipe2["txRegisteredBytes"]),
+            (2, "24MiB", "8MiB"),
+        )
+        self.assertEqual(
+            (
+                constrained["pipelineDepth"],
+                constrained["maxRegisteredBytes"],
+                constrained["txRegisteredBytes"],
+            ),
+            (2, "16MiB", "8MiB"),
+        )
+
+    def test_fanin_case_records_per_child_lane_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-fanin",
+                    "--case",
+                    "fanin-post1-in32-l2",
+                    "--output",
+                    str(manifest_path),
+                ]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["state"] = "prepared"
+            manifest["remote"] = {"origin": {"sha256": "same"}}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            child_lane_ids = {"parent": 0, "child-001": 1, "child-002": 2}
+            child_server_logs = {role: [] for role in child_lane_ids}
+
+            def preheat(
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+            ):
+                return {
+                    "bytes": 1024 * 1024,
+                    "sha256": "same",
+                    "elapsedNs": 1_000_000,
+                    "startedAtUnixNs": 1_000_000_000,
+                    "finishedAtUnixNs": 1_001_000_000,
+                    "taskTag": task_tag,
+                    "expectedTaskId": b7.standard_task_id(url, task_tag),
+                }
+
+            def fanout(_node, _inventory, url, specs, _suffix):
+                results = []
+                for worker, (role, _layout, task_tag, _artifact) in enumerate(specs, 1):
+                    task_id = b7.standard_task_id(url, task_tag)
+                    results.append(
+                        {
+                            "bytes": 1024 * 1024,
+                            "sha256": "same",
+                            "elapsedNs": 1_000_000,
+                            "startedAtUnixNs": 1_000_000_000 + worker,
+                            "finishedAtUnixNs": 1_001_000_000 + worker,
+                            "daemonLogFirstLine": 1,
+                            "daemonLogLastLine": 2,
+                            "taskTag": task_tag,
+                            "expectedTaskId": task_id,
+                            "workerIndex": worker,
+                            "role": role,
+                        }
+                    )
+                return results
+
+            for label, count in (("warmup", 1), ("sample", 3)):
+                for batch in range(1, count + 1):
+                    for worker in (1, 2):
+                        role = f"child-{worker:03d}"
+                        tag = f"b7-fanin-{label}-{batch:03d}-lane-{worker:03d}"
+                        task_id = b7.standard_task_id(
+                            manifest["origin"]["url"], tag
+                        )
+                        child_server_logs[role].append(
+                            f'lane_id={child_lane_ids[role]} task_id="{task_id}" '
+                            "start upload piece content over urma"
+                        )
+            parent_client_log = "\n".join(
+                f'2026-08-31T10:41:35.100000000Z DEBUG finished piece '
+                f'piece-0 from parent Some("peer") using protocol urma '
+                f'task_id="{task_id}"'
+                for task_id in sorted(
+                    {
+                        line.split('task_id="')[1].split('"')[0]
+                        for role in ("child-001", "child-002")
+                        for line in child_server_logs[role]
+                    }
+                )
+            )
+
+            def collect_range(_node, _inventory, layout, _first, _last):
+                role = PurePosixPath(layout["runDir"]).name
+                if role == "parent":
+                    return parent_client_log
+                return "\n".join(child_server_logs[role])
+
+            batch_count = 4  # 1 warmup + 3 samples
+
+            def evidence(_node, _inventory, layout):
+                role = PurePosixPath(layout["runDir"]).name
+                if role == "parent":
+                    return (
+                        "finished piece x from parent Some(\"peer\") using protocol urma\n"
+                        * (batch_count * 2)
+                    )
+                return "finished uploading piece content over urma\n" * batch_count
+
+            stop_order = []
+
+            def stop(_node, _inventory, _layout, role, _run_id):
+                stop_order.append(role)
+                return {"result": "stopped"}
+
+            with (
+                mock.patch.object(
+                    b7, "start_remote_role", return_value={"pid": 1, "target": "test"}
+                ),
+                mock.patch.object(b7, "run_remote_dfget", side_effect=preheat),
+                mock.patch.object(
+                    b7, "run_remote_dfget_fanout_batch", side_effect=fanout
+                ),
+                mock.patch.object(
+                    b7, "collect_remote_log_range", side_effect=collect_range
+                ),
+                mock.patch.object(
+                    b7,
+                    "analyze_task_timing",
+                    return_value={
+                        "taskId": "task",
+                        "pieceCompletions": 1,
+                        "startToFirstPieceNs": 100_000,
+                        "firstToLastPieceNs": 800_000,
+                        "lastPieceToDfgetEndNs": 100_000,
+                        "dfgetElapsedNs": 1_000_000,
+                    },
+                ),
+                mock.patch.object(b7, "collect_remote_evidence", side_effect=evidence),
+                mock.patch.object(b7, "remote_log_line_count", return_value=10),
+                mock.patch.object(b7, "collect_remote_log_since", return_value=""),
+                mock.patch.object(
+                    b7, "stop_remote_role", side_effect=stop
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    0,
+                )
+            finished = json.loads(manifest_path.read_text(encoding="utf-8"))
+            transfer = finished["result"]["transfer"]
+            self.assertEqual(transfer["topology"], "fanin")
+            self.assertEqual(len(transfer["samples"]), 6)
+            self.assertEqual(
+                transfer["serverLaneByRole"], {"child-001": 1, "child-002": 2}
+            )
+            self.assertEqual(
+                set(finished["result"]["started"]),
+                {"parent", "child-001", "child-002"},
+            )
+            self.assertTrue(finished["result"]["faninValidation"]["passed"])
+            self.assertEqual(finished["state"], "passed")
+            self.assertEqual(stop_order, ["parent", "child-001", "child-002"])
+
 
 if __name__ == "__main__":
     unittest.main()
