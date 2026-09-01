@@ -635,9 +635,9 @@ def run_remote_dfget_fanout_batch(
     transfers: list[tuple[str, dict[str, Any], str, str]],
     batch_suffix: str,
 ) -> list[dict[str, Any]]:
-    """Release one dfget per child daemon behind a host-local barrier."""
-    if len(transfers) < 2:
-        raise B7Error("fanout batch requires at least two child roles")
+    """Release one dfget per role behind a host-local barrier."""
+    if not transfers:
+        raise B7Error("role batch requires at least one transfer")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", batch_suffix):
         raise B7Error(f"invalid fanout batch suffix: {batch_suffix}")
     binary = str(

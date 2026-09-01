@@ -472,6 +472,45 @@ storage:
         self.assertEqual(results[0]["daemonLogFirstLine"], 11)
         self.assertEqual(results[1]["daemonLogLastLine"], 40)
 
+    def test_role_dfget_batch_allows_single_fanin_transfer(self):
+        _, _, generated = b7.generated_layout(
+            self.inventory, "dual", "b7-fanin-l1", None, child_count=1
+        )
+        completed = b7.subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                "1\t0\t1048576\tsame\t1000000\t1000000000\t1001000000\n"
+                "RANGE\t1\t11\t30\n"
+            ),
+            stderr="",
+        )
+        specs = [
+            (
+                "child",
+                generated["parent"],
+                "b7-fanin-l1-sample-001-lane-001",
+                "sample-001-lane-001",
+            )
+        ]
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            results = b7.run_remote_dfget_fanout_batch(
+                self.inventory["nodes"]["node1"],
+                self.inventory,
+                "http://example.test/input.bin",
+                specs,
+                "sample-001",
+            )
+        script = execute.call_args.args[2]
+        syntax = b7.subprocess.run(
+            ["bash", "-n"], input=script, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        self.assertEqual(script.count("while [ ! -e"), 1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["role"], "child")
+        self.assertEqual(results[0]["workerIndex"], 1)
+
     def test_run_rejects_legacy_cross_filesystem_output_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
