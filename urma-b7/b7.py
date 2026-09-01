@@ -36,6 +36,7 @@ LOG_TIMESTAMP_RE = re.compile(
 # `urma_piece` spans use Display, while several child spans use Debug.
 TASK_ID_RE = re.compile(r'\btask_id="?([A-Za-z0-9._:-]+)"?')
 LANE_ID_RE = re.compile(r"\blane_id=(\d+)")
+TRANSFER_ID_RE = re.compile(r"\btransfer_id=(\d+)")
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
@@ -104,6 +105,11 @@ def last_task_id(line: str) -> str | None:
 
 def last_lane_id(line: str) -> int | None:
     matches = list(LANE_ID_RE.finditer(line))
+    return int(matches[-1].group(1)) if matches else None
+
+
+def last_transfer_id(line: str) -> int | None:
+    matches = list(TRANSFER_ID_RE.finditer(line))
     return int(matches[-1].group(1)) if matches else None
 
 
@@ -1028,6 +1034,98 @@ def analyze_fanout_lanes(parent_log: str, task_ids: set[str]) -> dict[str, Any]:
     }
 
 
+def analyze_piece_concurrency(parent_log: str, task_ids: set[str]) -> dict[str, Any]:
+    """Prove overlapping Piece lifetimes on exactly one server-side lane.
+
+    A Piece becomes active at the server's upload-start event and leaves the
+    active set at its transfer-scoped peer-lane finish event. Requiring two
+    distinct task IDs in that set avoids mistaking sequential lane reuse for
+    concurrent Piece handling. This deliberately does not claim concurrent
+    native RX windows: shared-JFR receive matching still serializes that layer.
+    """
+    starts_by_transfer: dict[int, dict[str, int | str]] = {}
+    active: dict[int, dict[str, int | str]] = {}
+    completed: set[int] = set()
+    duplicate_starts: set[int] = set()
+    duplicate_finishes: set[int] = set()
+    task_start_counts = {task_id: 0 for task_id in task_ids}
+    lane_ids: set[int] = set()
+    max_active_transfers = 0
+    max_active_task_ids: set[str] = set()
+
+    for line_number, line in enumerate(parent_log.splitlines(), 1):
+        if "start upload piece content over urma" in line:
+            task_id = last_task_id(line)
+            if task_id not in task_ids:
+                continue
+            lane_id = last_lane_id(line)
+            transfer_id = last_transfer_id(line)
+            if lane_id is None or transfer_id is None:
+                continue
+            if transfer_id in starts_by_transfer:
+                duplicate_starts.add(transfer_id)
+                continue
+            event: dict[str, int | str] = {
+                "taskId": task_id,
+                "laneId": lane_id,
+                "startLine": line_number,
+            }
+            starts_by_transfer[transfer_id] = event
+            active[transfer_id] = event
+            task_start_counts[task_id] += 1
+            lane_ids.add(lane_id)
+            active_task_ids = {str(value["taskId"]) for value in active.values()}
+            if len(active) > max_active_transfers:
+                max_active_transfers = len(active)
+            if len(active_task_ids) > len(max_active_task_ids):
+                max_active_task_ids = active_task_ids
+            continue
+
+        if "urma piece finished on peer lane" not in line or not re.search(
+            r'\brole="?server"?', line
+        ):
+            continue
+        transfer_id = last_transfer_id(line)
+        if transfer_id is None or transfer_id not in starts_by_transfer:
+            continue
+        if transfer_id in completed:
+            duplicate_finishes.add(transfer_id)
+            continue
+        completed.add(transfer_id)
+        active.pop(transfer_id, None)
+
+    missing_task_ids = sorted(
+        task_id for task_id, count in task_start_counts.items() if count == 0
+    )
+    unfinished_transfer_ids = sorted(set(starts_by_transfer) - completed)
+    required_overlap = min(2, len(task_ids))
+    valid_lane = len(lane_ids) == 1 and 0 not in lane_ids
+    overlap_proven = len(max_active_task_ids) >= required_overlap
+    return {
+        "passed": not missing_task_ids
+        and valid_lane
+        and not duplicate_starts
+        and not duplicate_finishes
+        and not unfinished_transfer_ids
+        and overlap_proven,
+        "laneCount": len(lane_ids),
+        "laneIds": sorted(lane_ids),
+        "pieceStarts": len(starts_by_transfer),
+        "pieceCompletions": len(completed),
+        "pieceStartsByTask": task_start_counts,
+        "distinctTransferIds": len(starts_by_transfer),
+        "maxActiveTransfers": max_active_transfers,
+        "maxActiveTaskCount": len(max_active_task_ids),
+        "maxActiveTaskIds": sorted(max_active_task_ids),
+        "missingTaskIds": missing_task_ids,
+        "duplicateStartTransferIds": sorted(duplicate_starts),
+        "duplicateFinishTransferIds": sorted(duplicate_finishes),
+        "unfinishedTransferIds": unfinished_transfer_ids,
+        "overlapProven": overlap_proven,
+        "nativeRxWindowConcurrencyClaimed": False,
+    }
+
+
 def prometheus_counter_value(
     evidence: str, metric: str, required_labels: tuple[str, ...]
 ) -> float:
@@ -1813,9 +1911,9 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         if not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
             raise B7Error(f"case {case['name']} requires concurrency in 1..=16")
         topology = case.get("topology", "queue")
-        if topology not in ("queue", "fanout", "fanin"):
+        if topology not in ("queue", "fanout", "fanin", "piece-concurrency"):
             raise B7Error(f"case {case['name']} has unsupported topology {topology!r}")
-        if topology == "fanout" and concurrency < 2:
+        if topology in ("fanout", "piece-concurrency") and concurrency < 2:
             raise B7Error(
                 f"case {case['name']} {topology} requires concurrency >= 2"
             )
@@ -2901,6 +2999,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     repetitions = case.get("repetitions")
     warmups = case.get("warmups", 0)
     concurrency = case.get("concurrency", 1)
+    piece_concurrency = topology == "piece-concurrency"
     if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
         raise B7Error("manifest repetitions must be in 1..=100")
     if not isinstance(warmups, int) or not 0 <= warmups <= 20:
@@ -2918,6 +3017,11 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "SIGTERM only the two manifest-owned dfdaemon PIDs",
         "collect and analyze post-SIGTERM log evidence",
     ]
+    if piece_concurrency:
+        operations.insert(
+            5,
+            "prove overlapping Piece lifetimes with distinct transfer IDs on one lane",
+        )
     if not args.execute:
         print(json.dumps({"runId": run_id, "dryRun": True, "operations": operations}, indent=2))
         return 0
@@ -2932,6 +3036,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     result: dict[str, Any] = {
         "started": {},
         "transfer": {
+            "topology": topology,
             "concurrency": concurrency,
             "warmups": [],
             "samples": [],
@@ -2942,6 +3047,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     failure: B7Error | None = None
     evidence_dir = args.manifest.parent / "evidence"
     shutdown_offsets: dict[str, int] = {}
+    piece_concurrency_failures: list[str] = []
     try:
         result["started"]["parent"] = start_remote_role(
             parent_node, inventory, parent_layout, "parent", run_id
@@ -3075,6 +3181,21 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             task_ids = {
                 transfer["child"]["expectedTaskId"] for transfer in batch_transfers
             }
+            piece_concurrency_evidence = None
+            if piece_concurrency:
+                piece_concurrency_evidence = analyze_piece_concurrency(
+                    parent_task_log, task_ids
+                )
+                if not piece_concurrency_evidence["passed"]:
+                    piece_concurrency_failures.append(
+                        f"{batch_suffix}: single-lane Piece overlap not proven "
+                        f"lanes={piece_concurrency_evidence['laneIds']} "
+                        f"missing={piece_concurrency_evidence['missingTaskIds']} "
+                        f"maxActiveTasks={piece_concurrency_evidence['maxActiveTaskCount']} "
+                        f"unfinished={piece_concurrency_evidence['unfinishedTransferIds']} "
+                        f"duplicateStarts={piece_concurrency_evidence['duplicateStartTransferIds']} "
+                        f"duplicateFinishes={piece_concurrency_evidence['duplicateFinishTransferIds']}"
+                    )
             child_scoped_name = f"child.{batch_suffix}.tasks.log"
             parent_scoped_name = f"parent.{batch_suffix}.tasks.log"
             (evidence_dir / child_scoped_name).write_text(
@@ -3083,18 +3204,22 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             (evidence_dir / parent_scoped_name).write_text(
                 filter_task_scoped_log(parent_task_log, task_ids), encoding="utf-8"
             )
-            result["transfer"]["batches"][group].append(
-                {
-                    "index": index,
-                    "taskIds": sorted(task_ids),
-                    "taskScopedEvidence": {
-                        "parent": parent_scoped_name,
-                        "child": child_scoped_name,
-                    },
-                    "transfers": batch_transfers,
-                    "summary": concurrent_batch_summary(batch_transfers),
-                }
-            )
+            batch_result = {
+                "index": index,
+                "taskIds": sorted(task_ids),
+                "taskScopedEvidence": {
+                    "parent": parent_scoped_name,
+                    "child": child_scoped_name,
+                },
+                "transfers": batch_transfers,
+                "summary": concurrent_batch_summary(batch_transfers),
+            }
+            if piece_concurrency_evidence is not None:
+                batch_result["pieceConcurrencyEvidence"] = piece_concurrency_evidence
+                batch_result["pieceConcurrencyEvidenceFile"] = (
+                    f"parent.{batch_suffix}.log"
+                )
+            result["transfer"]["batches"][group].append(batch_result)
         first_sample = result["transfer"]["samples"][0]
         # Preserve the original single-sample fields for existing manifest consumers.
         result["transfer"]["parent"] = first_sample["parent"]
@@ -3120,11 +3245,70 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             evidence = collect_remote_evidence(node, inventory, layout)
             evidence_by_role[role] = evidence
             (evidence_dir / f"{role}.log").write_text(evidence, encoding="utf-8")
-        result["evidence"] = analyze_evidence(
-            evidence_by_role["parent"],
-            evidence_by_role["child"],
-            expected_parent_marker=f"-{run_id}-parent-",
-        )
+        try:
+            result["evidence"] = analyze_evidence(
+                evidence_by_role["parent"],
+                evidence_by_role["child"],
+                expected_parent_marker=f"-{run_id}-parent-",
+            )
+        except B7Error as evidence_error:
+            if not piece_concurrency:
+                raise
+            result["evidenceError"] = str(evidence_error)
+            piece_concurrency_failures.append(str(evidence_error))
+        if piece_concurrency:
+            transport = analyze_fanout_transport_health(
+                evidence_by_role["parent"], evidence_by_role["child"]
+            )
+            result["pieceConcurrencyDiagnostics"] = {
+                **transport,
+                "rxBudgetPressure": {
+                    "required": prometheus_counter_value(
+                        evidence_by_role["child"],
+                        "dragonfly_client_urma_budget_pressure_total",
+                        ('direction="rx"', 'stage="required"'),
+                    ),
+                    "optional": prometheus_counter_value(
+                        evidence_by_role["child"],
+                        "dragonfly_client_urma_budget_pressure_total",
+                        ('direction="rx"', 'stage="optional"'),
+                    ),
+                },
+                "requiredRxWaitCount": prometheus_counter_value(
+                    evidence_by_role["child"],
+                    "dragonfly_client_urma_required_admission_wait_total",
+                    ('direction="rx"',),
+                ),
+                "requiredRxWaitNs": prometheus_counter_value(
+                    evidence_by_role["child"],
+                    "dragonfly_client_urma_required_admission_wait_nanoseconds_total",
+                    ('direction="rx"',),
+                ),
+                "rxBufferUnavailableLines": sum(
+                    (
+                        "bufferunavailable" in line.lower()
+                        or "buffer unavailable" in line.lower()
+                    )
+                    and "rx" in line.lower()
+                    for line in evidence_by_role["child"].splitlines()
+                ),
+                "rxOptionalSingleWindowFallbacks": evidence_by_role[
+                    "child"
+                ].lower().count("urma rx second window unavailable"),
+            }
+            result["pieceConcurrencyValidation"] = {
+                "passed": not piece_concurrency_failures,
+                "failures": piece_concurrency_failures,
+                "scope": (
+                    "concurrent Piece lifetimes on one lane; native RX windows "
+                    "remain serialized by the shared-JFR safety gate"
+                ),
+            }
+            if piece_concurrency_failures:
+                raise B7Error(
+                    "piece-concurrency validation failed after complete evidence "
+                    "collection: " + "; ".join(piece_concurrency_failures)
+                )
         manifest["state"] = "passed"
     except (B7Error, OSError) as error:
         failure = error if isinstance(error, B7Error) else B7Error(str(error))

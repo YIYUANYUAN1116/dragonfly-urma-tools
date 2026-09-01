@@ -123,9 +123,36 @@ task ID 按本工具实际调用的 Dragonfly standard URL-based 规则计算：
 B7 不设置 application、revision、piece length 或 filtered query parameters。若后续 case 增加这些参数，
 必须同步扩展 task-ID helper，不能继续套用当前公式。
 
-这一模式使用同一个 Child daemon 和同一个 Parent，因此当前 URMA `SessionSlot` 会把 Piece 排到一条
-persistent lane 上；它建立的是“上层并发、单 lane 排队”基线。多 Child fan-out 和多 Parent fan-in
-需要扩展为多 role manifest，不能用本模式冒充多 lane transport concurrency。
+普通 `topology: queue` 并发 case 只建立“上层并发、单 lane”吞吐基线，不把同 lane 的 Piece overlap
+作为 PASS 条件。多 Child fan-out 和多 Parent fan-in 使用独立多 role manifest，不能用 queue 模式冒充
+多 lane transport concurrency。
+
+### 单 lane 并发 Piece（B8.4）
+
+`topology: piece-concurrency` 仍只启动一个 Parent 和一个 Child，但把并发 Piece 证据升级为 correctness
+gate。每个 batch 的多个独立 task 经同一 barrier 同时启动，工具从 Parent 日志按顺序配对：
+
+- `start upload piece content over urma` 的 `task_id`、`lane_id`、`transfer_id`；
+- `urma piece finished on peer lane role="server"` 的 `lane_id`、`transfer_id`。
+
+PASS 要求每个 task 均有 Piece start、所有 transfer 都完成且无重复、全 batch 只使用一个非零 lane，并且
+至少两个不同 task 的 Piece 生命周期在该 lane 上重叠。这样不会把“先跑完 task A 再复用 lane 跑 task B”
+误判为并发。manifest 在每个 batch 保存 `pieceConcurrencyEvidence`，并汇总
+`pieceConcurrencyDiagnostics` 与 `pieceConcurrencyValidation`。
+
+由于当前共享 JFR 的 RC SEND/RECV 匹配仍依赖 lane FIFO，客户端 safety gate 保证同 lane 同时最多一个
+native RX window outstanding。因此该 case 证明的是并发 rendezvous/storage/Piece 生命周期和独立
+`transfer_id`，不宣称 native data window 已并行；manifest 会显式记录
+`nativeRxWindowConcurrencyClaimed: false`。
+
+先运行 c2，再运行 c4：
+
+```powershell
+python .\b7.py prepare --mode dual --run-id b84-piece-c2 --case piece-concurrency-post1-in32-c2 --execute
+python .\b7.py run --manifest .\results\b84-piece-c2\manifest.json --execute
+python .\b7.py prepare --mode dual --run-id b84-piece-c4 --case piece-concurrency-post1-in32-c4 --execute
+python .\b7.py run --manifest .\results\b84-piece-c4\manifest.json --execute
+```
 
 ### TX fan-out（B7.2）
 
@@ -209,7 +236,7 @@ downloader` 及 parent penalty 文本同样作为真实 fallback 处理。
 ## 当前限制与后续层
 
 当前 `run` 支持 standard-task correctness、顺序 performance repetitions、同一 parent/child 上的并发
-task batch、一个 Parent/多个隔离 Child 的 TX fan-out，以及多个 Child server/一个 Parent client 的 RX
-fan-in：唯一 origin、逐 task 预热、`--disable-back-to-source`、逐 task 三方 SHA-256、固定拓扑与 lane-ID
-校验、task-ID scoped 日志、URMA 日志/metrics 证据以及有序 shutdown。后续仍需增加
+task batch、单 lane 并发 Piece correctness gate、一个 Parent/多个隔离 Child 的 TX fan-out，以及多个
+Child server/一个 Parent client 的 RX fan-in：唯一 origin、逐 task 预热、`--disable-back-to-source`、逐 task
+三方 SHA-256、固定拓扑与 lane-ID 校验、task-ID scoped 日志、URMA 日志/metrics 证据以及有序 shutdown。后续仍需增加
 persistent/persistent-cache、failpoint、双 lane 定向中断和带 outstanding WR 的专项 shutdown case。

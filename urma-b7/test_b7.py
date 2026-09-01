@@ -1043,6 +1043,60 @@ storage:
         self.assertFalse(shared["stable"])
         self.assertEqual(shared["duplicateStableLaneIds"], [3])
 
+    def test_piece_concurrency_requires_same_lane_and_cross_task_overlap(self):
+        log = "\n".join(
+            [
+                'task_id="task-a" lane_id=7 transfer_id=11 start upload piece content over urma',
+                'task_id="task-b" lane_id=7 transfer_id=12 start upload piece content over urma',
+                'role="server" lane_id=7 transfer_id=11 urma piece finished on peer lane',
+                'role="server" lane_id=7 transfer_id=12 urma piece finished on peer lane',
+            ]
+        )
+        evidence = b7.analyze_piece_concurrency(log, {"task-a", "task-b"})
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(evidence["laneIds"], [7])
+        self.assertEqual(evidence["distinctTransferIds"], 2)
+        self.assertEqual(evidence["maxActiveTaskCount"], 2)
+        self.assertTrue(evidence["overlapProven"])
+        self.assertFalse(evidence["nativeRxWindowConcurrencyClaimed"])
+
+        serial = "\n".join(
+            [
+                'task_id="task-a" lane_id=7 transfer_id=11 start upload piece content over urma',
+                'role="server" lane_id=7 transfer_id=11 urma piece finished on peer lane',
+                'task_id="task-b" lane_id=7 transfer_id=12 start upload piece content over urma',
+                'role="server" lane_id=7 transfer_id=12 urma piece finished on peer lane',
+            ]
+        )
+        evidence = b7.analyze_piece_concurrency(serial, {"task-a", "task-b"})
+        self.assertFalse(evidence["passed"])
+        self.assertFalse(evidence["overlapProven"])
+
+    def test_piece_concurrency_cases_keep_one_child_layout(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        self.assertEqual(
+            cases["piece-concurrency-post1-in32-c2"]["topology"],
+            "piece-concurrency",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b8-piece-c2",
+                    "--case",
+                    "piece-concurrency-post1-in32-c2",
+                    "--output",
+                    str(manifest_path),
+                ]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(manifest["generated"]), {"parent", "child"})
+            self.assertEqual(manifest["case"]["concurrency"], 2)
+
     def test_fanout_lane_evidence_accepts_unquoted_parent_span_task_ids(self):
         log = "\n".join(
             (
@@ -1340,6 +1394,119 @@ storage:
             self.assertEqual(len(transfer["batches"]["samples"]), 3)
             self.assertEqual(transfer["concurrentSummary"]["concurrency"], 2)
             self.assertEqual(len(transfer["measuredTaskIds"]), 6)
+
+    def test_piece_concurrency_runner_records_overlap_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "manifest.json"
+            b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b8-piece-runner",
+                    "--case",
+                    "piece-concurrency-post1-in32-c2",
+                    "--output",
+                    str(manifest_path),
+                ]
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["state"] = "prepared"
+            manifest["remote"] = {"origin": {"sha256": "same"}}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            current_parent_log = [""]
+
+            def preheat(
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+            ):
+                return {
+                    "bytes": 1024 * 1024,
+                    "sha256": "same",
+                    "elapsedNs": 1_000_000,
+                    "startedAtUnixNs": 1_000_000_000,
+                    "finishedAtUnixNs": 1_001_000_000,
+                    "taskTag": task_tag,
+                    "expectedTaskId": b7.standard_task_id(url, task_tag),
+                }
+
+            def batch(_node, _inventory, _layout, url, _disable, specs, _suffix):
+                results = []
+                starts = []
+                finishes = []
+                for worker, (task_tag, _artifact) in enumerate(specs, 1):
+                    task_id = b7.standard_task_id(url, task_tag)
+                    starts.append(
+                        f'task_id="{task_id}" lane_id=9 transfer_id={worker} '
+                        "start upload piece content over urma"
+                    )
+                    finishes.append(
+                        f'role="server" lane_id=9 transfer_id={worker} '
+                        "urma piece finished on peer lane"
+                    )
+                    results.append(
+                        {
+                            "bytes": 1024 * 1024,
+                            "sha256": "same",
+                            "elapsedNs": 1_000_000,
+                            "startedAtUnixNs": 1_000_000_000 + worker,
+                            "finishedAtUnixNs": 1_001_000_000 + worker,
+                            "daemonLogFirstLine": 1,
+                            "daemonLogLastLine": 20,
+                            "taskTag": task_tag,
+                            "expectedTaskId": task_id,
+                            "workerIndex": worker,
+                        }
+                    )
+                current_parent_log[0] = "\n".join([*starts, *finishes])
+                return results
+
+            def collect_range(_node, _inventory, layout, _first, _last):
+                role = PurePosixPath(layout["runDir"]).name
+                return current_parent_log[0] if role == "parent" else "child task log"
+
+            with (
+                mock.patch.object(
+                    b7, "start_remote_role", return_value={"pid": 1, "target": "test"}
+                ),
+                mock.patch.object(b7, "run_remote_dfget", side_effect=preheat),
+                mock.patch.object(b7, "run_remote_dfget_batch", side_effect=batch),
+                mock.patch.object(
+                    b7, "collect_remote_log_range", side_effect=collect_range
+                ),
+                mock.patch.object(
+                    b7,
+                    "analyze_task_timing",
+                    return_value={
+                        "taskId": "task",
+                        "pieceCompletions": 1,
+                        "startToFirstPieceNs": 100_000,
+                        "firstToLastPieceNs": 800_000,
+                        "lastPieceToDfgetEndNs": 100_000,
+                        "dfgetElapsedNs": 1_000_000,
+                    },
+                ),
+                mock.patch.object(b7, "collect_remote_evidence", return_value=""),
+                mock.patch.object(b7, "analyze_evidence", return_value={"passed": True}),
+                mock.patch.object(b7, "remote_log_line_count", return_value=10),
+                mock.patch.object(b7, "collect_remote_log_since", return_value=""),
+                mock.patch.object(
+                    b7, "stop_remote_role", return_value={"result": "stopped"}
+                ),
+            ):
+                self.assertEqual(
+                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    0,
+                )
+
+            finished = json.loads(manifest_path.read_text(encoding="utf-8"))
+            result = finished["result"]
+            self.assertTrue(result["pieceConcurrencyValidation"]["passed"])
+            self.assertEqual(result["transfer"]["topology"], "piece-concurrency")
+            for batch_result in result["transfer"]["batches"]["samples"]:
+                evidence = batch_result["pieceConcurrencyEvidence"]
+                self.assertEqual(evidence["laneIds"], [9])
+                self.assertGreaterEqual(evidence["maxActiveTaskCount"], 2)
 
     def test_fanout_case_records_distinct_lane_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
