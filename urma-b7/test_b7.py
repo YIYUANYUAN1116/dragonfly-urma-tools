@@ -1469,6 +1469,74 @@ storage:
                 b7.child_roles(manifest["generated"]), ["child-001", "child-002"]
             )
 
+    def test_prepare_fanin_allows_single_lane_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "manifest.json"
+            status = b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-fanin-l1",
+                    "--case",
+                    "fanin-post1-in32-l1-pipe1",
+                    "--output",
+                    str(output),
+                ]
+            )
+            self.assertEqual(status, 0)
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["topology"], "fanin")
+            self.assertEqual(manifest["case"]["concurrency"], 1)
+            self.assertEqual(b7.child_roles(manifest["generated"]), ["child"])
+
+    def test_fanin_defaults_missing_concurrency_to_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cases_path = Path(directory) / "cases.json"
+            manifest_path = Path(directory) / "manifest.json"
+            cases_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "cases": [
+                            {
+                                "name": "fanin-default-l1",
+                                "topology": "fanin",
+                                "postListSize": 1,
+                                "pipelineDepth": 1,
+                                "maxInflightChunks": 32,
+                                "repetitions": 1,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            case = b7.load_cases(cases_path)["fanin-default-l1"]
+            self.assertNotIn("concurrency", case)
+            self.assertEqual(
+                b7.main(
+                    [
+                        "prepare",
+                        "--mode",
+                        "dual",
+                        "--run-id",
+                        "b7-fanin-default-l1",
+                        "--case",
+                        "fanin-default-l1",
+                        "--cases",
+                        str(cases_path),
+                        "--output",
+                        str(manifest_path),
+                    ]
+                ),
+                0,
+            )
+            self.assertEqual(
+                b7.main(["run", "--manifest", str(manifest_path)]), 0
+            )
+
     def test_fanin_render_enables_child_urma_server(self):
         source = """host: {}
 download:

@@ -1726,7 +1726,7 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         topology = case.get("topology", "queue")
         if topology not in ("queue", "fanout", "fanin"):
             raise B7Error(f"case {case['name']} has unsupported topology {topology!r}")
-        if topology in ("fanout", "fanin") and concurrency < 2:
+        if topology == "fanout" and concurrency < 2:
             raise B7Error(
                 f"case {case['name']} {topology} requires concurrency >= 2"
             )
@@ -2412,15 +2412,17 @@ def command_run_fanin(
     case = manifest.get("case")
     if not isinstance(case, dict):
         raise B7Error("fanin manifest has no case")
-    concurrency = case.get("concurrency")
+    concurrency = case.get("concurrency", 1)
     repetitions = case.get("repetitions")
     warmups = case.get("warmups", 0)
     if (
         not isinstance(concurrency, int)
-        or not 2 <= concurrency <= 16
+        or not 1 <= concurrency <= 16
         or concurrency != len(children)
     ):
-        raise B7Error("fanin concurrency must equal the generated child count")
+        raise B7Error(
+            "fanin concurrency must be in 1..=16 and equal the generated child count"
+        )
     if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
         raise B7Error("fanin repetitions must be in 1..=100")
     if not isinstance(warmups, int) or not 0 <= warmups <= 20:

@@ -171,7 +171,8 @@ pressure、fallback 和跨 lane fairness。RX fan-in 使用一个 Parent client 
 pipe1 仍失败说明 8 MiB required 边界本身缺少等待/公平性；只有 pipe2 失败则需继续检查 depth2 的多 lane
 生命周期。
 
-fan-in 先运行 `fanin-post1-in32-l2` 和 `fanin-post1-in32-l4` 建立多 lane 基线，再依次运行
+fan-in 先运行 `fanin-post1-in32-l1-pipe1` 建立单 lane/单 window 方向性基线，再运行
+`fanin-post1-in32-l2` 和 `fanin-post1-in32-l4` 建立多 lane 基线，最后依次运行
 `fanin-post1-in32-l4-pipe1-rx8`、`fanin-post1-in32-l4-pipe2-rx16` 和
 `fanin-post1-in32-l4-pipe2-rx8`。前两组预算 case 分别验证 4 个 required RX window 和 4 条双 window
 pipeline 的充足预算；最后一组验证 RX8 下 optional window 能否受控退化而不造成 session retirement 或
