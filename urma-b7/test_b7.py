@@ -1723,6 +1723,8 @@ storage:
         parent = """
 dragonfly_client_urma_budget_pressure_total{direction="rx",stage="required"} 2
 dragonfly_client_urma_budget_pressure_total{direction="rx",stage="optional"} 3
+dragonfly_client_urma_required_admission_wait_total{direction="rx"} 17
+dragonfly_client_urma_required_admission_wait_nanoseconds_total{direction="rx"} 123456789
 URMA RX second window unavailable; continuing with one-window pipeline
 RX BufferUnavailable
 retire the cached peer session
@@ -1740,6 +1742,8 @@ dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 13
         }
         summary = b7.analyze_fanin_transport_health(parent, children)
         self.assertEqual(summary["rxBudgetPressure"], {"required": 2.0, "optional": 3.0})
+        self.assertEqual(summary["requiredRxWaitCount"], 17.0)
+        self.assertEqual(summary["requiredRxWaitNs"], 123456789.0)
         self.assertEqual(summary["rxBufferUnavailableLines"], 1)
         self.assertEqual(summary["rxOptionalSingleWindowFallbacks"], 1)
         self.assertEqual(summary["txBudgetPressure"], {"required": 16.0, "optional": 20.0})

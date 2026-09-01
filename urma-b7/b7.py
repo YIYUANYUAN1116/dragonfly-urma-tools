@@ -1242,6 +1242,16 @@ def analyze_fanin_transport_health(
                 ('direction="rx"', 'stage="optional"'),
             ),
         },
+        "requiredRxWaitCount": prometheus_counter_value(
+            parent,
+            "dragonfly_client_urma_required_admission_wait_total",
+            ('direction="rx"',),
+        ),
+        "requiredRxWaitNs": prometheus_counter_value(
+            parent,
+            "dragonfly_client_urma_required_admission_wait_nanoseconds_total",
+            ('direction="rx"',),
+        ),
         "rxBufferUnavailableLines": sum(
             ("bufferunavailable" in line.lower() or "buffer unavailable" in line.lower())
             and "rx" in line.lower()
