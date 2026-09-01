@@ -197,6 +197,11 @@ SIGTERM 前记录日志行偏移，停止两端后将新增内容分别保存为
 `child.shutdown.log`。受控停机引发的 peer `early eof` 单独计为 `peerCloseEvents`；其他 CQE、completion、
 protocol、digest、Jetty 或 panic 错误会使本轮失败。
 
+连续运行会复用 B7 的固定端口组。启动失败时工具会回收已拉起但尚未记入 manifest
+`started` 列表的 daemon；正常停止后会等待 TCP/UDP 端口退出监听和 TCP teardown，
+`prepare` 也会检查 UDP/QUIC 占用并等待上一轮端口可复用，避免紧接着启动时出现
+`address already in use`。
+
 证据分析还会固定方向：parent preheat 日志中出现任何从 peer 下载的 Piece，或 child 的 URMA Piece
 来自非预期 parent，都会以 `topology contamination` 失败。`urma download failed, fall back to tcp
 downloader` 及 parent penalty 文本同样作为真实 fallback 处理。

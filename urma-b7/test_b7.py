@@ -245,8 +245,65 @@ storage:
             script.index('.b7-owner.json"'), script.index('mv -T "$staging" "$run_dir"')
         )
         self.assertIn('ss -H -ltn "sport = :$port"', script)
+        self.assertIn('ss -H -lun "sport = :$port"', script)
+        self.assertIn('ss -H -tan "sport = :$port"', script)
+        self.assertIn("port not reusable after previous run", script)
         self.assertIn("/tmp/dragonfly-urma-b7/b7-test/parent", script)
         self.assertEqual(result["configSha256"], "abc123")
+        self.assertEqual(execute.call_args.kwargs["timeout"], 100)
+
+    def test_role_lifecycle_reaps_failed_start_and_waits_for_ports(self):
+        _, _, generated = b7.generated_layout(
+            self.inventory, "dual", "b7-test", None
+        )
+        layout = generated["parent"]
+        node = self.inventory["nodes"]["node1"]
+        started = b7.subprocess.CompletedProcess([], 0, stdout="123\n", stderr="")
+        stopped = b7.subprocess.CompletedProcess([], 0, stdout="stopped\n", stderr="")
+        with mock.patch.object(
+            b7, "ssh_script", side_effect=[started, stopped]
+        ) as execute:
+            self.assertEqual(
+                b7.start_remote_role(node, self.inventory, layout, "parent", "b7-test")[
+                    "pid"
+                ],
+                123,
+            )
+            self.assertEqual(
+                b7.stop_remote_role(node, self.inventory, layout, "parent", "b7-test")[
+                    "result"
+                ],
+                "stopped",
+            )
+
+        start_script = execute.call_args_list[0].args[2]
+        start_syntax = b7.subprocess.run(
+            ["bash", "-n"],
+            input=start_script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(start_syntax.returncode, 0, start_syntax.stderr)
+        self.assertIn("trap cleanup_failed_start EXIT", start_script)
+        self.assertIn('kill -KILL "$pid"', start_script)
+        self.assertIn("address already in use|AddrInUse", start_script)
+        self.assertLess(start_script.index("sleep 1"), start_script.index("ready=1"))
+        self.assertIn("trap - EXIT", start_script)
+
+        stop_script = execute.call_args_list[1].args[2]
+        stop_syntax = b7.subprocess.run(
+            ["bash", "-n"],
+            input=stop_script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(stop_syntax.returncode, 0, stop_syntax.stderr)
+        self.assertIn('ss -H -tan "sport = :$port"', stop_script)
+        self.assertIn('ss -H -uan "sport = :$port"', stop_script)
+        self.assertIn("port did not become reusable", stop_script)
+        self.assertEqual(execute.call_args_list[1].kwargs["timeout"], 130)
 
     def test_prepare_origin_creates_owner_marker_before_link(self):
         origin = b7.origin_artifact(self.inventory, "b7-test", "1g")

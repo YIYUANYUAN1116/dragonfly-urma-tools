@@ -294,11 +294,28 @@ for target in "$run_dir" "$staging" "$storage" "$config"; do
   fi
 done
 for port in {ports}; do
-  if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
+  if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . || \
+     ss -H -lun "sport = :$port" 2>/dev/null | grep -q .; then
     echo "port already in use: $port" >&2
     exit 21
   fi
 done
+ports_ready=0
+for _ in $(seq 1 180); do
+  busy_port=
+  for port in {ports}; do
+    if ss -H -tan "sport = :$port" 2>/dev/null | grep -q .; then
+      busy_port=$port
+      break
+    fi
+  done
+  if [ -z "$busy_port" ]; then ports_ready=1; break; fi
+  sleep 0.5
+done
+if [ "$ports_ready" -ne 1 ]; then
+  echo "port not reusable after previous run: $busy_port" >&2
+  exit 22
+fi
 umask 077
 mkdir -p "$run_parent"
 mkdir "$staging"
@@ -310,7 +327,7 @@ mkdir -p "$storage" "$cache"
 printf '%s' {shlex.quote(payload)} | base64 -d > "$config"
 sha256sum "$config" | awk '{{print $1}}'
 """
-    completed = ssh_script(node, inventory, script)
+    completed = ssh_script(node, inventory, script, timeout=100)
     if completed.returncode != 0:
         raise B7Error(
             f"cannot prepare {role} on {ssh_target(node)}: {completed.stderr.strip()}"
@@ -387,6 +404,7 @@ config={shlex.quote(layout['config'])}
 pidfile={shlex.quote(layout['pid'])}
 log={shlex.quote(layout['log'])}
 socket={shlex.quote(layout['socket'])}
+pid=
 test -x "$binary"
 test -f "$config"
 if [ -f "$pidfile" ]; then
@@ -396,6 +414,25 @@ if [ -f "$pidfile" ]; then
     exit 20
   fi
 fi
+rm -f -- "$pidfile" "$socket"
+cleanup_failed_start() {{
+  status=$?
+  trap - EXIT
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f -- "$pidfile" "$socket"
+  exit "$status"
+}}
+trap cleanup_failed_start EXIT
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY='*' no_proxy='*'
 export LD_LIBRARY_PATH={shlex.quote(inventory['urma']['libDir'])}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
@@ -408,16 +445,29 @@ for _ in $(seq 1 60); do
     tail -n 80 "$log" >&2 || true
     exit 22
   fi
-  if [ -S "$socket" ]; then ready=1; break; fi
+  if [ -S "$socket" ]; then
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+      tail -n 80 "$log" >&2 || true
+      exit 22
+    fi
+    if grep -Eqi 'address already in use|AddrInUse' "$log"; then
+      tail -n 80 "$log" >&2 || true
+      exit 24
+    fi
+    ready=1
+    break
+  fi
   sleep 0.5
 done
 if [ "$ready" -ne 1 ]; then
   echo "dfdaemon socket did not become ready" >&2
   exit 23
 fi
+trap - EXIT
 printf '%s\\n' "$pid"
 """
-    completed = ssh_script(node, inventory, script, timeout=45)
+    completed = ssh_script(node, inventory, script, timeout=50)
     if completed.returncode != 0:
         raise B7Error(f"cannot start {role} on {ssh_target(node)}: {completed.stderr.strip()}")
     return {"pid": int(completed.stdout.strip()), "target": ssh_target(node)}
@@ -1476,26 +1526,55 @@ def stop_remote_role(
     run_id: str,
 ) -> dict[str, Any]:
     binary = str(PurePosixPath(node["repo"]) / inventory["dragonfly"]["binaryRelativePaths"]["dfdaemon"])
+    ports = " ".join(str(port) for port in layout["ports"].values())
     script = f"""set -eu
 {assert_owned_script(layout, run_id, role)}
 pidfile={shlex.quote(layout['pid'])}
 config={shlex.quote(layout['config'])}
 binary={shlex.quote(binary)}
-test -f "$pidfile" || {{ echo not-running; exit 0; }}
-pid=$(cat "$pidfile")
-case "$pid" in (*[!0-9]*|'') echo "invalid owned pid" >&2; exit 20;; esac
-if ! kill -0 "$pid" 2>/dev/null; then rm -f "$pidfile"; echo already-stopped; exit 0; fi
-cmd=$(tr '\\0' ' ' < "/proc/$pid/cmdline")
-case "$cmd" in (*"$binary"*"--config $config"*) ;; (*) echo "pid ownership mismatch: $cmd" >&2; exit 21;; esac
-kill -TERM "$pid"
-for _ in $(seq 1 60); do
-  if ! kill -0 "$pid" 2>/dev/null; then rm -f "$pidfile"; echo stopped; exit 0; fi
+result=not-running
+if [ -f "$pidfile" ]; then
+  pid=$(cat "$pidfile")
+  case "$pid" in (*[!0-9]*|'') echo "invalid owned pid" >&2; exit 20;; esac
+  if kill -0 "$pid" 2>/dev/null; then
+    cmd=$(tr '\\0' ' ' < "/proc/$pid/cmdline")
+    case "$cmd" in (*"$binary"*"--config $config"*) ;; (*) echo "pid ownership mismatch: $cmd" >&2; exit 21;; esac
+    kill -TERM "$pid"
+    stopped=0
+    for _ in $(seq 1 60); do
+      if ! kill -0 "$pid" 2>/dev/null; then stopped=1; break; fi
+      sleep 0.5
+    done
+    if [ "$stopped" -ne 1 ]; then
+      echo "owned dfdaemon did not stop after SIGTERM" >&2
+      exit 22
+    fi
+    result=stopped
+  else
+    result=already-stopped
+  fi
+fi
+rm -f -- "$pidfile"
+ports_ready=0
+for _ in $(seq 1 180); do
+  busy_port=
+  for port in {ports}; do
+    if ss -H -tan "sport = :$port" 2>/dev/null | grep -q . || \
+       ss -H -uan "sport = :$port" 2>/dev/null | grep -q .; then
+      busy_port=$port
+      break
+    fi
+  done
+  if [ -z "$busy_port" ]; then ports_ready=1; break; fi
   sleep 0.5
 done
-echo "owned dfdaemon did not stop after SIGTERM" >&2
-exit 22
+if [ "$ports_ready" -ne 1 ]; then
+  echo "owned dfdaemon stopped but port did not become reusable: $busy_port" >&2
+  exit 23
+fi
+echo "$result"
 """
-    completed = ssh_script(node, inventory, script, timeout=40)
+    completed = ssh_script(node, inventory, script, timeout=130)
     if completed.returncode != 0:
         raise B7Error(f"cannot stop {role} on {ssh_target(node)}: {completed.stderr.strip()}")
     return {"result": completed.stdout.strip(), "target": ssh_target(node)}
