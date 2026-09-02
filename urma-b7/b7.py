@@ -37,6 +37,11 @@ LOG_TIMESTAMP_RE = re.compile(
 TASK_ID_RE = re.compile(r'\btask_id="?([A-Za-z0-9._:-]+)"?')
 LANE_ID_RE = re.compile(r"\blane_id=(\d+)")
 TRANSFER_ID_RE = re.compile(r"\btransfer_id=(\d+)")
+WINDOW_CHUNK_COUNT_RE = re.compile(r"\bwindow_chunk_count=(\d+)")
+RECEIVE_WINDOW_COUNT_RE = re.compile(r"\breceive_window_count=(\d+)")
+SEND_IMM_CHUNK_COUNT_RE = re.compile(r"\bsend_imm_chunk_count=(\d+)")
+REORDERED_CHUNK_COUNT_RE = re.compile(r"\breordered_chunk_count=(\d+)")
+CROSS_TRANSFER_CHUNK_COUNT_RE = re.compile(r"\bcross_transfer_chunk_count=(\d+)")
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
@@ -117,6 +122,11 @@ def last_lane_id(line: str) -> int | None:
 
 def last_transfer_id(line: str) -> int | None:
     matches = list(TRANSFER_ID_RE.finditer(line))
+    return int(matches[-1].group(1)) if matches else None
+
+
+def last_int_match(pattern: re.Pattern[str], line: str) -> int | None:
+    matches = list(pattern.finditer(line))
     return int(matches[-1].group(1)) if matches else None
 
 
@@ -1161,6 +1171,95 @@ def analyze_piece_concurrency(parent_log: str, task_ids: set[str]) -> dict[str, 
         "unfinishedTransferIds": identity_objects(unfinished_transfers),
         "overlapProven": overlap_proven,
         "nativeRxWindowConcurrencyClaimed": False,
+    }
+
+
+def analyze_send_imm_routing(child_log: str) -> dict[str, Any]:
+    """Summarize lane-global SEND_IMM routing within one batch log range."""
+    window_count = 0
+    window_chunks = 0
+    window_reordered = 0
+    window_cross_transfer = 0
+    piece_count = 0
+    piece_windows = 0
+    piece_chunks = 0
+    piece_reordered = 0
+    piece_cross_transfer = 0
+    lane_ids: set[int] = set()
+    transfers: set[tuple[int, int]] = set()
+    malformed_lines = 0
+
+    for line in child_log.splitlines():
+        if "validated URMA Piece receive window SEND_IMM identities" in line:
+            lane_id = last_lane_id(line)
+            transfer_id = last_transfer_id(line)
+            chunks = last_int_match(WINDOW_CHUNK_COUNT_RE, line)
+            reordered = last_int_match(REORDERED_CHUNK_COUNT_RE, line)
+            cross_transfer = last_int_match(CROSS_TRANSFER_CHUNK_COUNT_RE, line)
+            if None in (lane_id, transfer_id, chunks, reordered, cross_transfer):
+                malformed_lines += 1
+                continue
+            window_count += 1
+            window_chunks += int(chunks)
+            window_reordered += int(reordered)
+            window_cross_transfer += int(cross_transfer)
+            lane_ids.add(int(lane_id))
+            transfers.add((int(lane_id), int(transfer_id)))
+            continue
+
+        if "urma piece finished on peer lane" not in line or not re.search(
+            r'\brole="?client"?', line
+        ):
+            continue
+        lane_id = last_lane_id(line)
+        transfer_id = last_transfer_id(line)
+        windows = last_int_match(RECEIVE_WINDOW_COUNT_RE, line)
+        chunks = last_int_match(SEND_IMM_CHUNK_COUNT_RE, line)
+        reordered = last_int_match(REORDERED_CHUNK_COUNT_RE, line)
+        cross_transfer = last_int_match(CROSS_TRANSFER_CHUNK_COUNT_RE, line)
+        if None in (
+            lane_id,
+            transfer_id,
+            windows,
+            chunks,
+            reordered,
+            cross_transfer,
+        ):
+            malformed_lines += 1
+            continue
+        piece_count += 1
+        piece_windows += int(windows)
+        piece_chunks += int(chunks)
+        piece_reordered += int(reordered)
+        piece_cross_transfer += int(cross_transfer)
+
+    totals_match = (
+        window_count == piece_windows
+        and window_chunks == piece_chunks
+        and window_reordered == piece_reordered
+        and window_cross_transfer == piece_cross_transfer
+    )
+    native_concurrency = window_cross_transfer > 0
+    return {
+        "passed": malformed_lines == 0
+        and window_count > 0
+        and piece_count > 0
+        and totals_match,
+        "laneCount": len(lane_ids),
+        "laneIds": sorted(lane_ids),
+        "distinctTransfers": len(transfers),
+        "windowCount": window_count,
+        "sendImmChunkCount": window_chunks,
+        "reorderedChunkCount": window_reordered,
+        "crossTransferChunkCount": window_cross_transfer,
+        "pieceSummaryCount": piece_count,
+        "pieceReceiveWindowCount": piece_windows,
+        "pieceSendImmChunkCount": piece_chunks,
+        "pieceReorderedChunkCount": piece_reordered,
+        "pieceCrossTransferChunkCount": piece_cross_transfer,
+        "totalsMatch": totals_match,
+        "malformedLines": malformed_lines,
+        "nativeRxWindowConcurrencyClaimed": native_concurrency,
     }
 
 
@@ -3153,6 +3252,9 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     piece_length = case.get("pieceLength")
     protocol = case.get("protocol", "urma")
     piece_concurrency = topology == "piece-concurrency"
+    require_native_rx_window_concurrency = bool(
+        case.get("requireNativeRxWindowConcurrency", False)
+    )
     if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
         raise B7Error("manifest repetitions must be in 1..=100")
     if not isinstance(warmups, int) or not 0 <= warmups <= 20:
@@ -3174,6 +3276,11 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         operations.insert(
             5,
             "prove overlapping Piece lifetimes with distinct transfer IDs on one lane",
+        )
+    if require_native_rx_window_concurrency:
+        operations.insert(
+            6,
+            "prove SEND_IMM routing across concurrently posted native RX windows",
         )
     if not args.execute:
         print(json.dumps({"runId": run_id, "dryRun": True, "operations": operations}, indent=2))
@@ -3342,6 +3449,11 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 piece_concurrency_evidence = analyze_piece_concurrency(
                     parent_task_log, task_ids
                 )
+                send_imm_routing = analyze_send_imm_routing(task_log)
+                piece_concurrency_evidence["sendImmRouting"] = send_imm_routing
+                piece_concurrency_evidence["nativeRxWindowConcurrencyClaimed"] = (
+                    send_imm_routing["nativeRxWindowConcurrencyClaimed"]
+                )
                 if not piece_concurrency_evidence["passed"]:
                     piece_concurrency_failures.append(
                         f"{batch_suffix}: single-lane Piece overlap not proven "
@@ -3351,6 +3463,18 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                         f"unfinished={piece_concurrency_evidence['unfinishedTransferIds']} "
                         f"duplicateStarts={piece_concurrency_evidence['duplicateStartTransferIds']} "
                         f"duplicateFinishes={piece_concurrency_evidence['duplicateFinishTransferIds']}"
+                    )
+                if require_native_rx_window_concurrency and (
+                    not send_imm_routing["passed"]
+                    or not send_imm_routing["nativeRxWindowConcurrencyClaimed"]
+                ):
+                    piece_concurrency_failures.append(
+                        f"{batch_suffix}: native RX window concurrency not proven "
+                        f"windows={send_imm_routing['windowCount']} "
+                        f"chunks={send_imm_routing['sendImmChunkCount']} "
+                        f"crossTransfer={send_imm_routing['crossTransferChunkCount']} "
+                        f"totalsMatch={send_imm_routing['totalsMatch']} "
+                        f"malformed={send_imm_routing['malformedLines']}"
                     )
             child_scoped_name = f"child.{batch_suffix}.tasks.log"
             parent_scoped_name = f"parent.{batch_suffix}.tasks.log"
@@ -3374,6 +3498,9 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 batch_result["pieceConcurrencyEvidence"] = piece_concurrency_evidence
                 batch_result["pieceConcurrencyEvidenceFile"] = (
                     f"parent.{batch_suffix}.log"
+                )
+                batch_result["sendImmRoutingEvidenceFile"] = (
+                    f"child.{batch_suffix}.log"
                 )
             result["transfer"]["batches"][group].append(batch_result)
         first_sample = result["transfer"]["samples"][0]
@@ -3458,8 +3585,10 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 "passed": not piece_concurrency_failures,
                 "failures": piece_concurrency_failures,
                 "scope": (
-                    "concurrent Piece lifetimes on one lane; native RX windows "
-                    "remain serialized by the shared-JFR safety gate"
+                    "concurrent Piece lifetimes and SEND_IMM-routed native RX "
+                    "windows on one lane"
+                    if require_native_rx_window_concurrency
+                    else "concurrent Piece lifetimes on one lane"
                 ),
             }
             if piece_concurrency_failures:

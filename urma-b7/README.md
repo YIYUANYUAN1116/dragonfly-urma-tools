@@ -140,10 +140,10 @@ PASS 要求每个 task 均有 Piece start、所有 `(lane_id, transfer_id)` 都�
 误判为并发。manifest 在每个 batch 保存 `pieceConcurrencyEvidence`，并汇总
 `pieceConcurrencyDiagnostics` 与 `pieceConcurrencyValidation`。
 
-由于当前共享 JFR 的 RC SEND/RECV 匹配仍依赖 lane FIFO，客户端 safety gate 保证同 lane 同时最多一个
-native RX window outstanding。因此该 case 证明的是并发 rendezvous/storage/Piece 生命周期和独立
-`transfer_id`，不宣称 native data window 已并行；manifest 会显式记录
-`nativeRxWindowConcurrencyClaimed: false`。
+基础 `piece-concurrency-*` case 只要求并发 rendezvous/storage/Piece 生命周期和独立
+`transfer_id`。支持 lane-global SEND_IMM dispatcher 的客户端还会输出每个 RX window 和 Piece 的
+`reordered_chunk_count`、`cross_transfer_chunk_count` 汇总；runner 将其写入
+`sendImmRouting`，但基础 case 不把 native RX window 并行作为 PASS 条件。
 
 先运行 c2，再运行 c4：
 
@@ -152,6 +152,22 @@ python .\b7.py prepare --mode dual --run-id b84-piece-c2 --case piece-concurrenc
 python .\b7.py run --manifest .\results\b84-piece-c2\manifest.json --execute
 python .\b7.py prepare --mode dual --run-id b84-piece-c4 --case piece-concurrency-post1-in32-c4 --execute
 python .\b7.py run --manifest .\results\b84-piece-c4\manifest.json --execute
+```
+
+### 单 lane native RX window 并发（B8.6）
+
+`piece-native-rx-*` 在上述 Piece overlap gate 之上要求 SEND_IMM window/Piece 汇总完整一致，并且
+`crossTransferChunkCount > 0`。后者表示某个 transfer 的 SEND 实际落入了另一个 transfer 发布的
+RX slot，能够直接证明同 lane 至少两个 native RX window 同时 outstanding，且 completion 由
+`(lane_id, SEND_IMM identity)` 路由而非 posted-WR owner 或 FIFO 猜测。
+
+先运行 c2，再运行 c4：
+
+```powershell
+python .\b7.py prepare --mode dual --run-id b86-native-rx-c2 --case piece-native-rx-post1-in32-c2 --execute
+python .\b7.py run --manifest .\results\b86-native-rx-c2\manifest.json --execute
+python .\b7.py prepare --mode dual --run-id b86-native-rx-c4 --case piece-native-rx-post1-in32-c4 --execute
+python .\b7.py run --manifest .\results\b86-native-rx-c4\manifest.json --execute
 ```
 
 ### TX fan-out（B7.2）

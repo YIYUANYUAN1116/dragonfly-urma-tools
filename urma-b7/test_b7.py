@@ -1281,11 +1281,46 @@ storage:
         )
         self.assertEqual(evidence["unfinishedTransferIds"], [])
 
+    def test_send_imm_routing_proves_cross_transfer_native_windows(self):
+        log = "\n".join(
+            [
+                "lane_id=1 transfer_id=7 window_chunk_count=32 "
+                "reordered_chunk_count=20 cross_transfer_chunk_count=11 "
+                "validated URMA Piece receive window SEND_IMM identities",
+                "lane_id=1 transfer_id=8 window_chunk_count=32 "
+                "reordered_chunk_count=21 cross_transfer_chunk_count=9 "
+                "validated URMA Piece receive window SEND_IMM identities",
+                'role="client" lane_id=1 transfer_id=7 receive_window_count=1 '
+                "send_imm_chunk_count=32 reordered_chunk_count=20 "
+                "cross_transfer_chunk_count=11 urma piece finished on peer lane",
+                'role="client" lane_id=1 transfer_id=8 receive_window_count=1 '
+                "send_imm_chunk_count=32 reordered_chunk_count=21 "
+                "cross_transfer_chunk_count=9 urma piece finished on peer lane",
+            ]
+        )
+        evidence = b7.analyze_send_imm_routing(log)
+        self.assertTrue(evidence["passed"])
+        self.assertTrue(evidence["nativeRxWindowConcurrencyClaimed"])
+        self.assertEqual(evidence["distinctTransfers"], 2)
+        self.assertEqual(evidence["windowCount"], 2)
+        self.assertEqual(evidence["sendImmChunkCount"], 64)
+        self.assertEqual(evidence["crossTransferChunkCount"], 20)
+        self.assertTrue(evidence["totalsMatch"])
+
+        mismatched = b7.analyze_send_imm_routing(log.rsplit("\n", 1)[0])
+        self.assertFalse(mismatched["passed"])
+        self.assertFalse(mismatched["totalsMatch"])
+
     def test_piece_concurrency_cases_keep_one_child_layout(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
         self.assertEqual(
             cases["piece-concurrency-post1-in32-c2"]["topology"],
             "piece-concurrency",
+        )
+        self.assertTrue(
+            cases["piece-native-rx-post1-in32-c2"][
+                "requireNativeRxWindowConcurrency"
+            ]
         )
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
