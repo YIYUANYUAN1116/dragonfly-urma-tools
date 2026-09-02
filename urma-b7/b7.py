@@ -1043,11 +1043,14 @@ def analyze_piece_concurrency(parent_log: str, task_ids: set[str]) -> dict[str, 
     concurrent Piece handling. This deliberately does not claim concurrent
     native RX windows: shared-JFR receive matching still serializes that layer.
     """
-    starts_by_transfer: dict[int, dict[str, int | str]] = {}
-    active: dict[int, dict[str, int | str]] = {}
-    completed: set[int] = set()
-    duplicate_starts: set[int] = set()
-    duplicate_finishes: set[int] = set()
+    # transfer_id is allocated independently by each lane and restarts from 1
+    # after a lane is replaced. Every correlation key must therefore include
+    # lane_id; using transfer_id alone can pair events from different lanes.
+    starts_by_transfer: dict[tuple[int, int], dict[str, int | str]] = {}
+    active: dict[tuple[int, int], dict[str, int | str]] = {}
+    completed: set[tuple[int, int]] = set()
+    duplicate_starts: set[tuple[int, int]] = set()
+    duplicate_finishes: set[tuple[int, int]] = set()
     task_start_counts = {task_id: 0 for task_id in task_ids}
     lane_ids: set[int] = set()
     max_active_transfers = 0
@@ -1062,16 +1065,17 @@ def analyze_piece_concurrency(parent_log: str, task_ids: set[str]) -> dict[str, 
             transfer_id = last_transfer_id(line)
             if lane_id is None or transfer_id is None:
                 continue
-            if transfer_id in starts_by_transfer:
-                duplicate_starts.add(transfer_id)
+            transfer = (lane_id, transfer_id)
+            if transfer in starts_by_transfer:
+                duplicate_starts.add(transfer)
                 continue
             event: dict[str, int | str] = {
                 "taskId": task_id,
                 "laneId": lane_id,
                 "startLine": line_number,
             }
-            starts_by_transfer[transfer_id] = event
-            active[transfer_id] = event
+            starts_by_transfer[transfer] = event
+            active[transfer] = event
             task_start_counts[task_id] += 1
             lane_ids.add(lane_id)
             active_task_ids = {str(value["taskId"]) for value in active.values()}
@@ -1085,19 +1089,31 @@ def analyze_piece_concurrency(parent_log: str, task_ids: set[str]) -> dict[str, 
             r'\brole="?server"?', line
         ):
             continue
+        lane_id = last_lane_id(line)
         transfer_id = last_transfer_id(line)
-        if transfer_id is None or transfer_id not in starts_by_transfer:
+        if lane_id is None or transfer_id is None:
             continue
-        if transfer_id in completed:
-            duplicate_finishes.add(transfer_id)
+        transfer = (lane_id, transfer_id)
+        if transfer not in starts_by_transfer:
             continue
-        completed.add(transfer_id)
-        active.pop(transfer_id, None)
+        if transfer in completed:
+            duplicate_finishes.add(transfer)
+            continue
+        completed.add(transfer)
+        active.pop(transfer, None)
 
     missing_task_ids = sorted(
         task_id for task_id, count in task_start_counts.items() if count == 0
     )
-    unfinished_transfer_ids = sorted(set(starts_by_transfer) - completed)
+    unfinished_transfers = sorted(set(starts_by_transfer) - completed)
+
+    def identity_objects(
+        transfers: set[tuple[int, int]],
+    ) -> list[dict[str, int]]:
+        return [
+            {"laneId": lane_id, "transferId": transfer_id}
+            for lane_id, transfer_id in sorted(transfers)
+        ]
     required_overlap = min(2, len(task_ids))
     valid_lane = len(lane_ids) == 1 and 0 not in lane_ids
     overlap_proven = len(max_active_task_ids) >= required_overlap
@@ -1106,21 +1122,21 @@ def analyze_piece_concurrency(parent_log: str, task_ids: set[str]) -> dict[str, 
         and valid_lane
         and not duplicate_starts
         and not duplicate_finishes
-        and not unfinished_transfer_ids
+        and not unfinished_transfers
         and overlap_proven,
         "laneCount": len(lane_ids),
         "laneIds": sorted(lane_ids),
         "pieceStarts": len(starts_by_transfer),
         "pieceCompletions": len(completed),
         "pieceStartsByTask": task_start_counts,
-        "distinctTransferIds": len(starts_by_transfer),
+        "distinctTransfers": len(starts_by_transfer),
         "maxActiveTransfers": max_active_transfers,
         "maxActiveTaskCount": len(max_active_task_ids),
         "maxActiveTaskIds": sorted(max_active_task_ids),
         "missingTaskIds": missing_task_ids,
-        "duplicateStartTransferIds": sorted(duplicate_starts),
-        "duplicateFinishTransferIds": sorted(duplicate_finishes),
-        "unfinishedTransferIds": unfinished_transfer_ids,
+        "duplicateStartTransferIds": identity_objects(duplicate_starts),
+        "duplicateFinishTransferIds": identity_objects(duplicate_finishes),
+        "unfinishedTransferIds": identity_objects(unfinished_transfers),
         "overlapProven": overlap_proven,
         "nativeRxWindowConcurrencyClaimed": False,
     }

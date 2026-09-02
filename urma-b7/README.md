@@ -135,7 +135,7 @@ gate。每个 batch 的多个独立 task 经同一 barrier 同时启动，工具
 - `start upload piece content over urma` 的 `task_id`、`lane_id`、`transfer_id`；
 - `urma piece finished on peer lane role="server"` 的 `lane_id`、`transfer_id`。
 
-PASS 要求每个 task 均有 Piece start、所有 transfer 都完成且无重复、全 batch 只使用一个非零 lane，并且
+PASS 要求每个 task 均有 Piece start、所有 `(lane_id, transfer_id)` 都完成且无重复、全 batch 只使用一个非零 lane，并且
 至少两个不同 task 的 Piece 生命周期在该 lane 上重叠。这样不会把“先跑完 task A 再复用 lane 跑 task B”
 误判为并发。manifest 在每个 batch 保存 `pieceConcurrencyEvidence`，并汇总
 `pieceConcurrencyDiagnostics` 与 `pieceConcurrencyValidation`。

@@ -1055,7 +1055,7 @@ storage:
         evidence = b7.analyze_piece_concurrency(log, {"task-a", "task-b"})
         self.assertTrue(evidence["passed"])
         self.assertEqual(evidence["laneIds"], [7])
-        self.assertEqual(evidence["distinctTransferIds"], 2)
+        self.assertEqual(evidence["distinctTransfers"], 2)
         self.assertEqual(evidence["maxActiveTaskCount"], 2)
         self.assertTrue(evidence["overlapProven"])
         self.assertFalse(evidence["nativeRxWindowConcurrencyClaimed"])
@@ -1071,6 +1071,47 @@ storage:
         evidence = b7.analyze_piece_concurrency(serial, {"task-a", "task-b"})
         self.assertFalse(evidence["passed"])
         self.assertFalse(evidence["overlapProven"])
+
+    def test_piece_concurrency_transfer_identity_is_lane_aware(self):
+        log = "\n".join(
+            [
+                'task_id="task-a" lane_id=20 transfer_id=1 start upload piece content over urma',
+                'role="server" lane_id=20 transfer_id=1 urma piece finished on peer lane',
+                'task_id="task-b" lane_id=21 transfer_id=1 start upload piece content over urma',
+                'role="server" lane_id=21 transfer_id=1 urma piece finished on peer lane',
+            ]
+        )
+        evidence = b7.analyze_piece_concurrency(log, {"task-a", "task-b"})
+        # This is not a valid single-lane run, but reusing transfer_id=1 on a
+        # new lane must not be diagnosed as duplicate or left unfinished.
+        self.assertFalse(evidence["passed"])
+        self.assertEqual(evidence["laneIds"], [20, 21])
+        self.assertEqual(evidence["distinctTransfers"], 2)
+        self.assertEqual(evidence["duplicateStartTransferIds"], [])
+        self.assertEqual(evidence["duplicateFinishTransferIds"], [])
+        self.assertEqual(evidence["unfinishedTransferIds"], [])
+
+    def test_piece_concurrency_duplicate_identity_includes_lane(self):
+        log = "\n".join(
+            [
+                'task_id="task-a" lane_id=20 transfer_id=7 start upload piece content over urma',
+                'task_id="task-a" lane_id=20 transfer_id=7 start upload piece content over urma',
+                'role="server" lane_id=20 transfer_id=7 urma piece finished on peer lane',
+                'task_id="task-a" lane_id=20 transfer_id=8 start upload piece content over urma',
+                'role="server" lane_id=20 transfer_id=8 urma piece finished on peer lane',
+                'role="server" lane_id=20 transfer_id=8 urma piece finished on peer lane',
+            ]
+        )
+        evidence = b7.analyze_piece_concurrency(log, {"task-a"})
+        self.assertEqual(
+            evidence["duplicateStartTransferIds"],
+            [{"laneId": 20, "transferId": 7}],
+        )
+        self.assertEqual(
+            evidence["duplicateFinishTransferIds"],
+            [{"laneId": 20, "transferId": 8}],
+        )
+        self.assertEqual(evidence["unfinishedTransferIds"], [])
 
     def test_piece_concurrency_cases_keep_one_child_layout(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
