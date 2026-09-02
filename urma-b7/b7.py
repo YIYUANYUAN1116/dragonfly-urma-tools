@@ -78,12 +78,14 @@ def validate_run_id(run_id: str) -> str:
     return run_id
 
 
-def standard_task_id(url: str, tag: str) -> str:
+def standard_task_id(url: str, tag: str, piece_length: str | None = None) -> str:
     """Reproduce Dragonfly's URL-based standard task ID for B7-owned dfget calls.
 
-    B7 does not pass application, revision, piece-length, or filtered query parameters. Keeping
-    this helper explicit lets concurrent daemon-log ranges be split by task ID instead of by
-    overlapping wall-clock intervals.
+    B7 does not pass application, revision, or filtered query parameters. The piece
+    length is part of the identity (id_generator: url + tag + piece_length + STANDARD),
+    so it must be threaded through whenever dfget runs with --piece-length. Keeping
+    this helper explicit lets concurrent daemon-log ranges be split by task ID instead
+    of by overlapping wall-clock intervals.
     """
     parts = urlsplit(url)
     if not parts.scheme or not parts.netloc:
@@ -94,6 +96,11 @@ def standard_task_id(url: str, tag: str) -> str:
     digest = hashlib.sha256()
     digest.update(normalized.encode())
     digest.update(tag.encode())
+    if piece_length is not None:
+        bytes_value = parse_piece_length_bytes(piece_length)
+        if bytes_value is None:
+            raise B7Error(f"invalid piece length for task ID: {piece_length!r}")
+        digest.update(str(bytes_value).encode())
     digest.update(b"STANDARD")
     return digest.hexdigest()
 
@@ -487,6 +494,7 @@ def run_remote_dfget(
     disable_back_to_source: bool,
     task_tag: str,
     artifact_suffix: str,
+    piece_length: str | None = None,
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", artifact_suffix):
         raise B7Error(f"invalid transfer artifact suffix: {artifact_suffix}")
@@ -506,6 +514,8 @@ def run_remote_dfget(
     ]
     if disable_back_to_source:
         args.append("--disable-back-to-source")
+    if piece_length is not None:
+        args.extend(["--piece-length", piece_length])
     command = " ".join(shlex.quote(value) for value in args)
     daemon_log = shlex.quote(layout["log"])
     script = f"""set -u
@@ -539,7 +549,7 @@ printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
         "daemonLogFirstLine": int(fields[5]),
         "daemonLogLastLine": int(fields[6]),
         "taskTag": task_tag,
-        "expectedTaskId": standard_task_id(url, task_tag),
+        "expectedTaskId": standard_task_id(url, task_tag, piece_length),
         "output": output,
         "transferLog": transfer_log,
     }
@@ -553,6 +563,7 @@ def run_remote_dfget_batch(
     disable_back_to_source: bool,
     transfers: list[tuple[str, str]],
     batch_suffix: str,
+    piece_length: str | None = None,
 ) -> list[dict[str, Any]]:
     """Start several dfget processes behind one remote barrier and wait for all of them."""
     if not transfers:
@@ -589,6 +600,8 @@ def run_remote_dfget_batch(
         ]
         if disable_back_to_source:
             args.append("--disable-back-to-source")
+        if piece_length is not None:
+            args.extend(["--piece-length", piece_length])
         command = " ".join(shlex.quote(value) for value in args)
         launch_blocks.append(
             "\n".join(
@@ -673,7 +686,7 @@ def run_remote_dfget_batch(
                 "daemonLogFirstLine": first_line,
                 "daemonLogLastLine": last_line,
                 "taskTag": task_tag,
-                "expectedTaskId": standard_task_id(url, task_tag),
+                "expectedTaskId": standard_task_id(url, task_tag, piece_length),
                 "output": f"{layout['output']}.{artifact_suffix}",
                 "transferLog": f"{layout['transferLog']}.{artifact_suffix}",
                 "workerIndex": worker,
@@ -690,6 +703,7 @@ def run_remote_dfget_fanout_batch(
     url: str,
     transfers: list[tuple[str, dict[str, Any], str, str]],
     batch_suffix: str,
+    piece_length: str | None = None,
 ) -> list[dict[str, Any]]:
     """Release one dfget per role behind a host-local barrier."""
     if not transfers:
@@ -730,6 +744,8 @@ def run_remote_dfget_fanout_batch(
             task_tag,
             "--disable-back-to-source",
         ]
+        if piece_length is not None:
+            args.extend(["--piece-length", piece_length])
         command = " ".join(shlex.quote(value) for value in args)
         launch_blocks.extend(
             [
@@ -822,7 +838,7 @@ def run_remote_dfget_fanout_batch(
                 "daemonLogFirstLine": first_line,
                 "daemonLogLastLine": last_line,
                 "taskTag": task_tag,
-                "expectedTaskId": standard_task_id(url, task_tag),
+                "expectedTaskId": standard_task_id(url, task_tag, piece_length),
                 "output": f"{layout['output']}.{artifact_suffix}",
                 "transferLog": f"{layout['transferLog']}.{artifact_suffix}",
                 "workerIndex": worker,
@@ -842,7 +858,7 @@ def collect_remote_evidence(
     script = f"""set -u
 {{
   echo '=== selected events ==='
-  grep -Ei 'urma|fallback|digest|piece finished|peer lane|cqe|flush' {log} 2>/dev/null || true
+  grep -Ei 'urma|fallback|digest|piece finished|finished piece|upload piece|peer lane|cqe|flush' {log} 2>/dev/null || true
   echo '=== metrics ==='
   curl -fsS --max-time 3 http://127.0.0.1:{metrics_port}/metrics 2>/dev/null | grep -E 'dragonfly.*urma' || true
 }} | base64 | tr -d '\\n'
@@ -923,17 +939,23 @@ def parse_log_timestamp_ns(line: str) -> int:
 
 
 def analyze_task_timing(
-    transfer: dict[str, Any], task_log: str, expected_task_id: str | None = None
+    transfer: dict[str, Any],
+    task_log: str,
+    expected_task_id: str | None = None,
+    protocol: str = "urma",
 ) -> dict[str, Any]:
+    completion_marker = f" using protocol {protocol}"
     completion_lines = [
         line
         for line in task_log.splitlines()
         if "finished piece " in line
         and " from parent Some(" in line
-        and " using protocol urma" in line
+        and completion_marker in line
     ]
     if not completion_lines:
-        raise B7Error("no child URMA Piece completion found in task log range")
+        raise B7Error(
+            f"no child {protocol.upper()} Piece completion found in task log range"
+        )
     completion_task_ids = [last_task_id(line) for line in completion_lines]
     if any(task_id is None for task_id in completion_task_ids):
         raise B7Error("task log Piece completion is missing task_id")
@@ -1408,8 +1430,19 @@ def analyze_fanin_transport_health(
 
 
 def analyze_evidence(
-    parent: str, child: str, expected_parent_marker: str | None = None
+    parent: str,
+    child: str,
+    expected_parent_marker: str | None = None,
+    protocol: str = "urma",
+    task_ids: set[str] | None = None,
 ) -> dict[str, int]:
+    log_task_id_pattern = re.compile(r'task_id="([^"]+)"')
+
+    def in_scope(line: str) -> bool:
+        if task_ids is None:
+            return True
+        return bool(set(log_task_id_pattern.findall(line)) & task_ids)
+
     child_attempt_lines = [
         line for line in child.splitlines() if "finished dragonfly urma piece attempt" in line
     ]
@@ -1423,7 +1456,7 @@ def analyze_evidence(
         for line in child.splitlines()
         if "finished piece " in line
         and " from parent Some(" in line
-        and " using protocol urma" in line
+        and f" using protocol {protocol}" in line
     ]
     fallback_patterns = (
         "urma download failed, fall back to tcp downloader",
@@ -1468,6 +1501,45 @@ def analyze_evidence(
             for line in text.splitlines()
         ),
     }
+    if protocol == "tcp":
+        # The TCP storage server logs one "start upload piece content" per served
+        # piece (without the URMA "over urma" suffix). When task_ids is provided,
+        # both sides are strictly scoped to the measured task IDs so warmup,
+        # preheat, or unrelated tasks cannot satisfy the proof. Fallback and lane
+        # evidence are URMA-specific and stay zero in this mode.
+        parent_upload_lines = [
+            line
+            for line in parent.splitlines()
+            if "start upload piece content" in line and "over urma" not in line
+        ]
+        summary["parentTcpUploads"] = sum(in_scope(line) for line in parent_upload_lines)
+        summary["outOfScopeParentTcpUploads"] = len(parent_upload_lines) - summary[
+            "parentTcpUploads"
+        ]
+        child_tcp_piece_lines = [
+            line for line in child_peer_piece_lines if in_scope(line)
+        ]
+        summary["childTcpPieces"] = len(child_tcp_piece_lines)
+        summary["outOfScopeChildTcpPieces"] = len(child_peer_piece_lines) - len(
+            child_tcp_piece_lines
+        )
+        if summary["childTcpPieces"] == 0:
+            if task_ids is not None and child_peer_piece_lines:
+                raise B7Error(
+                    "TCP Piece evidence exists but none matches the measured task IDs"
+                )
+            raise B7Error("content matched but logs do not prove a TCP Piece transfer")
+        if summary["parentPeerPieces"] != 0:
+            raise B7Error(
+                "topology contamination: parent preheat downloaded Piece content from a peer"
+            )
+        if summary["unexpectedChildParentPieces"] != 0:
+            raise B7Error("topology contamination: child used an unexpected parent peer")
+        if summary["parentTcpUploads"] != summary["childTcpPieces"]:
+            raise B7Error("parent/child TCP Piece completion counts differ")
+        if summary["transferErrors"] != 0:
+            raise B7Error("transport error evidence was found before shutdown")
+        return summary
     if summary["parentUrmaFinished"] == 0 or summary["childUrmaSuccesses"] == 0:
         raise B7Error("content matched but logs do not prove an URMA Piece transfer")
     if summary["parentPeerPieces"] != 0:
@@ -1951,8 +2023,41 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
             raise B7Error(
                 f"case {case['name']} {topology} requires concurrency >= 2"
             )
+        protocol = case.get("protocol", "urma")
+        if protocol not in ("urma", "tcp"):
+            raise B7Error(f"case {case['name']} has unsupported protocol {protocol!r}")
+        if protocol == "tcp" and topology != "queue":
+            raise B7Error(
+                f"case {case['name']} protocol tcp only supports queue topology"
+            )
+        piece_length = case.get("pieceLength")
+        if piece_length is not None:
+            if (
+                not isinstance(piece_length, str)
+                or parse_piece_length_bytes(piece_length) is None
+            ):
+                raise B7Error(
+                    f"case {case['name']} requires pieceLength in 4MiB..=64MiB "
+                    "(human readable, e.g. 4mib)"
+                )
         result[case["name"]] = case
     return result
+
+
+PIECE_LENGTH_RE = re.compile(r"^(\d+)(mib|gib)$", re.IGNORECASE)
+MIN_PIECE_LENGTH_BYTES = 4 * 1024 * 1024
+MAX_PIECE_LENGTH_BYTES = 64 * 1024 * 1024
+
+
+def parse_piece_length_bytes(piece_length: str) -> int | None:
+    """Parse a dfget --piece-length value; returns None when out of range or invalid."""
+    match = PIECE_LENGTH_RE.fullmatch(piece_length.strip()) if isinstance(piece_length, str) else None
+    if match is None:
+        return None
+    value = int(match.group(1)) * (1024 * 1024 if match.group(2).lower() == "mib" else 1024 * 1024 * 1024)
+    if not MIN_PIECE_LENGTH_BYTES <= value <= MAX_PIECE_LENGTH_BYTES:
+        return None
+    return value
 
 
 def generated_layout(
@@ -2021,7 +2126,7 @@ def role_overlays(
         ("host", "ip"): node["host"],
         ("server", "cacheDir"): layout["cache"],
         ("download", "server", "socketPath"): layout["socket"],
-        ("download", "protocol"): "urma",
+        ("download", "protocol"): case.get("protocol", "urma"),
         ("upload", "server", "port"): ports["upload"],
         ("storage", "dir"): layout["storage"],
         ("storage", "server", "ip"): node["host"],
@@ -2265,6 +2370,7 @@ def command_run_fanout(
     concurrency = case.get("concurrency")
     repetitions = case.get("repetitions")
     warmups = case.get("warmups", 0)
+    piece_length = case.get("pieceLength")
     if (
         not isinstance(concurrency, int)
         or not 2 <= concurrency <= 16
@@ -2351,6 +2457,7 @@ def command_run_fanout(
                     False,
                     task_tag,
                     suffix,
+                    piece_length,
                 )
         for role in children:
             layout = generated[role]
@@ -2376,6 +2483,7 @@ def command_run_fanout(
                 manifest["origin"]["url"],
                 specs,
                 batch_suffix,
+                piece_length,
             )
             parent_log_last = remote_log_line_count(
                 parent_node, inventory, parent_layout
@@ -2636,6 +2744,7 @@ def command_run_fanin(
     concurrency = case.get("concurrency", 1)
     repetitions = case.get("repetitions")
     warmups = case.get("warmups", 0)
+    piece_length = case.get("pieceLength")
     if (
         not isinstance(concurrency, int)
         or not 1 <= concurrency <= 16
@@ -2733,6 +2842,7 @@ def command_run_fanin(
                     False,
                     task_tag,
                     suffix,
+                    piece_length,
                 )
             parent_log_first = remote_log_line_count(
                 parent_node, inventory, parent_layout
@@ -2755,6 +2865,7 @@ def command_run_fanin(
                 manifest["origin"]["url"],
                 specs,
                 batch_suffix,
+                piece_length,
             )
             parent_log_last = remote_log_line_count(
                 parent_node, inventory, parent_layout
@@ -3033,6 +3144,8 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     repetitions = case.get("repetitions")
     warmups = case.get("warmups", 0)
     concurrency = case.get("concurrency", 1)
+    piece_length = case.get("pieceLength")
+    protocol = case.get("protocol", "urma")
     piece_concurrency = topology == "piece-concurrency"
     if not isinstance(repetitions, int) or not 1 <= repetitions <= 100:
         raise B7Error("manifest repetitions must be in 1..=100")
@@ -3112,6 +3225,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                     False,
                     task_tag,
                     suffix,
+                    piece_length,
                 )
         result["started"]["child"] = start_remote_role(
             child_node, inventory, child_layout, "child", run_id
@@ -3135,6 +3249,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                         True,
                         task_tag,
                         suffix,
+                        piece_length,
                     )
                 ]
             else:
@@ -3146,6 +3261,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                     True,
                     child_specs,
                     batch_suffix,
+                    piece_length,
                 )
             parent_log_last = remote_log_line_count(parent_node, inventory, parent_layout)
             child_first = min(
@@ -3180,11 +3296,11 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             ):
                 parent_transfer = parent_transfers[task_tag]
                 expected_task_id = child_transfer.get("expectedTaskId") or standard_task_id(
-                    manifest["origin"]["url"], task_tag
+                    manifest["origin"]["url"], task_tag, piece_length
                 )
                 child_transfer["expectedTaskId"] = expected_task_id
                 child_transfer["taskTiming"] = analyze_task_timing(
-                    child_transfer, task_log, expected_task_id
+                    child_transfer, task_log, expected_task_id, protocol
                 )
                 hashes = {
                     manifest["remote"]["origin"]["sha256"],
@@ -3284,6 +3400,8 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 evidence_by_role["parent"],
                 evidence_by_role["child"],
                 expected_parent_marker=f"-{run_id}-parent-",
+                protocol=protocol,
+                task_ids=set(result["transfer"]["measuredTaskIds"]),
             )
         except B7Error as evidence_error:
             if not piece_concurrency:

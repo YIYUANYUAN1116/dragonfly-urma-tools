@@ -3,6 +3,10 @@
   "cases": [
     {"name": "smoke-post1-pipe1", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 16, "repetitions": 1, "category": "correctness"},
     {"name": "baseline-post1-pipe2", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 5, "warmups": 2, "category": "performance"},
+    {"name": "tcp-baseline-post1-pipe2", "fileClass": "1g", "protocol": "tcp", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 5, "warmups": 2, "category": "performance"},
+    {"name": "tcp-concurrent-post1-in32-c4", "fileClass": "1g", "protocol": "tcp", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "concurrency"},
+    {"name": "piece-4mib-post1-pipe2", "fileClass": "1g", "pieceLength": "4mib", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 5, "warmups": 2, "category": "piece-size"},
+    {"name": "piece-16mib-post1-pipe2", "fileClass": "1g", "pieceLength": "16mib", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 5, "warmups": 2, "category": "piece-size"},
     {"name": "batch-post8-pipe2", "fileClass": "1g", "postListSize": 8, "pipelineDepth": 2, "maxInflightChunks": 64, "repetitions": 5, "warmups": 2, "category": "performance"},
     {"name": "concurrent-post1-in32-c2", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "concurrency"},
     {"name": "concurrent-post1-in32-c4", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "concurrency"},

@@ -770,6 +770,7 @@ storage:
                 _disable,
                 task_tag,
                 _artifact_suffix,
+                _piece_length=None,
             ):
                 order.append(f"dfget-{layout['node']}")
                 return {
@@ -976,6 +977,152 @@ storage:
         self.assertEqual(aggregate["batches"], 2)
         self.assertEqual(aggregate["concurrency"], 2)
         self.assertAlmostEqual(aggregate["aggregateThroughputMiBps"], 2 / 1.1)
+
+    def test_piece_length_parsing_and_case_validation(self):
+        self.assertEqual(b7.parse_piece_length_bytes("4mib"), 4 * 1024 * 1024)
+        self.assertEqual(b7.parse_piece_length_bytes("16MiB"), 16 * 1024 * 1024)
+        self.assertEqual(b7.parse_piece_length_bytes("64mib"), 64 * 1024 * 1024)
+        self.assertIsNone(b7.parse_piece_length_bytes("2mib"))
+        self.assertIsNone(b7.parse_piece_length_bytes("65mib"))
+        self.assertIsNone(b7.parse_piece_length_bytes("4kb"))
+        self.assertIsNone(b7.parse_piece_length_bytes("abc"))
+        cases = {
+            "ok": {"name": "ok", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 1, "repetitions": 1, "pieceLength": "16mib"},
+            "tcp-queue": {"name": "tcp-queue", "protocol": "tcp", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 1, "repetitions": 1},
+            "bad-protocol": {"name": "bad-protocol", "protocol": "quic", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 1, "repetitions": 1},
+            "tcp-fanout": {"name": "tcp-fanout", "protocol": "tcp", "topology": "fanout", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 1, "repetitions": 1, "concurrency": 2},
+            "bad-piece": {"name": "bad-piece", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 1, "repetitions": 1, "pieceLength": "2mib"},
+            "bad-piece-format": {"name": "bad-piece-format", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 1, "repetitions": 1, "pieceLength": "4MB"},
+        }
+        for name in ("ok", "tcp-queue"):
+            document = {"schemaVersion": 1, "cases": [cases[name]]}
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "cases.json"
+                path.write_text(json.dumps(document), encoding="utf-8")
+                loaded = b7.load_cases(path)
+            self.assertIn(name, loaded)
+        for name in ("bad-protocol", "tcp-fanout", "bad-piece", "bad-piece-format"):
+            document = {"schemaVersion": 1, "cases": [cases[name]]}
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "cases.json"
+                path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(b7.B7Error, name):
+                    b7.load_cases(path)
+
+    def test_standard_task_id_includes_piece_length(self):
+        base = b7.standard_task_id("http://example.com/file", "tag")
+        self.assertEqual(base, b7.standard_task_id("http://example.com/file", "tag"))
+        self.assertNotEqual(base, b7.standard_task_id("http://example.com/file", "tag", "16mib"))
+        self.assertEqual(
+            b7.standard_task_id("http://example.com/file", "tag", "16mib"),
+            b7.standard_task_id("http://example.com/file", "tag", "16MiB"),
+        )
+        # Mirrors id_generator: sha256(url + tag + piece_length + "STANDARD").
+        digest = __import__("hashlib").sha256()
+        digest.update(b"http://example.com/file")
+        digest.update(b"tag")
+        digest.update(str(16 * 1024 * 1024).encode())
+        digest.update(b"STANDARD")
+        self.assertEqual(
+            b7.standard_task_id("http://example.com/file", "tag", "16mib"),
+            digest.hexdigest(),
+        )
+        with self.assertRaises(b7.B7Error):
+            b7.standard_task_id("http://example.com/file", "tag", "2mib")
+
+    def test_role_overlays_selects_protocol_from_case(self):
+        _, _, generated = b7.generated_layout(self.inventory, "single", "b7-test", "node1")
+        base_case = {"postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 16}
+        urma_overlay = b7.role_overlays(
+            self.inventory, generated["parent"], "parent", "b7-test", base_case
+        )
+        self.assertEqual(urma_overlay[("download", "protocol")], "urma")
+        tcp_overlay = b7.role_overlays(
+            self.inventory, generated["parent"], "parent", "b7-test", dict(base_case, protocol="tcp")
+        )
+        self.assertEqual(tcp_overlay[("download", "protocol")], "tcp")
+
+    def test_task_timing_supports_tcp_protocol_marker(self):
+        urma_line = (
+            '2026-08-31T10:41:35.100000000Z DEBUG finished piece task-0 '
+            'from parent Some("parent") using protocol urma task_id="task-id"'
+        )
+        tcp_line = (
+            '2026-08-31T10:41:35.200000000Z DEBUG finished piece task-0 '
+            'from parent Some("parent") using protocol tcp task_id="task-id"'
+        )
+        started = b7.parse_log_timestamp_ns(tcp_line) - 100_000_000
+        finished = b7.parse_log_timestamp_ns(tcp_line) + 100_000_000
+        transfer = {
+            "startedAtUnixNs": started,
+            "finishedAtUnixNs": finished,
+            "elapsedNs": finished - started,
+        }
+        with self.assertRaises(b7.B7Error):
+            b7.analyze_task_timing(transfer, urma_line + "\n", protocol="tcp")
+        timing = b7.analyze_task_timing(
+            transfer, tcp_line + "\n", expected_task_id="task-id", protocol="tcp"
+        )
+        self.assertEqual(timing["pieceCompletions"], 1)
+        # Default protocol stays URMA: a TCP-only log must fail.
+        with self.assertRaises(b7.B7Error):
+            b7.analyze_task_timing(transfer, tcp_line + "\n")
+
+    def test_analyze_evidence_tcp_branch_requires_matching_uploads(self):
+        parent = (
+            "DEBUG start upload piece content task_id=\"task\"\n"
+            "DEBUG start upload piece content task_id=\"task\"\n"
+        )
+        child = (
+            'DEBUG finished piece 0 from parent Some("parent") using protocol tcp task_id="task"\n'
+            'DEBUG finished piece 1 from parent Some("parent") using protocol tcp task_id="task"\n'
+        )
+        summary = b7.analyze_evidence(parent, child, protocol="tcp")
+        self.assertEqual(summary["parentTcpUploads"], 2)
+        self.assertEqual(summary["childTcpPieces"], 2)
+        with self.assertRaisesRegex(b7.B7Error, "counts differ"):
+            b7.analyze_evidence(parent, child.splitlines()[0] + "\n", protocol="tcp")
+        with self.assertRaisesRegex(b7.B7Error, "do not prove a TCP"):
+            b7.analyze_evidence(parent, "", protocol="tcp")
+
+    def test_analyze_evidence_tcp_scopes_by_measured_task_ids(self):
+        parent = (
+            'DEBUG start upload piece content task_id="t1"\n'
+            'DEBUG start upload piece content task_id="t1"\n'
+            'DEBUG start upload piece content task_id="warmup-task"\n'
+        )
+        child = (
+            'DEBUG finished piece 0 from parent Some("parent") using protocol tcp task_id="t1"\n'
+            'DEBUG finished piece 1 from parent Some("parent") using protocol tcp task_id="t1"\n'
+            'DEBUG finished piece 0 from parent Some("parent") using protocol tcp task_id="warmup-task"\n'
+        )
+        summary = b7.analyze_evidence(
+            parent, child, protocol="tcp", task_ids={"t1"}
+        )
+        self.assertEqual(summary["parentTcpUploads"], 2)
+        self.assertEqual(summary["childTcpPieces"], 2)
+        self.assertEqual(summary["outOfScopeParentTcpUploads"], 1)
+        self.assertEqual(summary["outOfScopeChildTcpPieces"], 1)
+        # Without scoping the warmup lines inflate both counts symmetrically.
+        unscoped = b7.analyze_evidence(parent, child, protocol="tcp")
+        self.assertEqual(unscoped["parentTcpUploads"], 3)
+        self.assertEqual(unscoped["childTcpPieces"], 3)
+        # In-scope mismatch is still rejected after scoping.
+        with self.assertRaisesRegex(b7.B7Error, "counts differ"):
+            b7.analyze_evidence(
+                parent,
+                'DEBUG finished piece 0 from parent Some("parent") using protocol tcp task_id="t1"\n',
+                protocol="tcp",
+                task_ids={"t1"},
+            )
+        # Evidence exists only for out-of-scope tasks -> explicit failure.
+        warmup_only_child = (
+            'DEBUG finished piece 0 from parent Some("parent") using protocol tcp task_id="warmup-task"\n'
+        )
+        with self.assertRaisesRegex(
+            b7.B7Error, "none matches the measured task IDs"
+        ):
+            b7.analyze_evidence(parent, warmup_only_child, protocol="tcp", task_ids={"t1"})
 
     def test_task_timing_splits_dfget_wall_time(self):
         first_line = (
@@ -1271,6 +1418,7 @@ storage:
                 _disable,
                 task_tag,
                 _artifact_suffix,
+                _piece_length=None,
             ):
                 tags.append(task_tag)
                 return {
@@ -1370,7 +1518,8 @@ storage:
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
             def preheat(
-                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix,
+                _piece_length=None,
             ):
                 return {
                     "bytes": 1024 * 1024,
@@ -1386,7 +1535,7 @@ storage:
 
             batch_calls = []
 
-            def batch(_node, _inventory, _layout, url, _disable, specs, suffix):
+            def batch(_node, _inventory, _layout, url, _disable, specs, suffix, _piece_length=None):
                 batch_calls.append((suffix, list(specs)))
                 return [
                     {
@@ -1474,7 +1623,8 @@ storage:
             current_parent_log = [""]
 
             def preheat(
-                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix,
+                _piece_length=None,
             ):
                 return {
                     "bytes": 1024 * 1024,
@@ -1486,7 +1636,7 @@ storage:
                     "expectedTaskId": b7.standard_task_id(url, task_tag),
                 }
 
-            def batch(_node, _inventory, _layout, url, _disable, specs, _suffix):
+            def batch(_node, _inventory, _layout, url, _disable, specs, _suffix, _piece_length=None):
                 results = []
                 starts = []
                 finishes = []
@@ -1587,7 +1737,8 @@ storage:
             task_logs = {}
 
             def preheat(
-                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix,
+                _piece_length=None,
             ):
                 return {
                     "bytes": 1024 * 1024,
@@ -1599,7 +1750,7 @@ storage:
                     "expectedTaskId": b7.standard_task_id(url, task_tag),
                 }
 
-            def fanout(_node, _inventory, url, specs, _suffix):
+            def fanout(_node, _inventory, url, specs, _suffix, _piece_length=None):
                 results = []
                 for worker, (role, _layout, task_tag, _artifact) in enumerate(specs, 1):
                     task_id = b7.standard_task_id(url, task_tag)
@@ -2040,7 +2191,8 @@ dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 13
             child_server_logs = {role: [] for role in child_lane_ids}
 
             def preheat(
-                _node, _inventory, _layout, url, _disable, task_tag, _suffix
+                _node, _inventory, _layout, url, _disable, task_tag, _suffix,
+                _piece_length=None,
             ):
                 return {
                     "bytes": 1024 * 1024,
@@ -2052,7 +2204,7 @@ dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 13
                     "expectedTaskId": b7.standard_task_id(url, task_tag),
                 }
 
-            def fanout(_node, _inventory, url, specs, _suffix):
+            def fanout(_node, _inventory, url, specs, _suffix, _piece_length=None):
                 results = []
                 for worker, (role, _layout, task_tag, _artifact) in enumerate(specs, 1):
                     task_id = b7.standard_task_id(url, task_tag)
