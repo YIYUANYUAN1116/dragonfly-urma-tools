@@ -1499,10 +1499,28 @@ def analyze_shutdown_evidence(parent: str, child: str) -> dict[str, int]:
         for line in text.splitlines()
         if error_pattern.search(line)
     ]
-    peer_close = [line for line in relevant if "early eof" in line.lower()]
-    unexpected = [line for line in relevant if "early eof" not in line.lower()]
+    early_eof = [line for line in relevant if "early eof" in line.lower()]
+    control_queue_closed = [
+        line
+        for line in relevant
+        if "urma incoming transfer queue is closed" in line.lower()
+    ]
+    peer_close = [
+        line
+        for line in relevant
+        if "early eof" in line.lower()
+        or "urma incoming transfer queue is closed" in line.lower()
+    ]
+    unexpected = [
+        line
+        for line in relevant
+        if "early eof" not in line.lower()
+        and "urma incoming transfer queue is closed" not in line.lower()
+    ]
     summary = {
         "peerCloseEvents": len(peer_close),
+        "earlyEofEvents": len(early_eof),
+        "controlQueueClosedEvents": len(control_queue_closed),
         "unexpectedErrors": len(unexpected),
     }
     if unexpected:

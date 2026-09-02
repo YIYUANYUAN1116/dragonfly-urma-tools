@@ -903,7 +903,22 @@ storage:
             "",
         )
         self.assertEqual(summary["peerCloseEvents"], 1)
+        self.assertEqual(summary["earlyEofEvents"], 1)
+        self.assertEqual(summary["controlQueueClosedEvents"], 0)
         self.assertEqual(summary["unexpectedErrors"], 0)
+
+        queue_closed = b7.analyze_shutdown_evidence(
+            'aborting urma peer lane role="server" lane_id=1 '
+            "error=protocol error: URMA incoming transfer queue is closed\n"
+            "urma peer connection retired error=unknown protocol error: "
+            "URMA incoming transfer queue is closed\n",
+            "",
+        )
+        self.assertEqual(queue_closed["peerCloseEvents"], 2)
+        self.assertEqual(queue_closed["earlyEofEvents"], 0)
+        self.assertEqual(queue_closed["controlQueueClosedEvents"], 2)
+        self.assertEqual(queue_closed["unexpectedErrors"], 0)
+
         with self.assertRaises(b7.B7Error):
             b7.analyze_shutdown_evidence("CQE completion error\n", "")
 

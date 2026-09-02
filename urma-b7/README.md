@@ -221,8 +221,10 @@ output 布局是在 `prepare` 时固化进 manifest 的。旧 manifest 若仍把
 
 主证据文件只包含一次 selected-events 扫描和运行中 metrics，不再拼接可能重复的 log tail。工具在发送
 SIGTERM 前记录日志行偏移，停止两端后将新增内容分别保存为 `parent.shutdown.log` 和
-`child.shutdown.log`。受控停机引发的 peer `early eof` 单独计为 `peerCloseEvents`；其他 CQE、completion、
-protocol、digest、Jetty 或 panic 错误会使本轮失败。
+`child.shutdown.log`。受控停机引发的 peer `early eof` 或对端退出后关闭 incoming transfer queue，统一计入
+`peerCloseEvents`，并分别保留 `earlyEofEvents` 和 `controlQueueClosedEvents`；其他 CQE、completion、
+protocol、digest、Jetty 或 panic 错误会使本轮失败。该放行只应用于发送 SIGTERM 前记录 offset 之后的
+shutdown 日志，不会放宽传输阶段的 correctness gate。
 
 连续运行会复用 B7 的固定端口组。启动失败时工具会回收已拉起但尚未记入 manifest
 `started` 列表的 daemon；正常停止后会等待 TCP/UDP 端口退出监听和 TCP teardown，
