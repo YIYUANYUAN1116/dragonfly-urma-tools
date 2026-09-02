@@ -156,10 +156,11 @@ python .\b7.py run --manifest .\results\b84-piece-c4\manifest.json --execute
 
 ### 单 lane native RX window 并发（B8.6）
 
-`piece-native-rx-*` 在上述 Piece overlap gate 之上要求 SEND_IMM window/Piece 汇总完整一致，并且
-`crossTransferChunkCount > 0`。后者表示某个 transfer 的 SEND 实际落入了另一个 transfer 发布的
-RX slot，能够直接证明同 lane 至少两个 native RX window 同时 outstanding，且 completion 由
-`(lane_id, SEND_IMM identity)` 路由而非 posted-WR owner 或 FIFO 猜测。
+`piece-native-rx-*` 在上述 Piece overlap gate 之上要求 SEND_IMM window/Piece 汇总完整一致，并解析
+`URMA native RX window admitted/released` 生命周期。PASS 要求 admission/release 完整配对、无重复或
+遗留 window，并且同一 lane 的 `maxActiveTransfers >= 2`。`crossTransferChunkCount` 继续记录某个
+transfer 的 SEND 落入另一 transfer 发布的 RX slot，但 provider 可以保持同 transfer 匹配，因此它只是
+路由观测指标，不再作为 native RX window 并发的必要条件。
 
 先运行 c2，再运行 c4：
 

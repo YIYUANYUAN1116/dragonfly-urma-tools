@@ -37,6 +37,7 @@ LOG_TIMESTAMP_RE = re.compile(
 TASK_ID_RE = re.compile(r'\btask_id="?([A-Za-z0-9._:-]+)"?')
 LANE_ID_RE = re.compile(r"\blane_id=(\d+)")
 TRANSFER_ID_RE = re.compile(r"\btransfer_id=(\d+)")
+WINDOW_START_CHUNK_RE = re.compile(r"\bwindow_start_chunk=(\d+)")
 WINDOW_CHUNK_COUNT_RE = re.compile(r"\bwindow_chunk_count=(\d+)")
 RECEIVE_WINDOW_COUNT_RE = re.compile(r"\breceive_window_count=(\d+)")
 SEND_IMM_CHUNK_COUNT_RE = re.compile(r"\bsend_imm_chunk_count=(\d+)")
@@ -1174,6 +1175,84 @@ def analyze_piece_concurrency(parent_log: str, task_ids: set[str]) -> dict[str, 
     }
 
 
+def analyze_native_rx_admission(child_log: str) -> dict[str, Any]:
+    """Prove overlapping native RX windows from distinct transfers on one lane."""
+    active: set[tuple[int, int, int]] = set()
+    lane_ids: set[int] = set()
+    admitted = 0
+    released = 0
+    duplicate_admissions: set[tuple[int, int, int]] = set()
+    unknown_releases: set[tuple[int, int, int]] = set()
+    malformed_lines = 0
+    max_active_windows = 0
+    max_active_transfers = 0
+
+    for line in child_log.splitlines():
+        admitted_event = "URMA native RX window admitted" in line
+        released_event = "URMA native RX window released" in line
+        if not admitted_event and not released_event:
+            continue
+        lane_id = last_lane_id(line)
+        transfer_id = last_transfer_id(line)
+        window_start = last_int_match(WINDOW_START_CHUNK_RE, line)
+        if lane_id is None or transfer_id is None or window_start is None:
+            malformed_lines += 1
+            continue
+        identity = (lane_id, transfer_id, window_start)
+        lane_ids.add(lane_id)
+        if admitted_event:
+            admitted += 1
+            if identity in active:
+                duplicate_admissions.add(identity)
+                continue
+            active.add(identity)
+            max_active_windows = max(max_active_windows, len(active))
+            max_active_transfers = max(
+                max_active_transfers,
+                len({(lane, transfer) for lane, transfer, _ in active}),
+            )
+        else:
+            released += 1
+            if identity not in active:
+                unknown_releases.add(identity)
+                continue
+            active.remove(identity)
+
+    def identities(values: set[tuple[int, int, int]]) -> list[dict[str, int]]:
+        return [
+            {
+                "laneId": lane_id,
+                "transferId": transfer_id,
+                "windowStartChunk": window_start,
+            }
+            for lane_id, transfer_id, window_start in sorted(values)
+        ]
+
+    valid_lifecycle = (
+        admitted > 0
+        and len(lane_ids) == 1
+        and 0 not in lane_ids
+        and malformed_lines == 0
+        and not duplicate_admissions
+        and not unknown_releases
+        and not active
+    )
+    return {
+        "passed": valid_lifecycle,
+        "laneCount": len(lane_ids),
+        "laneIds": sorted(lane_ids),
+        "admittedWindowCount": admitted,
+        "releasedWindowCount": released,
+        "maxActiveWindows": max_active_windows,
+        "maxActiveTransfers": max_active_transfers,
+        "duplicateAdmissions": identities(duplicate_admissions),
+        "unknownReleases": identities(unknown_releases),
+        "unfinishedWindows": identities(active),
+        "malformedLines": malformed_lines,
+        "concurrencyProven": valid_lifecycle and max_active_transfers >= 2,
+    }
+
+
 def analyze_send_imm_routing(child_log: str) -> dict[str, Any]:
     """Summarize lane-global SEND_IMM routing within one batch log range."""
     window_count = 0
@@ -1239,7 +1318,8 @@ def analyze_send_imm_routing(child_log: str) -> dict[str, Any]:
         and window_reordered == piece_reordered
         and window_cross_transfer == piece_cross_transfer
     )
-    native_concurrency = window_cross_transfer > 0
+    native_rx_admission = analyze_native_rx_admission(child_log)
+    native_concurrency = native_rx_admission["concurrencyProven"]
     return {
         "passed": malformed_lines == 0
         and window_count > 0
@@ -1259,6 +1339,7 @@ def analyze_send_imm_routing(child_log: str) -> dict[str, Any]:
         "pieceCrossTransferChunkCount": piece_cross_transfer,
         "totalsMatch": totals_match,
         "malformedLines": malformed_lines,
+        "nativeRxAdmission": native_rx_admission,
         "nativeRxWindowConcurrencyClaimed": native_concurrency,
     }
 
@@ -3468,11 +3549,17 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                     not send_imm_routing["passed"]
                     or not send_imm_routing["nativeRxWindowConcurrencyClaimed"]
                 ):
+                    native_rx_admission = send_imm_routing["nativeRxAdmission"]
                     piece_concurrency_failures.append(
                         f"{batch_suffix}: native RX window concurrency not proven "
                         f"windows={send_imm_routing['windowCount']} "
                         f"chunks={send_imm_routing['sendImmChunkCount']} "
                         f"crossTransfer={send_imm_routing['crossTransferChunkCount']} "
+                        f"admitted={native_rx_admission['admittedWindowCount']} "
+                        f"released={native_rx_admission['releasedWindowCount']} "
+                        f"maxActiveWindows={native_rx_admission['maxActiveWindows']} "
+                        f"maxActiveTransfers={native_rx_admission['maxActiveTransfers']} "
+                        f"admissionPassed={native_rx_admission['passed']} "
                         f"totalsMatch={send_imm_routing['totalsMatch']} "
                         f"malformed={send_imm_routing['malformedLines']}"
                     )

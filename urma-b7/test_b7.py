@@ -1281,21 +1281,33 @@ storage:
         )
         self.assertEqual(evidence["unfinishedTransferIds"], [])
 
-    def test_send_imm_routing_proves_cross_transfer_native_windows(self):
+    def test_native_rx_admission_proves_concurrency_without_cross_transfer_routing(self):
         log = "\n".join(
             [
+                "lane_id=1 transfer_id=7 window_start_chunk=0 "
+                "window_chunk_count=32 active_native_rx_windows=1 "
+                "active_native_rx_transfers=1 URMA native RX window admitted",
+                "lane_id=1 transfer_id=8 window_start_chunk=0 "
+                "window_chunk_count=32 active_native_rx_windows=2 "
+                "active_native_rx_transfers=2 URMA native RX window admitted",
                 "lane_id=1 transfer_id=7 window_chunk_count=32 "
-                "reordered_chunk_count=20 cross_transfer_chunk_count=11 "
+                "reordered_chunk_count=20 cross_transfer_chunk_count=0 "
                 "validated URMA Piece receive window SEND_IMM identities",
                 "lane_id=1 transfer_id=8 window_chunk_count=32 "
-                "reordered_chunk_count=21 cross_transfer_chunk_count=9 "
+                "reordered_chunk_count=21 cross_transfer_chunk_count=0 "
                 "validated URMA Piece receive window SEND_IMM identities",
+                "lane_id=1 transfer_id=7 window_start_chunk=0 "
+                "active_native_rx_windows=1 active_native_rx_transfers=1 "
+                "URMA native RX window released",
+                "lane_id=1 transfer_id=8 window_start_chunk=0 "
+                "active_native_rx_windows=0 active_native_rx_transfers=0 "
+                "URMA native RX window released",
                 'role="client" lane_id=1 transfer_id=7 receive_window_count=1 '
                 "send_imm_chunk_count=32 reordered_chunk_count=20 "
-                "cross_transfer_chunk_count=11 urma piece finished on peer lane",
+                "cross_transfer_chunk_count=0 urma piece finished on peer lane",
                 'role="client" lane_id=1 transfer_id=8 receive_window_count=1 '
                 "send_imm_chunk_count=32 reordered_chunk_count=21 "
-                "cross_transfer_chunk_count=9 urma piece finished on peer lane",
+                "cross_transfer_chunk_count=0 urma piece finished on peer lane",
             ]
         )
         evidence = b7.analyze_send_imm_routing(log)
@@ -1304,12 +1316,39 @@ storage:
         self.assertEqual(evidence["distinctTransfers"], 2)
         self.assertEqual(evidence["windowCount"], 2)
         self.assertEqual(evidence["sendImmChunkCount"], 64)
-        self.assertEqual(evidence["crossTransferChunkCount"], 20)
+        self.assertEqual(evidence["crossTransferChunkCount"], 0)
         self.assertTrue(evidence["totalsMatch"])
+        self.assertEqual(evidence["nativeRxAdmission"]["maxActiveTransfers"], 2)
+        self.assertEqual(evidence["nativeRxAdmission"]["unfinishedWindows"], [])
 
         mismatched = b7.analyze_send_imm_routing(log.rsplit("\n", 1)[0])
         self.assertFalse(mismatched["passed"])
         self.assertFalse(mismatched["totalsMatch"])
+
+    def test_native_rx_admission_rejects_serial_or_unfinished_windows(self):
+        serial = "\n".join(
+            [
+                "lane_id=1 transfer_id=7 window_start_chunk=0 "
+                "URMA native RX window admitted",
+                "lane_id=1 transfer_id=7 window_start_chunk=0 "
+                "URMA native RX window released",
+                "lane_id=1 transfer_id=8 window_start_chunk=0 "
+                "URMA native RX window admitted",
+                "lane_id=1 transfer_id=8 window_start_chunk=0 "
+                "URMA native RX window released",
+            ]
+        )
+        evidence = b7.analyze_native_rx_admission(serial)
+        self.assertTrue(evidence["passed"])
+        self.assertFalse(evidence["concurrencyProven"])
+        self.assertEqual(evidence["maxActiveTransfers"], 1)
+
+        unfinished = b7.analyze_native_rx_admission(serial.rsplit("\n", 1)[0])
+        self.assertFalse(unfinished["passed"])
+        self.assertEqual(
+            unfinished["unfinishedWindows"],
+            [{"laneId": 1, "transferId": 8, "windowStartChunk": 0}],
+        )
 
     def test_piece_concurrency_cases_keep_one_child_layout(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
