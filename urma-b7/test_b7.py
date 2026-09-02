@@ -1037,10 +1037,16 @@ storage:
             self.inventory, generated["parent"], "parent", "b7-test", base_case
         )
         self.assertEqual(urma_overlay[("download", "protocol")], "urma")
+        self.assertEqual(urma_overlay[("download", "concurrentPieceCount")], 8)
         tcp_overlay = b7.role_overlays(
             self.inventory, generated["parent"], "parent", "b7-test", dict(base_case, protocol="tcp")
         )
         self.assertEqual(tcp_overlay[("download", "protocol")], "tcp")
+        piece_overlay = b7.role_overlays(
+            self.inventory, generated["parent"], "parent", "b7-test",
+            dict(base_case, concurrentPieceCount=32),
+        )
+        self.assertEqual(piece_overlay[("download", "concurrentPieceCount")], 32)
 
     def test_task_timing_supports_tcp_protocol_marker(self):
         urma_line = (

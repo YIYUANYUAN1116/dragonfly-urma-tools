@@ -140,7 +140,7 @@ one_line() {{ "$@" 2>&1 | tr '\\n' ' ' | tr '\\t' ' '; }}
 file_hash() {{ if [ -f "$1" ]; then sha256sum "$1" | awk '{{print $1}}'; else printf missing; fi; }}
 config_keys() {{
   if [ -f "$1" ]; then
-    grep -E '^[[:space:]]*(ip|port|host|manager|scheduler|advertiseIP|listenIP|listenPort|tcpPort|quicPort|socketPath|dir|device|eidIndex|fabricTag|maxInflightChunks|maxConcurrentTransfers|transferTimeout|mmapContent|protocol):' "$1" 2>/dev/null | base64 | tr -d '\\n'
+    grep -E '^[[:space:]]*(ip|port|host|manager|scheduler|advertiseIP|listenIP|listenPort|tcpPort|quicPort|socketPath|dir|device|eidIndex|fabricTag|maxInflightChunks|maxConcurrentTransfers|transferTimeout|mmapContent|protocol|concurrentPieceCount):' "$1" 2>/dev/null | base64 | tr -d '\\n'
   else
     printf missing
   fi
@@ -2013,6 +2013,11 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         warmups = case.get("warmups", 0)
         if not isinstance(warmups, int) or not 0 <= warmups <= 20:
             raise B7Error(f"case {case['name']} requires warmups in 0..=20")
+        concurrent_piece_count = case.get("concurrentPieceCount", 8)
+        if not isinstance(concurrent_piece_count, int) or not 1 <= concurrent_piece_count <= 1024:
+            raise B7Error(
+                f"case {case['name']} requires concurrentPieceCount in 1..=1024"
+            )
         concurrency = case.get("concurrency", 1)
         if not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
             raise B7Error(f"case {case['name']} requires concurrency in 1..=16")
@@ -2145,6 +2150,7 @@ def role_overlays(
         ("storage", "server", "urma", "maxConcurrentTransfers"): case.get("maxConcurrentTransfers", 16),
         ("storage", "server", "urma", "transferTimeout"): case.get("transferTimeout", "30s"),
         ("storage", "server", "urma", "mmapContent"): is_urma_server,
+        ("download", "concurrentPieceCount"): case.get("concurrentPieceCount", 8),
         ("proxy", "server", "port"): ports["proxy"],
         ("health", "server", "port"): ports["health"],
         ("metrics", "server", "port"): ports["metrics"],
