@@ -120,6 +120,13 @@ Dragonfly 调度侧允许 32 个并发 Piece，不宣称 lane 内同时存在 32
 - `urma-piece-cc16-post1-pipe2-tx16`：TX16 可容纳 16 个 required ring；
 - `urma-piece-cc16-post1-pipe2-tx32`：TX32 可容纳 16 个 transfer 的双 ring。
 
+TX pool 对照完成后，使用以下三个 case 区分 native post batching 和第二 pipeline ring 的影响；除 case 名
+指出的轴外，继续保持 `in16`、`maxConcurrentTransfers=16` 和 RX32 MiB：
+
+- `urma-piece-cc8-post8-pipe2-tx16` 对照 CC8/TX16/post1；
+- `urma-piece-cc16-post8-pipe2-tx32` 对照 CC16/TX32/post1；
+- `urma-piece-cc16-post1-pipe1-tx16` 对照 CC16/TX16/pipe2。
+
 ### 并发 batch（B7.1）
 
 case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含

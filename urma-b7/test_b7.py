@@ -93,6 +93,38 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(case["pipelineDepth"], 2)
             self.assertEqual(case["maxConcurrentTransfers"], 16)
 
+    def test_piece_post_list_and_pipeline_cases_change_only_target_axes(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        cc8_post8 = cases["urma-piece-cc8-post8-pipe2-tx16"]
+        cc16_post8 = cases["urma-piece-cc16-post8-pipe2-tx32"]
+        cc16_pipe1 = cases["urma-piece-cc16-post1-pipe1-tx16"]
+        self.assertEqual(
+            (cc8_post8["concurrentPieceCount"], cc8_post8["postListSize"]),
+            (8, 8),
+        )
+        self.assertEqual(
+            (
+                cc16_post8["concurrentPieceCount"],
+                cc16_post8["postListSize"],
+                cc16_post8["pipelineDepth"],
+                cc16_post8["maxRegisteredBytes"],
+                cc16_post8["txRegisteredBytes"],
+            ),
+            (16, 8, 2, "64MiB", "32MiB"),
+        )
+        self.assertEqual(
+            (
+                cc16_pipe1["postListSize"],
+                cc16_pipe1["pipelineDepth"],
+                cc16_pipe1["maxRegisteredBytes"],
+                cc16_pipe1["txRegisteredBytes"],
+            ),
+            (1, 1, "48MiB", "16MiB"),
+        )
+        for case in (cc8_post8, cc16_post8, cc16_pipe1):
+            self.assertEqual(case["maxInflightChunks"], 16)
+            self.assertEqual(case["maxConcurrentTransfers"], 16)
+
     def test_generated_paths_stay_in_scoped_roots(self):
         plan = b7.build_plan(self.inventory, "single", "b7-test", "node2")
         for role in ("parent", "child"):
