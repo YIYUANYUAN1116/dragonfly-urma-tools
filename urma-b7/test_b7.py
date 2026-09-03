@@ -137,6 +137,26 @@ class B7Tests(unittest.TestCase):
             {key: value for key, value in mct32.items() if key not in ignored},
         )
 
+    def test_piece_post_list_sweep_changes_only_post_list_size(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        names = {
+            1: "urma-piece-cc32-post1-pipe1-mct16-tx32",
+            4: "urma-piece-cc32-post4-pipe1-mct16-tx32",
+            8: "urma-piece-cc32-post8-pipe1-mct16-tx32",
+            16: "urma-piece-cc32-post16-pipe1-mct16-tx32",
+        }
+        matrix = {post: cases[name] for post, name in names.items()}
+        ignored = {"name", "postListSize", "category"}
+        baseline = {
+            key: value for key, value in matrix[8].items() if key not in ignored
+        }
+        for post, case in matrix.items():
+            self.assertEqual(case["postListSize"], post)
+            self.assertEqual(
+                {key: value for key, value in case.items() if key not in ignored},
+                baseline,
+            )
+
     def test_generated_paths_stay_in_scoped_roots(self):
         plan = b7.build_plan(self.inventory, "single", "b7-test", "node2")
         for role in ("parent", "child"):

@@ -133,6 +133,14 @@ in16、TX32、RX32，只改变 MCT：
 - `urma-piece-cc32-post8-pipe1-mct16-tx32`；
 - `urma-piece-cc32-post8-pipe1-mct32-tx32`。
 
+MCT16 胜出后，固定 CC32、pipe1、in16、MCT16、TX32、RX32，使用以下矩阵定位 native post-list
+批处理的饱和点：
+
+- `urma-piece-cc32-post1-pipe1-mct16-tx32`；
+- `urma-piece-cc32-post4-pipe1-mct16-tx32`；
+- `urma-piece-cc32-post8-pipe1-mct16-tx32`；
+- `urma-piece-cc32-post16-pipe1-mct16-tx32`。
+
 ### 并发 batch（B7.1）
 
 case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含
