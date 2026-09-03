@@ -130,6 +130,7 @@ class B7Tests(unittest.TestCase):
         names = {
             "4mib": "urma-piece-4mib-cc16-post1-pipe2",
             "16mib": "urma-piece-16mib-cc16-post1-pipe2",
+            "32mib": "urma-piece-32mib-cc16-post1-pipe2",
             "64mib": "urma-piece-64mib-cc16-post1-pipe2",
         }
         matrix = {piece_length: cases[name] for piece_length, name in names.items()}
@@ -147,6 +148,19 @@ class B7Tests(unittest.TestCase):
                 {key: value for key, value in case.items() if key not in ignored},
                 baseline,
             )
+
+    def test_piece_size_64mib_expanded_budget_case(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        case = cases["urma-piece-64mib-cc16-post1-pipe2-tx64-rx64"]
+        self.assertEqual(case["pieceLength"], "64mib")
+        self.assertEqual(case["concurrentPieceCount"], 16)
+        self.assertEqual(case["maxInflightChunks"], 16)
+        self.assertEqual(case["pipelineDepth"], 2)
+        self.assertEqual(case["maxConcurrentTransfers"], 16)
+        self.assertEqual(case["maxRegisteredBytes"], "128MiB")
+        self.assertEqual(case["txRegisteredBytes"], "64MiB")
+        self.assertEqual(case["warmups"], 1)
+        self.assertEqual(case["repetitions"], 3)
 
     def test_piece_transfer_cap_cases_differ_only_in_mct(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")

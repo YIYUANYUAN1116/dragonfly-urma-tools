@@ -146,11 +146,17 @@ MCT16 胜出后，固定 CC32、pipe1、in16、MCT16、TX32、RX32，使用以�
 
 - `urma-piece-4mib-cc16-post1-pipe2`；
 - `urma-piece-16mib-cc16-post1-pipe2`；
+- `urma-piece-32mib-cc16-post1-pipe2`；
 - `urma-piece-64mib-cc16-post1-pipe2`。
 
 该快速 sweep 使用 1 次 warmup 和 3 次 measured task。64 MiB 时 1 GiB 文件恰好包含
 16 个 Piece，仍能实际填满 CC16；若继续测试 128 MiB 以上，必须同时扩大源文件，避免
 Piece 总数不足导致实际并发下降。
+
+若 64 MiB 基线出现较多 optional single-window fallback，使用
+`urma-piece-64mib-cc16-post1-pipe2-tx64-rx64` 复测。它保持 Piece、CC、post-list、
+pipeline 和 inflight 不变，仅将注册内存扩大为 TX64 MiB + RX64 MiB，用于区分 Piece
+大小效应和 registered-window budget 效应。
 
 ### 并发 batch（B7.1）
 
