@@ -47,6 +47,51 @@
     {"name": "fanin-post1-in32-l4-pipe2-rx16", "fileClass": "1g", "topology": "fanin", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "maxRegisteredBytes": "24MiB", "txRegisteredBytes": "8MiB", "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
     {"name": "fanin-post1-in32-l4-pipe2-rx8", "fileClass": "1g", "topology": "fanin", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "maxRegisteredBytes": "16MiB", "txRegisteredBytes": "8MiB", "concurrency": 4, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
     {"name": "fanin-post1-in32-l2-pipe2-rx16", "fileClass": "1g", "topology": "fanin", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "maxRegisteredBytes": "24MiB", "txRegisteredBytes": "8MiB", "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
-    {"name": "fanin-post1-in32-l2-pipe2-rx8", "fileClass": "1g", "topology": "fanin", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "maxRegisteredBytes": "16MiB", "txRegisteredBytes": "8MiB", "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "multi-lane"}
+    {"name": "fanin-post1-in32-l2-pipe2-rx8", "fileClass": "1g", "topology": "fanin", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "maxRegisteredBytes": "16MiB", "txRegisteredBytes": "8MiB", "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
+    {
+        "name": "urma-piece-cc8-tx16",
+        "fileClass": "1g",
+        "topology": "piece-concurrency",
+        "postListSize": 1,
+        "pipelineDepth": 2,
+        "maxInflightChunks": 32,
+        "maxConcurrentTransfers": 8,
+        "concurrency": 1,
+        "txRegisteredBytes": 16777216,
+        "maxRegisteredBytes": 50331648,
+        "repetitions": 3,
+        "warmups": 1,
+        "category": "piece-concurrency-tx-budget"
+    },
+    {
+        "name": "urma-piece-cc16-tx16",
+        "fileClass": "1g",
+        "topology": "piece-concurrency",
+        "postListSize": 1,
+        "pipelineDepth": 2,
+        "maxInflightChunks": 32,
+        "maxConcurrentTransfers": 16,
+        "concurrency": 1,
+        "txRegisteredBytes": 16777216,
+        "maxRegisteredBytes": 50331648,
+        "repetitions": 3,
+        "warmups": 1,
+        "category": "piece-concurrency-tx-budget"
+    },
+    {
+        "name": "urma-piece-cc16-tx32",
+        "fileClass": "1g",
+        "topology": "piece-concurrency",
+        "postListSize": 1,
+        "pipelineDepth": 2,
+        "maxInflightChunks": 32,
+        "maxConcurrentTransfers": 16,
+        "concurrency": 1,
+        "txRegisteredBytes": 33554432,
+        "maxRegisteredBytes": 67108864,
+        "repetitions": 3,
+        "warmups": 1,
+        "category": "piece-concurrency-tx-budget"
+    }
   ]
 }
