@@ -163,6 +163,33 @@ pipeline 和 inflight 不变，仅将注册内存扩大为 TX64 MiB + RX64 MiB�
 application window。该 case 使用 CC4/MCT4、pipeline2，并提供 TX32 MiB + RX32 MiB；
 1 GiB 文件仍有 64 个 Piece，不会因 Piece 总数不足降低实际并发。
 
+### 16 MiB Piece 多 lane fan-out 曲线
+
+旧 `fanout-post*` case 没有显式固定 `concurrentPieceCount`，会继承 Dragonfly 默认 CC8，因此不能单独
+解释 lane 数的贡献。新的第一组 case 固定每个 Child `CC1/MCT1`、16 MiB Piece、post1、pipe2、in16、
+TX16 MiB + RX32 MiB，仅改变 lane/Child 数：
+
+- `fanout-piece16-cc1-post1-in16-l1`；
+- `fanout-piece16-cc1-post1-in16-l2`；
+- `fanout-piece16-cc1-post1-in16-l4`；
+- `fanout-piece16-cc1-post1-in16-l8`。
+
+L1 使用普通 queue topology；L2/L4/L8 使用 fanout topology。TX16 MiB 可以同时容纳 L8 下每 lane
+一个 transfer 的两级 1 MiB window，因此这组用于隔离 lane 扩展，不应出现 TX budget 导致的 ring1
+退化。每个 case 使用 1 次 warmup + 3 次 measured batch。
+
+第二组固定每 lane `CC8/MCT8`、16 MiB Piece、post1、pipe2、in16、TX64 MiB + RX32 MiB，测试多 lane
+加 Piece 并发后的饱和能力：
+
+- `fanout-piece16-cc8-post1-in16-l1-tx64`；
+- `fanout-piece16-cc8-post1-in16-l2-tx64`；
+- `fanout-piece16-cc8-post1-in16-l4-tx64`。
+
+TX64 MiB 正好覆盖 L4 下 `4 lanes x 8 transfers x 2 windows x 1 MiB`，三点保持完全相同的注册预算。
+建议先按 CC1 的 L2、L4、L8 顺序验证纯 lane 曲线，再跑 CC8 的 L1、L2、L4。当前 dual inventory 会
+在 node2 上启动多个隔离 Child daemon，所以结果代表同一物理 Child host 的多 lane/多进程 fan-out，
+不能表述为多节点 fan-out。
+
 ### 并发 batch（B7.1）
 
 case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含

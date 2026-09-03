@@ -177,6 +177,57 @@ class B7Tests(unittest.TestCase):
         self.assertEqual(case["warmups"], 1)
         self.assertEqual(case["repetitions"], 3)
 
+    def test_fanout_piece16_cc1_lane_sweep_changes_only_lane_count(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        names = {
+            1: "fanout-piece16-cc1-post1-in16-l1",
+            2: "fanout-piece16-cc1-post1-in16-l2",
+            4: "fanout-piece16-cc1-post1-in16-l4",
+            8: "fanout-piece16-cc1-post1-in16-l8",
+        }
+        matrix = {lanes: cases[name] for lanes, name in names.items()}
+        ignored = {"name", "topology", "concurrency"}
+        baseline = {
+            key: value for key, value in matrix[1].items() if key not in ignored
+        }
+        for lanes, case in matrix.items():
+            self.assertEqual(case.get("concurrency", 1), lanes)
+            self.assertEqual(case.get("topology", "queue"), "queue" if lanes == 1 else "fanout")
+            self.assertEqual(case["pieceLength"], "16mib")
+            self.assertEqual(case["concurrentPieceCount"], 1)
+            self.assertEqual(case["maxConcurrentTransfers"], 1)
+            self.assertEqual(case["maxRegisteredBytes"], "48MiB")
+            self.assertEqual(case["txRegisteredBytes"], "16MiB")
+            self.assertEqual(
+                {key: value for key, value in case.items() if key not in ignored},
+                baseline,
+            )
+
+    def test_fanout_piece16_cc8_saturation_sweep_changes_only_lane_count(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        names = {
+            1: "fanout-piece16-cc8-post1-in16-l1-tx64",
+            2: "fanout-piece16-cc8-post1-in16-l2-tx64",
+            4: "fanout-piece16-cc8-post1-in16-l4-tx64",
+        }
+        matrix = {lanes: cases[name] for lanes, name in names.items()}
+        ignored = {"name", "topology", "concurrency"}
+        baseline = {
+            key: value for key, value in matrix[1].items() if key not in ignored
+        }
+        for lanes, case in matrix.items():
+            self.assertEqual(case.get("concurrency", 1), lanes)
+            self.assertEqual(case.get("topology", "queue"), "queue" if lanes == 1 else "fanout")
+            self.assertEqual(case["pieceLength"], "16mib")
+            self.assertEqual(case["concurrentPieceCount"], 8)
+            self.assertEqual(case["maxConcurrentTransfers"], 8)
+            self.assertEqual(case["maxRegisteredBytes"], "96MiB")
+            self.assertEqual(case["txRegisteredBytes"], "64MiB")
+            self.assertEqual(
+                {key: value for key, value in case.items() if key not in ignored},
+                baseline,
+            )
+
     def test_piece_transfer_cap_cases_differ_only_in_mct(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
         mct16 = cases["urma-piece-cc32-post8-pipe1-mct16-tx32"]
