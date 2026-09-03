@@ -18,6 +18,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -937,6 +938,39 @@ def collect_remote_log_range(
     if completed.returncode != 0:
         raise B7Error(f"cannot collect task log from {ssh_target(node)}")
     return decode_b64(completed.stdout.strip())
+
+
+def piece_lifecycles_complete(log: str, task_ids: set[str]) -> bool:
+    """Return whether all expected server Piece starts have a matching finish."""
+    evidence = analyze_piece_concurrency(log, task_ids)
+    return (
+        evidence["pieceStarts"] > 0
+        and not evidence["missingTaskIds"]
+        and not evidence["unfinishedTransferIds"]
+    )
+
+
+def collect_complete_piece_log_range(
+    node: dict[str, Any],
+    inventory: dict[str, Any],
+    layout: dict[str, Any],
+    first_line: int,
+    task_ids: set[str],
+    timeout_seconds: float = 2.0,
+) -> tuple[int, str]:
+    """Snapshot a batch after tracing emits its trailing Piece finishes.
+
+    The first boundary remains fixed and polling ends before the next batch starts,
+    so evidence cannot bleed across batches. On timeout the last snapshot is
+    returned and the normal validator reports the incomplete lifecycle.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        last_line = remote_log_line_count(node, inventory, layout)
+        log = collect_remote_log_range(node, inventory, layout, first_line, last_line)
+        if piece_lifecycles_complete(log, task_ids) or time.monotonic() >= deadline:
+            return last_line, log
+        time.sleep(0.02)
 
 
 def parse_log_timestamp_ns(line: str) -> int:
@@ -3497,7 +3531,32 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                     batch_suffix,
                     piece_length,
                 )
-            parent_log_last = remote_log_line_count(parent_node, inventory, parent_layout)
+            expected_task_ids = {
+                transfer.get("expectedTaskId")
+                or standard_task_id(manifest["origin"]["url"], task_tag, piece_length)
+                for (_worker, task_tag, _suffix), transfer in zip(
+                    workers, child_transfers
+                )
+            }
+            if piece_concurrency:
+                parent_log_last, parent_task_log = collect_complete_piece_log_range(
+                    parent_node,
+                    inventory,
+                    parent_layout,
+                    parent_log_first,
+                    expected_task_ids,
+                )
+            else:
+                parent_log_last = remote_log_line_count(
+                    parent_node, inventory, parent_layout
+                )
+                parent_task_log = collect_remote_log_range(
+                    parent_node,
+                    inventory,
+                    parent_layout,
+                    parent_log_first,
+                    parent_log_last,
+                )
             child_first = min(
                 int(transfer["daemonLogFirstLine"]) for transfer in child_transfers
             )
@@ -3510,13 +3569,6 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 child_layout,
                 child_first,
                 child_last,
-            )
-            parent_task_log = collect_remote_log_range(
-                parent_node,
-                inventory,
-                parent_layout,
-                parent_log_first,
-                parent_log_last,
             )
             (evidence_dir / f"child.{batch_suffix}.log").write_text(
                 task_log, encoding="utf-8"

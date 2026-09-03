@@ -1259,6 +1259,24 @@ storage:
         self.assertEqual(evidence["duplicateFinishTransferIds"], [])
         self.assertEqual(evidence["unfinishedTransferIds"], [])
 
+    def test_piece_lifecycles_complete_rejects_trailing_unfinished_transfer(self):
+        task = "task-a"
+        incomplete = "\n".join(
+            (
+                f"task_id={task} lane_id=1 transfer_id=7 "
+                "start upload piece content over urma",
+                f"task_id={task} lane_id=1 transfer_id=8 "
+                "start upload piece content over urma",
+                "role=server lane_id=1 transfer_id=7 "
+                "urma piece finished on peer lane",
+            )
+        )
+        complete = incomplete + "\n" + (
+            "role=server lane_id=1 transfer_id=8 urma piece finished on peer lane"
+        )
+        self.assertFalse(b7.piece_lifecycles_complete(incomplete, {task}))
+        self.assertTrue(b7.piece_lifecycles_complete(complete, {task}))
+
     def test_piece_concurrency_duplicate_identity_includes_lane(self):
         log = "\n".join(
             [
