@@ -141,6 +141,17 @@ MCT16 胜出后，固定 CC32、pipe1、in16、MCT16、TX32、RX32，使用以�
 - `urma-piece-cc32-post8-pipe1-mct16-tx32`；
 - `urma-piece-cc32-post16-pipe1-mct16-tx32`。
 
+定位单任务 Piece 固定生命周期开销时，固定 1 GiB、URMA、CC16、post1、pipe2 和 in16，
+只改变 Piece 大小：
+
+- `urma-piece-4mib-cc16-post1-pipe2`；
+- `urma-piece-16mib-cc16-post1-pipe2`；
+- `urma-piece-64mib-cc16-post1-pipe2`。
+
+该快速 sweep 使用 1 次 warmup 和 3 次 measured task。64 MiB 时 1 GiB 文件恰好包含
+16 个 Piece，仍能实际填满 CC16；若继续测试 128 MiB 以上，必须同时扩大源文件，避免
+Piece 总数不足导致实际并发下降。
+
 ### 并发 batch（B7.1）
 
 case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含

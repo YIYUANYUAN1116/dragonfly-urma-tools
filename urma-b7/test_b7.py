@@ -125,6 +125,29 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(case["maxInflightChunks"], 16)
             self.assertEqual(case["maxConcurrentTransfers"], 16)
 
+    def test_piece_size_cc16_sweep_changes_only_piece_length(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        names = {
+            "4mib": "urma-piece-4mib-cc16-post1-pipe2",
+            "16mib": "urma-piece-16mib-cc16-post1-pipe2",
+            "64mib": "urma-piece-64mib-cc16-post1-pipe2",
+        }
+        matrix = {piece_length: cases[name] for piece_length, name in names.items()}
+        ignored = {"name", "pieceLength"}
+        baseline = {
+            key: value for key, value in matrix["4mib"].items() if key not in ignored
+        }
+        for piece_length, case in matrix.items():
+            self.assertEqual(case["pieceLength"], piece_length)
+            self.assertEqual(case["protocol"], "urma")
+            self.assertEqual(case["concurrentPieceCount"], 16)
+            self.assertEqual(case["warmups"], 1)
+            self.assertEqual(case["repetitions"], 3)
+            self.assertEqual(
+                {key: value for key, value in case.items() if key not in ignored},
+                baseline,
+            )
+
     def test_piece_transfer_cap_cases_differ_only_in_mct(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
         mct16 = cases["urma-piece-cc32-post8-pipe1-mct16-tx32"]
