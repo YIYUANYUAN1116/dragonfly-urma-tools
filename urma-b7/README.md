@@ -127,6 +127,12 @@ TX pool 对照完成后，使用以下三个 case 区分 native post batching �
 - `urma-piece-cc16-post8-pipe2-tx32` 对照 CC16/TX32/post1；
 - `urma-piece-cc16-post1-pipe1-tx16` 对照 CC16/TX16/pipe2。
 
+验证 `maxConcurrentTransfers=16` 是否限制 CC32 时，使用以下严格 A/B；两者固定 CC32、post8、pipe1、
+in16、TX32、RX32，只改变 MCT：
+
+- `urma-piece-cc32-post8-pipe1-mct16-tx32`；
+- `urma-piece-cc32-post8-pipe1-mct32-tx32`。
+
 ### 并发 batch（B7.1）
 
 case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含

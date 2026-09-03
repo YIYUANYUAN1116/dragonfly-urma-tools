@@ -125,6 +125,18 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(case["maxInflightChunks"], 16)
             self.assertEqual(case["maxConcurrentTransfers"], 16)
 
+    def test_piece_transfer_cap_cases_differ_only_in_mct(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        mct16 = cases["urma-piece-cc32-post8-pipe1-mct16-tx32"]
+        mct32 = cases["urma-piece-cc32-post8-pipe1-mct32-tx32"]
+        self.assertEqual(mct16["maxConcurrentTransfers"], 16)
+        self.assertEqual(mct32["maxConcurrentTransfers"], 32)
+        ignored = {"name", "maxConcurrentTransfers"}
+        self.assertEqual(
+            {key: value for key, value in mct16.items() if key not in ignored},
+            {key: value for key, value in mct32.items() if key not in ignored},
+        )
+
     def test_generated_paths_stay_in_scoped_roots(self):
         plan = b7.build_plan(self.inventory, "single", "b7-test", "node2")
         for role in ("parent", "child"):
