@@ -77,6 +77,22 @@ class B7Tests(unittest.TestCase):
         self.assertEqual(pipe2["maxRegisteredBytes"], "48MiB")
         self.assertEqual(pipe2["txRegisteredBytes"], "16MiB")
 
+    def test_piece_tx_budget_cases_preserve_rx_budget_and_other_axes(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        expected = {
+            "urma-piece-cc8-post1-pipe2-tx16": (8, "48MiB", "16MiB"),
+            "urma-piece-cc16-post1-pipe2-tx16": (16, "48MiB", "16MiB"),
+            "urma-piece-cc16-post1-pipe2-tx32": (16, "64MiB", "32MiB"),
+        }
+        for name, (piece_cc, total, tx) in expected.items():
+            case = cases[name]
+            self.assertEqual(case["concurrentPieceCount"], piece_cc)
+            self.assertEqual(case["maxRegisteredBytes"], total)
+            self.assertEqual(case["txRegisteredBytes"], tx)
+            self.assertEqual(case["maxInflightChunks"], 16)
+            self.assertEqual(case["pipelineDepth"], 2)
+            self.assertEqual(case["maxConcurrentTransfers"], 16)
+
     def test_generated_paths_stay_in_scoped_roots(self):
         plan = b7.build_plan(self.inventory, "single", "b7-test", "node2")
         for role in ("parent", "child"):
@@ -1591,30 +1607,35 @@ RX BufferUnavailable
                     b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
                     0,
                 )
-            self.assertEqual(len(tags), 14)
-            self.assertEqual(len(set(tags)), 7)
-            self.assertEqual(tags[:7], tags[7:])
-            self.assertEqual(
-                tags[:7],
-                [
-                    "b7-perf-warmup-001",
-                    "b7-perf-warmup-002",
-                    "b7-perf-sample-001",
-                    "b7-perf-sample-002",
-                    "b7-perf-sample-003",
-                    "b7-perf-sample-004",
-                    "b7-perf-sample-005",
-                ],
-            )
+            warmups = manifest["case"]["warmups"]
+            repetitions = manifest["case"]["repetitions"]
+            expected_tags = [
+                *(f"b7-perf-warmup-{index:03d}" for index in range(1, warmups + 1)),
+                *(
+                    f"b7-perf-sample-{index:03d}"
+                    for index in range(1, repetitions + 1)
+                ),
+            ]
+            task_count = len(expected_tags)
+            self.assertEqual(len(tags), task_count * 2)
+            self.assertEqual(len(set(tags)), task_count)
+            self.assertEqual(tags[:task_count], tags[task_count:])
+            self.assertEqual(tags[:task_count], expected_tags)
             finished = json.loads(manifest_path.read_text(encoding="utf-8"))
             transfer_result = finished["result"]["transfer"]
             self.assertEqual(len(transfer_result["warmups"]), 2)
-            self.assertEqual(len(transfer_result["samples"]), 5)
-            self.assertEqual(transfer_result["summary"]["samples"], 5)
-            self.assertEqual(transfer_result["taskTimingSummary"]["samples"], 5)
+            self.assertEqual(len(transfer_result["samples"]), repetitions)
+            self.assertEqual(transfer_result["summary"]["samples"], repetitions)
+            self.assertEqual(
+                transfer_result["taskTimingSummary"]["samples"], repetitions
+            )
             self.assertIn("taskTiming", transfer_result["warmups"][0]["child"])
             self.assertTrue(
-                (Path(directory) / "evidence" / "child.sample-005.log").is_file()
+                (
+                    Path(directory)
+                    / "evidence"
+                    / f"child.sample-{repetitions:03d}.log"
+                ).is_file()
             )
 
     def test_concurrent_case_runs_measured_batches_and_records_task_ids(self):

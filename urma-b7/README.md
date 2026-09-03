@@ -92,13 +92,13 @@ child 启动前完成全部唯一 task 的 parent preheat，再启动 child 并�
 `output.bin.sample-NNN`。output 与 Dragonfly content storage 位于同一文件系统且每轮目标唯一，使正常
 路径可以 hard link，避免 task cache 命中、目标冲突和跨文件系统的 1 GiB output copy。warmup 结果保存
 但不参与汇总，measured sample 输出单轮耗时/吞吐及 min、median、mean、p95、max、aggregate 吞吐。一次
-2 warmup + 5 repetitions 的 1 GiB case 会在 parent/child 各创建 7 个独立 task，执行前需要为两侧
+2 warmup + 3 repetitions 的 1 GiB case 会在 parent/child 各创建 5 个独立 task，执行前需要为两侧
 隔离 storage 和 run directory 预留足够空间，结束后使用 `cleanup` 回收。
 
 ### 单任务 Piece concurrency TCP/URMA 对照
 
 `tcp-piece-cc{1,2,4,8,16,32}-post1-pipe2` 与
-`urma-piece-cc{1,2,4,8,16,32}-post1-pipe2` 固定一个 `dfget`、1 GiB 文件、2 次 warmup、5 次
+`urma-piece-cc{1,2,4,8,16,32}-post1-pipe2` 固定一个 `dfget`、1 GiB 文件、2 次 warmup、3 次
 measured task，只改变 `download.concurrentPieceCount`。manifest 中的 task `concurrency` 因此始终为 1；
 case 名称里的 `cc` 表示单 task 内的 Piece concurrency，不是并发 `dfget` 数量。
 
@@ -112,6 +112,13 @@ python .\b7.py run --manifest .\results\urma-piece-cc8-001\manifest.json --execu
 该组默认保留 `maxConcurrentTransfers=16`，用于测量当前默认 URMA transport 的端到端曲线；CC32 代表
 Dragonfly 调度侧允许 32 个并发 Piece，不宣称 lane 内同时存在 32 个 native transfer。若默认曲线在 CC16
 附近受 transport cap 限制，应另建只修改 `maxConcurrentTransfers` 的对照 case，不能覆盖本组基线。
+
+定位 TX8 admission/pipeline 边界时使用三个只改变 Piece CC 和 TX pool 的正交 case；三者均保持 RX pool
+为 32 MiB、`post1-pipe2-in16` 和 `maxConcurrentTransfers=16`：
+
+- `urma-piece-cc8-post1-pipe2-tx16`：TX16 可容纳 8 个 transfer 的双 ring；
+- `urma-piece-cc16-post1-pipe2-tx16`：TX16 可容纳 16 个 required ring；
+- `urma-piece-cc16-post1-pipe2-tx32`：TX32 可容纳 16 个 transfer 的双 ring。
 
 ### 并发 batch（B7.1）
 
