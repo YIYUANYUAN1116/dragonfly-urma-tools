@@ -195,7 +195,7 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(case.get("topology", "queue"), "queue" if lanes == 1 else "fanout")
             self.assertEqual(case["pieceLength"], "16mib")
             self.assertEqual(case["concurrentPieceCount"], 1)
-            self.assertEqual(case["maxConcurrentTransfers"], 1)
+            self.assertEqual(case["maxConcurrentTransfers"], 8)
             self.assertEqual(case["maxRegisteredBytes"], "48MiB")
             self.assertEqual(case["txRegisteredBytes"], "16MiB")
             self.assertEqual(
@@ -220,7 +220,7 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(case.get("topology", "queue"), "queue" if lanes == 1 else "fanout")
             self.assertEqual(case["pieceLength"], "16mib")
             self.assertEqual(case["concurrentPieceCount"], 8)
-            self.assertEqual(case["maxConcurrentTransfers"], 8)
+            self.assertEqual(case["maxConcurrentTransfers"], 32)
             self.assertEqual(case["maxRegisteredBytes"], "96MiB")
             self.assertEqual(case["txRegisteredBytes"], "64MiB")
             self.assertEqual(
@@ -1070,6 +1070,13 @@ storage:
                 "finished dragonfly urma piece attempt success=true\n"
                 "urma download failed, fall back to tcp downloader: unavailable\n",
             )
+        with self.assertRaisesRegex(b7.B7Error, "fallback/error"):
+            b7.analyze_evidence(
+                "finished uploading piece content over urma\n",
+                "finished dragonfly urma piece attempt success=true\n"
+                "urma download failed; falling back to tcp downloader "
+                "error=busy urma peer busy (5): urma connection admission is full\n",
+            )
 
     def test_evidence_rejects_unexpected_child_parent(self):
         with self.assertRaisesRegex(b7.B7Error, "unexpected parent"):
@@ -1637,6 +1644,16 @@ storage:
         self.assertEqual(summary["busyOrRejectLines"], 1)
         self.assertEqual(summary["sessionRetirementLines"], 2)
         self.assertEqual(summary["tcpFallbackLines"], 2)
+
+    def test_fanout_transport_health_recognizes_current_busy_fallback_logs(self):
+        parent = "urma connection admission full remote_address=127.0.0.1:1234\n"
+        children = (
+            "urma download failed; falling back to tcp downloader "
+            "error=busy urma peer busy (5): urma connection admission is full\n"
+        )
+        summary = b7.analyze_fanout_transport_health(parent, children)
+        self.assertEqual(summary["busyOrRejectLines"], 2)
+        self.assertEqual(summary["tcpFallbackLines"], 1)
 
     def test_urma_queue_transport_health_includes_child_rx_admission(self):
         parent = """

@@ -166,20 +166,21 @@ application window。该 case 使用 CC4/MCT4、pipeline2，并提供 TX32 MiB +
 ### 16 MiB Piece 多 lane fan-out 曲线
 
 旧 `fanout-post*` case 没有显式固定 `concurrentPieceCount`，会继承 Dragonfly 默认 CC8，因此不能单独
-解释 lane 数的贡献。新的第一组 case 固定每个 Child `CC1/MCT1`、16 MiB Piece、post1、pipe2、in16、
-TX16 MiB + RX32 MiB，仅改变 lane/Child 数：
+解释 lane 数的贡献。新的第一组 case 固定每个 Child CC1，并将进程级 MCT 固定为 8；其他参数为
+16 MiB Piece、post1、pipe2、in16、TX16 MiB + RX32 MiB，仅改变 lane/Child 数：
 
 - `fanout-piece16-cc1-post1-in16-l1`；
 - `fanout-piece16-cc1-post1-in16-l2`；
 - `fanout-piece16-cc1-post1-in16-l4`；
 - `fanout-piece16-cc1-post1-in16-l8`。
 
-L1 使用普通 queue topology；L2/L4/L8 使用 fanout topology。TX16 MiB 可以同时容纳 L8 下每 lane
-一个 transfer 的两级 1 MiB window，因此这组用于隔离 lane 扩展，不应出现 TX budget 导致的 ring1
-退化。每个 case 使用 1 次 warmup + 3 次 measured batch。
+L1 使用普通 queue topology；L2/L4/L8 使用 fanout topology。`maxConcurrentTransfers` 同时限制
+进程级持久连接数和活跃 Piece 数，并非 per-lane 配置，因此必须至少为 8。TX16 MiB 可以同时容纳 L8
+下每 lane 一个 transfer 的两级 1 MiB window，因此这组用于隔离 lane 扩展，不应出现 TX budget 导致的
+ring1 退化。每个 case 使用 1 次 warmup + 3 次 measured batch。
 
-第二组固定每 lane `CC8/MCT8`、16 MiB Piece、post1、pipe2、in16、TX64 MiB + RX32 MiB，测试多 lane
-加 Piece 并发后的饱和能力：
+第二组固定每 lane CC8，并将进程级 MCT 固定为 32；其他参数为 16 MiB Piece、post1、pipe2、in16、
+TX64 MiB + RX32 MiB，测试多 lane 加 Piece 并发后的饱和能力：
 
 - `fanout-piece16-cc8-post1-in16-l1-tx64`；
 - `fanout-piece16-cc8-post1-in16-l2-tx64`；

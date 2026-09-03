@@ -1401,6 +1401,7 @@ def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any
     lower_children = children.lower()
     fallback_patterns = (
         "urma download failed, fall back to tcp downloader",
+        "falling back to tcp downloader",
         "restarting over tcp",
         "recently failed over urma",
         "failed its previous urma transfer",
@@ -1428,7 +1429,17 @@ def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any
             "urma tx second lease unavailable"
         ),
         "busyOrRejectLines": sum(
-            any(pattern in line.lower() for pattern in ("peer rejected", "code=busy", "error_code_busy"))
+            any(
+                pattern in line.lower()
+                for pattern in (
+                    "peer rejected",
+                    "peer busy",
+                    "code=busy",
+                    "error_code_busy",
+                    "connection admission full",
+                    "transfer admission is full",
+                )
+            )
             for line in combined.splitlines()
         ),
         "sessionRetirementLines": sum(
@@ -1528,6 +1539,7 @@ def analyze_fanin_evidence(parent: str, children: dict[str, str]) -> dict[str, A
     """
     fallback_patterns = (
         "urma download failed, fall back to tcp downloader",
+        "falling back to tcp downloader",
         "restarting over tcp",
         "recently failed over urma",
         "failed its previous urma transfer",
@@ -1599,6 +1611,7 @@ def analyze_fanin_transport_health(
     lower_parent = parent.lower()
     fallback_patterns = (
         "urma download failed, fall back to tcp downloader",
+        "falling back to tcp downloader",
         "restarting over tcp",
         "recently failed over urma",
         "failed its previous urma transfer",
@@ -1658,7 +1671,14 @@ def analyze_fanin_transport_health(
         "busyOrRejectLines": sum(
             any(
                 pattern in line.lower()
-                for pattern in ("peer rejected", "code=busy", "error_code_busy")
+                for pattern in (
+                    "peer rejected",
+                    "peer busy",
+                    "code=busy",
+                    "error_code_busy",
+                    "connection admission full",
+                    "transfer admission is full",
+                )
             )
             for line in combined.splitlines()
         ),
@@ -1714,6 +1734,7 @@ def analyze_evidence(
     ]
     fallback_patterns = (
         "urma download failed, fall back to tcp downloader",
+        "falling back to tcp downloader",
         "restarting over tcp",
         "recently failed over urma",
         "failed its previous urma transfer",
