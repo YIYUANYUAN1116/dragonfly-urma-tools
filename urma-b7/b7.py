@@ -45,6 +45,16 @@ SEND_IMM_CHUNK_COUNT_RE = re.compile(r"\bsend_imm_chunk_count=(\d+)")
 REORDERED_CHUNK_COUNT_RE = re.compile(r"\breordered_chunk_count=(\d+)")
 CROSS_TRANSFER_CHUNK_COUNT_RE = re.compile(r"\bcross_transfer_chunk_count=(\d+)")
 PROCESS_ADMISSION_WAIT_NS_RE = re.compile(r"\badmission_wait_ns=(\d+)")
+TX_REQUIRED_ACQUIRE_NS_RE = re.compile(r"\btx_required_acquire_ns=(\d+)")
+TX_REQUIRED_ACQUIRE_ATTEMPTS_RE = re.compile(
+    r"\btx_required_acquire_attempts=(\d+)"
+)
+TX_REQUIRED_POOL_ACQUIRE_NS_RE = re.compile(r"\btx_required_pool_acquire_ns=(\d+)")
+TX_OPTIONAL_ACQUIRE_NS_RE = re.compile(r"\btx_optional_acquire_ns=(\d+)")
+TX_OPTIONAL_ACQUIRE_ATTEMPTS_RE = re.compile(
+    r"\btx_optional_acquire_attempts=(\d+)"
+)
+TX_OPTIONAL_POOL_ACQUIRE_NS_RE = re.compile(r"\btx_optional_pool_acquire_ns=(\d+)")
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
@@ -1427,6 +1437,107 @@ def process_admission_wait_summary(evidence: str) -> dict[str, int | float]:
     }
 
 
+def integer_ns_summary(values: list[int]) -> dict[str, int | float]:
+    if not values:
+        return {
+            "count": 0,
+            "totalNs": 0,
+            "meanNs": 0.0,
+            "medianNs": 0.0,
+            "p95Ns": 0,
+            "p99Ns": 0,
+            "maxNs": 0,
+        }
+    ordered = sorted(values)
+    p95_index = max(0, (len(ordered) * 95 + 99) // 100 - 1)
+    p99_index = max(0, (len(ordered) * 99 + 99) // 100 - 1)
+    return {
+        "count": len(values),
+        "totalNs": sum(values),
+        "meanNs": statistics.fmean(values),
+        "medianNs": statistics.median(values),
+        "p95Ns": ordered[p95_index],
+        "p99Ns": ordered[p99_index],
+        "maxNs": ordered[-1],
+    }
+
+
+def tx_window_acquire_summary(evidence: str) -> dict[str, Any]:
+    piece_lines = [
+        line
+        for line in evidence.splitlines()
+        if "finished uploading piece content over urma" in line
+        and (
+            TX_REQUIRED_ACQUIRE_NS_RE.search(line)
+            or TX_OPTIONAL_ACQUIRE_NS_RE.search(line)
+        )
+    ]
+    required_ns: list[int] = []
+    required_pool_ns: list[int] = []
+    required_non_pool_ns: list[int] = []
+    required_attempts: list[int] = []
+    optional_ns: list[int] = []
+    optional_pool_ns: list[int] = []
+    optional_non_pool_ns: list[int] = []
+    optional_attempts: list[int] = []
+    malformed_piece_lines = 0
+    for line in piece_lines:
+        values = (
+            last_int_match(TX_REQUIRED_ACQUIRE_NS_RE, line),
+            last_int_match(TX_REQUIRED_ACQUIRE_ATTEMPTS_RE, line),
+            last_int_match(TX_REQUIRED_POOL_ACQUIRE_NS_RE, line),
+            last_int_match(TX_OPTIONAL_ACQUIRE_NS_RE, line),
+            last_int_match(TX_OPTIONAL_ACQUIRE_ATTEMPTS_RE, line),
+            last_int_match(TX_OPTIONAL_POOL_ACQUIRE_NS_RE, line),
+        )
+        if any(value is None for value in values):
+            malformed_piece_lines += 1
+            continue
+        (
+            required_duration,
+            required_count,
+            required_pool_duration,
+            optional_duration,
+            optional_count,
+            optional_pool_duration,
+        ) = values
+        required_ns.append(required_duration)
+        required_pool_ns.append(required_pool_duration)
+        required_non_pool_ns.append(
+            max(0, required_duration - required_pool_duration)
+        )
+        required_attempts.append(required_count)
+        optional_attempts.append(optional_count)
+        if optional_count > 0:
+            optional_ns.append(optional_duration)
+            if optional_pool_duration > 0:
+                optional_pool_ns.append(optional_pool_duration)
+                optional_non_pool_ns.append(
+                    max(0, optional_duration - optional_pool_duration)
+                )
+
+    return {
+        "observed": bool(piece_lines),
+        "pieceCount": len(required_ns),
+        "required": {
+            "attempts": sum(required_attempts),
+            "retryCount": sum(max(0, attempts - 1) for attempts in required_attempts),
+            "durationNs": integer_ns_summary(required_ns),
+            "poolDurationNs": integer_ns_summary(required_pool_ns),
+            "nonPoolDurationNs": integer_ns_summary(required_non_pool_ns),
+        },
+        "optional": {
+            "attempts": sum(optional_attempts),
+            "skippedCount": sum(attempts == 0 for attempts in optional_attempts),
+            "durationNs": integer_ns_summary(optional_ns),
+            "successfulPoolSamples": len(optional_pool_ns),
+            "poolDurationNs": integer_ns_summary(optional_pool_ns),
+            "nonPoolDurationNs": integer_ns_summary(optional_non_pool_ns),
+        },
+        "malformedLines": malformed_piece_lines,
+    }
+
+
 def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any]:
     combined = parent + "\n" + children
     lower_parent = parent.lower()
@@ -1460,6 +1571,7 @@ def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any
         "txOptionalSingleRingFallbacks": lower_parent.count(
             "urma tx second lease unavailable"
         ),
+        "txWindowAcquire": tx_window_acquire_summary(parent),
         "processAdmissionWait": process_admission_wait_summary(parent),
         "busyOrRejectLines": sum(
             any(

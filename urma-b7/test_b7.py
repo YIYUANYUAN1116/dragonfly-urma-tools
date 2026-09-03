@@ -1653,6 +1653,8 @@ storage:
         self.assertEqual(summary["busyOrRejectLines"], 1)
         self.assertEqual(summary["sessionRetirementLines"], 2)
         self.assertEqual(summary["tcpFallbackLines"], 2)
+        self.assertFalse(summary["txWindowAcquire"]["observed"])
+        self.assertEqual(summary["txWindowAcquire"]["malformedLines"], 0)
 
     def test_fanout_transport_health_recognizes_current_busy_fallback_logs(self):
         parent = "urma connection admission full remote_address=127.0.0.1:1234\n"
@@ -1688,6 +1690,37 @@ storage:
                 "maxNs": 4000000,
             },
         )
+
+    def test_fanout_transport_health_summarizes_tx_window_acquisition_cost(self):
+        parent = "\n".join(
+            (
+                "tx_required_acquire_attempts=1 tx_required_acquire_ns=100 "
+                "tx_required_pool_acquire_ns=30 tx_optional_acquire_attempts=1 "
+                "tx_optional_acquire_ns=40 tx_optional_pool_acquire_ns=10 "
+                "finished uploading piece content over urma",
+                "tx_required_acquire_attempts=3 tx_required_acquire_ns=300 "
+                "tx_required_pool_acquire_ns=50 tx_optional_acquire_attempts=0 "
+                "tx_optional_acquire_ns=0 tx_optional_pool_acquire_ns=0 "
+                "finished uploading piece content over urma",
+            )
+        )
+
+        summary = b7.analyze_fanout_transport_health(parent, "")["txWindowAcquire"]
+
+        self.assertTrue(summary["observed"])
+        self.assertEqual(summary["pieceCount"], 2)
+        self.assertEqual(summary["required"]["attempts"], 4)
+        self.assertEqual(summary["required"]["retryCount"], 2)
+        self.assertEqual(summary["required"]["durationNs"]["medianNs"], 200)
+        self.assertEqual(summary["required"]["poolDurationNs"]["totalNs"], 80)
+        self.assertEqual(summary["required"]["nonPoolDurationNs"]["totalNs"], 320)
+        self.assertEqual(summary["optional"]["attempts"], 1)
+        self.assertEqual(summary["optional"]["skippedCount"], 1)
+        self.assertEqual(summary["optional"]["durationNs"]["totalNs"], 40)
+        self.assertEqual(summary["optional"]["successfulPoolSamples"], 1)
+        self.assertEqual(summary["optional"]["poolDurationNs"]["totalNs"], 10)
+        self.assertEqual(summary["optional"]["nonPoolDurationNs"]["totalNs"], 30)
+        self.assertEqual(summary["malformedLines"], 0)
 
     def test_urma_queue_transport_health_includes_child_rx_admission(self):
         parent = """
