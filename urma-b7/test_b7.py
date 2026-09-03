@@ -162,6 +162,21 @@ class B7Tests(unittest.TestCase):
         self.assertEqual(case["warmups"], 1)
         self.assertEqual(case["repetitions"], 3)
 
+    def test_piece_window_alignment_case_matches_demo_window(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        case = cases["urma-piece-16mib-cc4-post1-in64-pipe2-tx32-rx32"]
+        self.assertEqual(case["protocol"], "urma")
+        self.assertEqual(case["pieceLength"], "16mib")
+        self.assertEqual(case["concurrentPieceCount"], 4)
+        self.assertEqual(case["maxInflightChunks"], 64)
+        self.assertEqual(case["pipelineDepth"], 2)
+        self.assertEqual(case["postListSize"], 1)
+        self.assertEqual(case["maxConcurrentTransfers"], 4)
+        self.assertEqual(case["maxRegisteredBytes"], "64MiB")
+        self.assertEqual(case["txRegisteredBytes"], "32MiB")
+        self.assertEqual(case["warmups"], 1)
+        self.assertEqual(case["repetitions"], 3)
+
     def test_piece_transfer_cap_cases_differ_only_in_mct(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
         mct16 = cases["urma-piece-cc32-post8-pipe1-mct16-tx32"]

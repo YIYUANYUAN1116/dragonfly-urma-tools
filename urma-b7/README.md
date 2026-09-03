@@ -158,6 +158,11 @@ Piece 总数不足导致实际并发下降。
 pipeline 和 inflight 不变，仅将注册内存扩大为 TX64 MiB + RX64 MiB，用于区分 Piece
 大小效应和 registered-window budget 效应。
 
+确认 16 MiB 为 Piece 大小甜点后，使用
+`urma-piece-16mib-cc4-post1-in64-pipe2-tx32-rx32` 对齐 demo 的 64 chunk（4 MiB）
+application window。该 case 使用 CC4/MCT4、pipeline2，并提供 TX32 MiB + RX32 MiB；
+1 GiB 文件仍有 64 个 Piece，不会因 Piece 总数不足降低实际并发。
+
 ### 并发 batch（B7.1）
 
 case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含
