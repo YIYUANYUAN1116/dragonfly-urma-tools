@@ -205,24 +205,33 @@ class B7Tests(unittest.TestCase):
 
     def test_fanout_piece16_cc8_saturation_sweep_changes_only_lane_count(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
-        names = {
-            1: "fanout-piece16-cc8-post1-in16-l1-tx64",
-            2: "fanout-piece16-cc8-post1-in16-l2-tx64",
-            4: "fanout-piece16-cc8-post1-in16-l4-tx64",
+        expected = {
+            1: ("fanout-piece16-cc8-post1-in16-l1-tx64", 32, "96MiB", "64MiB"),
+            2: ("fanout-piece16-cc8-post1-in16-l2-tx64", 32, "96MiB", "64MiB"),
+            4: ("fanout-piece16-cc8-post1-in16-l4-tx64", 40, "96MiB", "64MiB"),
+            8: ("fanout-piece16-cc8-post1-in16-l8-tx128", 80, "160MiB", "128MiB"),
         }
-        matrix = {lanes: cases[name] for lanes, name in names.items()}
-        ignored = {"name", "topology", "concurrency"}
+        matrix = {lanes: cases[values[0]] for lanes, values in expected.items()}
+        ignored = {
+            "name",
+            "topology",
+            "concurrency",
+            "maxConcurrentTransfers",
+            "maxRegisteredBytes",
+            "txRegisteredBytes",
+        }
         baseline = {
             key: value for key, value in matrix[1].items() if key not in ignored
         }
         for lanes, case in matrix.items():
+            _, max_transfers, registered, tx_registered = expected[lanes]
             self.assertEqual(case.get("concurrency", 1), lanes)
             self.assertEqual(case.get("topology", "queue"), "queue" if lanes == 1 else "fanout")
             self.assertEqual(case["pieceLength"], "16mib")
             self.assertEqual(case["concurrentPieceCount"], 8)
-            self.assertEqual(case["maxConcurrentTransfers"], 32)
-            self.assertEqual(case["maxRegisteredBytes"], "96MiB")
-            self.assertEqual(case["txRegisteredBytes"], "64MiB")
+            self.assertEqual(case["maxConcurrentTransfers"], max_transfers)
+            self.assertEqual(case["maxRegisteredBytes"], registered)
+            self.assertEqual(case["txRegisteredBytes"], tx_registered)
             self.assertEqual(
                 {key: value for key, value in case.items() if key not in ignored},
                 baseline,
@@ -1654,6 +1663,31 @@ storage:
         summary = b7.analyze_fanout_transport_health(parent, children)
         self.assertEqual(summary["busyOrRejectLines"], 2)
         self.assertEqual(summary["tcpFallbackLines"], 1)
+
+    def test_fanout_transport_health_summarizes_successful_process_admission_waits(self):
+        parent = "\n".join(
+            (
+                "admission_wait_ns=4000000 URMA process transfer admitted after bounded wait",
+                "admission_wait_ns=1000000 URMA process transfer admitted after bounded wait",
+                "admission_wait_ns=2000000 URMA process transfer admitted after bounded wait",
+                "admission_wait_ns=10000000 URMA process transfer admission is full after bounded wait",
+            )
+        )
+
+        summary = b7.analyze_fanout_transport_health(parent, "")
+
+        self.assertEqual(
+            summary["processAdmissionWait"],
+            {
+                "count": 3,
+                "totalNs": 7000000,
+                "meanNs": 7000000 / 3,
+                "medianNs": 2000000,
+                "p95Ns": 4000000,
+                "p99Ns": 4000000,
+                "maxNs": 4000000,
+            },
+        )
 
     def test_urma_queue_transport_health_includes_child_rx_admission(self):
         parent = """

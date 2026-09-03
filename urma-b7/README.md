@@ -179,15 +179,19 @@ L1 使用普通 queue topology；L2/L4/L8 使用 fanout topology。`maxConcurren
 下每 lane 一个 transfer 的两级 1 MiB window，因此这组用于隔离 lane 扩展，不应出现 TX budget 导致的
 ring1 退化。每个 case 使用 1 次 warmup + 3 次 measured batch。
 
-第二组固定每 lane CC8，并将进程级 MCT 固定为 32；其他参数为 16 MiB Piece、post1、pipe2、in16、
-TX64 MiB + RX32 MiB，测试多 lane 加 Piece 并发后的饱和能力：
+第二组固定每 lane CC8，使用 16 MiB Piece、post1、pipe2、in16，测试多 lane 加 Piece 并发后的
+系统饱和能力：
 
 - `fanout-piece16-cc8-post1-in16-l1-tx64`；
 - `fanout-piece16-cc8-post1-in16-l2-tx64`；
-- `fanout-piece16-cc8-post1-in16-l4-tx64`。
+- `fanout-piece16-cc8-post1-in16-l4-tx64`；
+- `fanout-piece16-cc8-post1-in16-l8-tx128`。
 
-TX64 MiB 正好覆盖 L4 下 `4 lanes x 8 transfers x 2 windows x 1 MiB`，三点保持完全相同的注册预算。
-建议先按 CC1 的 L2、L4、L8 顺序验证纯 lane 曲线，再跑 CC8 的 L1、L2、L4。当前 dual inventory 会
+L1/L2 使用 MCT32，L4 使用 MCT40，以容纳 32 个 steady transfers 和 persistent-lane Piece 完成时的
+短暂 process-admission 交接；三点均使用 TX64 MiB + RX32 MiB。L8 将 steady transfers 扩至 64，
+使用 MCT80、TX128 MiB + RX32 MiB。L8 因此是按 lane 数同步扩展 transport/resource ceiling 的饱和点，
+不是只改变 lane 的严格单变量实验。建议先按 CC1 的 L2、L4、L8 顺序验证纯 lane 曲线，再跑 CC8 的
+L1、L2、L4、L8。当前 dual inventory 会
 在 node2 上启动多个隔离 Child daemon，所以结果代表同一物理 Child host 的多 lane/多进程 fan-out，
 不能表述为多节点 fan-out。
 

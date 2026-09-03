@@ -44,6 +44,7 @@ RECEIVE_WINDOW_COUNT_RE = re.compile(r"\breceive_window_count=(\d+)")
 SEND_IMM_CHUNK_COUNT_RE = re.compile(r"\bsend_imm_chunk_count=(\d+)")
 REORDERED_CHUNK_COUNT_RE = re.compile(r"\breordered_chunk_count=(\d+)")
 CROSS_TRANSFER_CHUNK_COUNT_RE = re.compile(r"\bcross_transfer_chunk_count=(\d+)")
+PROCESS_ADMISSION_WAIT_NS_RE = re.compile(r"\badmission_wait_ns=(\d+)")
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
@@ -1395,6 +1396,37 @@ def prometheus_counter_value(
     return total
 
 
+def process_admission_wait_summary(evidence: str) -> dict[str, int | float]:
+    values = [
+        value
+        for line in evidence.splitlines()
+        if "URMA process transfer admitted after bounded wait" in line
+        if (value := last_int_match(PROCESS_ADMISSION_WAIT_NS_RE, line)) is not None
+    ]
+    if not values:
+        return {
+            "count": 0,
+            "totalNs": 0,
+            "meanNs": 0.0,
+            "medianNs": 0.0,
+            "p95Ns": 0,
+            "p99Ns": 0,
+            "maxNs": 0,
+        }
+    ordered = sorted(values)
+    p95_index = max(0, (len(ordered) * 95 + 99) // 100 - 1)
+    p99_index = max(0, (len(ordered) * 99 + 99) // 100 - 1)
+    return {
+        "count": len(values),
+        "totalNs": sum(values),
+        "meanNs": statistics.fmean(values),
+        "medianNs": statistics.median(values),
+        "p95Ns": ordered[p95_index],
+        "p99Ns": ordered[p99_index],
+        "maxNs": ordered[-1],
+    }
+
+
 def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any]:
     combined = parent + "\n" + children
     lower_parent = parent.lower()
@@ -1428,6 +1460,7 @@ def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any
         "txOptionalSingleRingFallbacks": lower_parent.count(
             "urma tx second lease unavailable"
         ),
+        "processAdmissionWait": process_admission_wait_summary(parent),
         "busyOrRejectLines": sum(
             any(
                 pattern in line.lower()
