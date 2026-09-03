@@ -95,6 +95,24 @@ child 启动前完成全部唯一 task 的 parent preheat，再启动 child 并�
 2 warmup + 5 repetitions 的 1 GiB case 会在 parent/child 各创建 7 个独立 task，执行前需要为两侧
 隔离 storage 和 run directory 预留足够空间，结束后使用 `cleanup` 回收。
 
+### 单任务 Piece concurrency TCP/URMA 对照
+
+`tcp-piece-cc{1,2,4,8,16,32}-post1-pipe2` 与
+`urma-piece-cc{1,2,4,8,16,32}-post1-pipe2` 固定一个 `dfget`、1 GiB 文件、2 次 warmup、5 次
+measured task，只改变 `download.concurrentPieceCount`。manifest 中的 task `concurrency` 因此始终为 1；
+case 名称里的 `cc` 表示单 task 内的 Piece concurrency，不是并发 `dfget` 数量。
+
+URMA 对照示例：
+
+```powershell
+python .\b7.py prepare --mode dual --run-id urma-piece-cc8-001 --case urma-piece-cc8-post1-pipe2 --execute
+python .\b7.py run --manifest .\results\urma-piece-cc8-001\manifest.json --execute
+```
+
+该组默认保留 `maxConcurrentTransfers=16`，用于测量当前默认 URMA transport 的端到端曲线；CC32 代表
+Dragonfly 调度侧允许 32 个并发 Piece，不宣称 lane 内同时存在 32 个 native transfer。若默认曲线在 CC16
+附近受 transport cap 限制，应另建只修改 `maxConcurrentTransfers` 的对照 case，不能覆盖本组基线。
+
 ### 并发 batch（B7.1）
 
 case 可增加 `concurrency: 2..16`。此时 `warmups` 和 `repetitions` 表示 batch 数，每个 batch 包含

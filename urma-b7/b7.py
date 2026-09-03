@@ -1418,6 +1418,46 @@ def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any
     }
 
 
+def analyze_urma_queue_transport_health(parent: str, child: str) -> dict[str, Any]:
+    """TX/RX admission and fallback diagnostics for parent-to-child URMA."""
+    return {
+        **analyze_fanout_transport_health(parent, child),
+        "rxBudgetPressure": {
+            "required": prometheus_counter_value(
+                child,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="rx"', 'stage="required"'),
+            ),
+            "optional": prometheus_counter_value(
+                child,
+                "dragonfly_client_urma_budget_pressure_total",
+                ('direction="rx"', 'stage="optional"'),
+            ),
+        },
+        "requiredRxWaitCount": prometheus_counter_value(
+            child,
+            "dragonfly_client_urma_required_admission_wait_total",
+            ('direction="rx"',),
+        ),
+        "requiredRxWaitNs": prometheus_counter_value(
+            child,
+            "dragonfly_client_urma_required_admission_wait_nanoseconds_total",
+            ('direction="rx"',),
+        ),
+        "rxBufferUnavailableLines": sum(
+            (
+                "bufferunavailable" in line.lower()
+                or "buffer unavailable" in line.lower()
+            )
+            and "rx" in line.lower()
+            for line in child.splitlines()
+        ),
+        "rxOptionalSingleWindowFallbacks": child.lower().count(
+            "urma rx second window unavailable"
+        ),
+    }
+
+
 def analyze_fanin_child_lanes(child_log: str, task_id: str) -> dict[str, Any]:
     """Per-child server lane evidence for one fanin batch task.
 
@@ -3628,46 +3668,12 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 raise
             result["evidenceError"] = str(evidence_error)
             piece_concurrency_failures.append(str(evidence_error))
-        if piece_concurrency:
-            transport = analyze_fanout_transport_health(
+        if protocol == "urma":
+            result["urmaDiagnostics"] = analyze_urma_queue_transport_health(
                 evidence_by_role["parent"], evidence_by_role["child"]
             )
-            result["pieceConcurrencyDiagnostics"] = {
-                **transport,
-                "rxBudgetPressure": {
-                    "required": prometheus_counter_value(
-                        evidence_by_role["child"],
-                        "dragonfly_client_urma_budget_pressure_total",
-                        ('direction="rx"', 'stage="required"'),
-                    ),
-                    "optional": prometheus_counter_value(
-                        evidence_by_role["child"],
-                        "dragonfly_client_urma_budget_pressure_total",
-                        ('direction="rx"', 'stage="optional"'),
-                    ),
-                },
-                "requiredRxWaitCount": prometheus_counter_value(
-                    evidence_by_role["child"],
-                    "dragonfly_client_urma_required_admission_wait_total",
-                    ('direction="rx"',),
-                ),
-                "requiredRxWaitNs": prometheus_counter_value(
-                    evidence_by_role["child"],
-                    "dragonfly_client_urma_required_admission_wait_nanoseconds_total",
-                    ('direction="rx"',),
-                ),
-                "rxBufferUnavailableLines": sum(
-                    (
-                        "bufferunavailable" in line.lower()
-                        or "buffer unavailable" in line.lower()
-                    )
-                    and "rx" in line.lower()
-                    for line in evidence_by_role["child"].splitlines()
-                ),
-                "rxOptionalSingleWindowFallbacks": evidence_by_role[
-                    "child"
-                ].lower().count("urma rx second window unavailable"),
-            }
+        if piece_concurrency:
+            result["pieceConcurrencyDiagnostics"] = result["urmaDiagnostics"]
             result["pieceConcurrencyValidation"] = {
                 "passed": not piece_concurrency_failures,
                 "failures": piece_concurrency_failures,

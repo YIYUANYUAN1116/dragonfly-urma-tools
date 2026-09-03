@@ -1437,6 +1437,29 @@ storage:
         self.assertEqual(summary["sessionRetirementLines"], 2)
         self.assertEqual(summary["tcpFallbackLines"], 2)
 
+    def test_urma_queue_transport_health_includes_child_rx_admission(self):
+        parent = """
+dragonfly_client_urma_budget_pressure_total{direction="tx",stage="required"} 2
+dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 3
+URMA TX second lease unavailable; falling back to single ring
+"""
+        child = """
+dragonfly_client_urma_budget_pressure_total{direction="rx",stage="required"} 5
+dragonfly_client_urma_budget_pressure_total{direction="rx",stage="optional"} 7
+dragonfly_client_urma_required_admission_wait_total{direction="rx"} 11
+dragonfly_client_urma_required_admission_wait_nanoseconds_total{direction="rx"} 1234
+URMA RX second window unavailable; continuing with one-window pipeline
+RX BufferUnavailable
+"""
+        summary = b7.analyze_urma_queue_transport_health(parent, child)
+        self.assertEqual(summary["txBudgetPressure"], {"required": 2.0, "optional": 3.0})
+        self.assertEqual(summary["txOptionalSingleRingFallbacks"], 1)
+        self.assertEqual(summary["rxBudgetPressure"], {"required": 5.0, "optional": 7.0})
+        self.assertEqual(summary["requiredRxWaitCount"], 11.0)
+        self.assertEqual(summary["requiredRxWaitNs"], 1234.0)
+        self.assertEqual(summary["rxBufferUnavailableLines"], 1)
+        self.assertEqual(summary["rxOptionalSingleWindowFallbacks"], 1)
+
     def test_task_timing_summary_uses_only_supplied_measured_samples(self):
         samples = [
             {
