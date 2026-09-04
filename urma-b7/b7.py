@@ -58,6 +58,7 @@ TX_OPTIONAL_POOL_ACQUIRE_NS_RE = re.compile(r"\btx_optional_pool_acquire_ns=(\d+
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
+    PurePosixPath("/dev/shm/dragonfly-b7"),
     PurePosixPath("/var/www/dragonfly"),
 )
 
@@ -316,6 +317,7 @@ def prepare_remote_role(
         json.dumps({"schemaVersion": 1, "runId": run_id, "role": role}).encode("utf-8")
     ).decode("ascii")
     ports = " ".join(str(port) for port in layout["ports"].values())
+    require_tmpfs = layout.get("storageClass") == "tmpfs"
     script = f"""set -eu
 run_dir={shlex.quote(layout['runDir'])}
 run_parent={shlex.quote(str(PurePosixPath(layout['runDir']).parent))}
@@ -360,6 +362,10 @@ printf '%s' {shlex.quote(marker)} | base64 -d > "$staging/.b7-owner.json"
 mv -T "$staging" "$run_dir"
 trap - EXIT
 mkdir -p "$storage" "$cache"
+if {"true" if require_tmpfs else "false"} && [ "$(stat -f -c %T \"$storage\")" != tmpfs ]; then
+  echo "storage path is not tmpfs: $storage" >&2
+  exit 23
+fi
 printf '%s' {shlex.quote(payload)} | base64 -d > "$config"
 sha256sum "$config" | awk '{{print $1}}'
 """
@@ -433,6 +439,14 @@ def start_remote_role(
     run_id: str,
 ) -> dict[str, Any]:
     binary = str(PurePosixPath(node["repo"]) / inventory["dragonfly"]["binaryRelativePaths"]["dfdaemon"])
+    performance_profile = layout.get("urmaPerformanceProfile")
+    if performance_profile not in (None, "transport-only"):
+        raise B7Error(f"unsupported URMA performance profile {performance_profile!r}")
+    profile_export = (
+        "unset DF_URMA_PERFORMANCE_PROFILE"
+        if performance_profile is None
+        else f"export DF_URMA_PERFORMANCE_PROFILE={shlex.quote(performance_profile)}"
+    )
     script = f"""set -eu
 {assert_owned_script(layout, run_id, role)}
 binary={shlex.quote(binary)}
@@ -472,6 +486,7 @@ trap cleanup_failed_start EXIT
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY='*' no_proxy='*'
 export LD_LIBRARY_PATH={shlex.quote(inventory['urma']['libDir'])}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
+{profile_export}
 nohup "$binary" --config "$config" --log-level debug --console >"$log" 2>&1 </dev/null &
 pid=$!
 printf '%s\\n' "$pid" > "$pidfile"
@@ -2223,8 +2238,12 @@ def cleanup_remote_role(
 ) -> None:
     expected_run = f"/tmp/dragonfly-urma-b7/{run_id}/{role}"
     expected_staging = expected_run + ".b7-preparing"
-    expected_storage = f"/var/lib/dragonfly-b7/{run_id}/{role}"
-    if layout["runDir"] != expected_run or layout["storage"] != expected_storage:
+    allowed_storage = {
+        f"/var/lib/dragonfly-b7/{run_id}/{role}",
+        f"/dev/shm/dragonfly-b7/{run_id}/{role}",
+    }
+    expected_storage = layout["storage"]
+    if layout["runDir"] != expected_run or expected_storage not in allowed_storage:
         raise B7Error(f"cleanup layout mismatch for {role}")
     safe_remote_path(PurePosixPath(layout["config"]))
     script = f"""set -eu
@@ -2371,10 +2390,21 @@ def safe_remote_path(path: PurePosixPath) -> str:
     return str(path)
 
 
-def role_paths(inventory: dict[str, Any], run_id: str, role: str) -> dict[str, str]:
+def role_paths(
+    inventory: dict[str, Any],
+    run_id: str,
+    role: str,
+    storage_class: str = "filesystem",
+) -> dict[str, str]:
     single = inventory["singleHost"]
     run_root = PurePosixPath(single["runRoot"]) / run_id
-    storage_root = PurePosixPath(single["storageRoot"]) / run_id / role
+    if storage_class == "filesystem":
+        storage_base = PurePosixPath(single["storageRoot"])
+    elif storage_class == "tmpfs":
+        storage_base = PurePosixPath("/dev/shm/dragonfly-b7")
+    else:
+        raise B7Error(f"unsupported storage class {storage_class!r}")
+    storage_root = storage_base / run_id / role
     return {
         "runDir": safe_remote_path(run_root / role),
         "config": safe_remote_path(run_root / f"{role}.yaml"),
@@ -2388,6 +2418,7 @@ def role_paths(inventory: dict[str, Any], run_id: str, role: str) -> dict[str, s
         "output": safe_remote_path(storage_root / "output.bin"),
         "transferLog": safe_remote_path(run_root / role / "dfget.log"),
         "storage": safe_remote_path(storage_root),
+        "storageClass": storage_class,
     }
 
 
@@ -2455,6 +2486,25 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
             raise B7Error(
                 f"case {case['name']} protocol tcp only supports queue topology"
             )
+        storage_class = case.get("storageClass", "filesystem")
+        if storage_class not in ("filesystem", "tmpfs"):
+            raise B7Error(
+                f"case {case['name']} has unsupported storageClass {storage_class!r}"
+            )
+        performance_profile = case.get("urmaPerformanceProfile")
+        if performance_profile not in (None, "transport-only"):
+            raise B7Error(
+                f"case {case['name']} has unsupported URMA performance profile "
+                f"{performance_profile!r}"
+            )
+        if performance_profile is not None and protocol != "urma":
+            raise B7Error(
+                f"case {case['name']} performance profile requires protocol urma"
+            )
+        if performance_profile is not None and topology != "fanout":
+            raise B7Error(
+                f"case {case['name']} performance profile requires fanout topology"
+            )
         piece_length = case.get("pieceLength")
         if piece_length is not None:
             if (
@@ -2467,6 +2517,24 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 )
         result[case["name"]] = case
     return result
+
+
+def validate_transfer_identity(
+    case: dict[str, Any],
+    origin_sha256: str,
+    producer: dict[str, Any],
+    consumer: dict[str, Any],
+    context: str,
+) -> None:
+    """Validate all bytes normally, but only transport lifecycle in the test profile."""
+    transport_only = case.get("urmaPerformanceProfile") == "transport-only"
+    hashes = {origin_sha256, producer["sha256"]}
+    if not transport_only:
+        hashes.add(consumer["sha256"])
+    lengths = {producer["bytes"], consumer["bytes"]}
+    if len(hashes) != 1 or len(lengths) != 1:
+        mode = "transport lifecycle" if transport_only else "content integrity"
+        raise B7Error(f"{context} {mode} check failed")
 
 
 PIECE_LENGTH_RE = re.compile(r"^(\d+)(mib|gib)$", re.IGNORECASE)
@@ -2491,6 +2559,8 @@ def generated_layout(
     run_id: str,
     host: str | None,
     child_count: int = 1,
+    storage_class: str = "filesystem",
+    urma_performance_profile: str | None = None,
 ) -> tuple[str, str, dict[str, dict[str, Any]]]:
     if not 1 <= child_count <= 16:
         raise B7Error("child count must be in 1..=16")
@@ -2502,9 +2572,10 @@ def generated_layout(
             raise B7Error(f"unknown single-host node {parent_node}")
     generated: dict[str, dict[str, Any]] = {
         "parent": {
-            **role_paths(inventory, run_id, "parent"),
+            **role_paths(inventory, run_id, "parent", storage_class),
             "node": parent_node,
             "ports": inventory["singleHost"]["parentPorts"],
+            "urmaPerformanceProfile": urma_performance_profile,
         },
     }
     base_ports = inventory["singleHost"]["childPorts"]
@@ -2515,9 +2586,10 @@ def generated_layout(
         if any(port > 65535 for port in ports.values()):
             raise B7Error(f"generated port exceeds 65535 for {role}")
         generated[role] = {
-            **role_paths(inventory, run_id, role),
+            **role_paths(inventory, run_id, role, storage_class),
             "node": child_node,
             "ports": ports,
+            "urmaPerformanceProfile": urma_performance_profile,
         }
     return parent_node, child_node, generated
 
@@ -2695,7 +2767,13 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     topology = case.get("topology", "queue")
     child_count = case.get("concurrency", 1) if topology in ("fanout", "fanin") else 1
     parent_node, child_node, generated = generated_layout(
-        inventory, args.mode, args.run_id, args.host, child_count
+        inventory,
+        args.mode,
+        args.run_id,
+        args.host,
+        child_count,
+        case.get("storageClass", "filesystem"),
+        case.get("urmaPerformanceProfile"),
     )
     origin = origin_artifact(inventory, args.run_id, case.get("fileClass", "1g"))
     output = args.output or TOOL_DIR / "results" / args.run_id / "manifest.json"
@@ -2849,6 +2927,11 @@ def command_run_fanout(
         "transfer": {
             "topology": "fanout",
             "concurrency": concurrency,
+            "integrityMode": (
+                "transport-lifecycle-only"
+                if case.get("urmaPerformanceProfile") == "transport-only"
+                else "sha256"
+            ),
             "warmups": [],
             "samples": [],
             "batches": {"warmups": [], "samples": []},
@@ -2956,16 +3039,32 @@ def command_run_fanout(
                         f"{batch_suffix}/{role}: {timing_error}"
                     )
                 parent_transfer = parent_transfers[task_tag]
-                hashes = {
-                    manifest["remote"]["origin"]["sha256"],
-                    parent_transfer["sha256"],
-                    child_transfer["sha256"],
-                }
-                lengths = {parent_transfer["bytes"], child_transfer["bytes"]}
-                if len(hashes) != 1 or len(lengths) != 1:
-                    raise B7Error(
-                        f"origin/parent/{role} identity check failed for {task_tag}"
+                if case.get("urmaPerformanceProfile") == "transport-only":
+                    completed_pieces = task_log.count(
+                        "finished URMA transport-only validation Piece"
                     )
+                    piece_bytes = parse_piece_length_bytes(piece_length or "")
+                    if piece_bytes is None:
+                        raise B7Error(
+                            "transport-only profile requires an explicit valid pieceLength"
+                        )
+                    expected_pieces = (
+                        int(parent_transfer["bytes"]) + piece_bytes - 1
+                    ) // piece_bytes
+                    child_transfer["transportOnlyCompletedPieces"] = completed_pieces
+                    child_transfer["transportOnlyExpectedPieces"] = expected_pieces
+                    if completed_pieces != expected_pieces:
+                        fanout_validation_failures.append(
+                            f"{batch_suffix}/{role}: transport-only profile completion "
+                            f"count {completed_pieces} != {expected_pieces}"
+                        )
+                validate_transfer_identity(
+                    case,
+                    manifest["remote"]["origin"]["sha256"],
+                    parent_transfer,
+                    child_transfer,
+                    f"origin/parent/{role} identity for {task_tag}",
+                )
                 child_transfer["throughputMiBps"] = (
                     child_transfer["bytes"]
                     * 1_000_000_000
@@ -3338,16 +3437,13 @@ def command_run_fanin(
                     fanin_validation_failures.append(
                         f"{batch_suffix}/{role}: {timing_error}"
                     )
-                hashes = {
+                validate_transfer_identity(
+                    case,
                     manifest["remote"]["origin"]["sha256"],
-                    server["sha256"],
-                    client["sha256"],
-                }
-                lengths = {server["bytes"], client["bytes"]}
-                if len(hashes) != 1 or len(lengths) != 1:
-                    raise B7Error(
-                        f"origin/server/{role} identity check failed for {task_tag}"
-                    )
+                    server,
+                    client,
+                    f"origin/server/{role} identity for {task_tag}",
+                )
                 client["throughputMiBps"] = (
                     client["bytes"]
                     * 1_000_000_000
@@ -3754,16 +3850,13 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 child_transfer["taskTiming"] = analyze_task_timing(
                     child_transfer, task_log, expected_task_id, protocol
                 )
-                hashes = {
+                validate_transfer_identity(
+                    case,
                     manifest["remote"]["origin"]["sha256"],
-                    parent_transfer["sha256"],
-                    child_transfer["sha256"],
-                }
-                lengths = {parent_transfer["bytes"], child_transfer["bytes"]}
-                if len(hashes) != 1 or len(lengths) != 1:
-                    raise B7Error(
-                        f"origin/parent/child identity check failed for {task_tag}"
-                    )
+                    parent_transfer,
+                    child_transfer,
+                    f"origin/parent/child identity for {task_tag}",
+                )
                 child_transfer["throughputMiBps"] = (
                     child_transfer["bytes"]
                     * 1_000_000_000

@@ -67,6 +67,54 @@ class B7Tests(unittest.TestCase):
         self.assertEqual(generated["child-001"]["node"], "node2")
         self.assertIn("/child-004/", generated["child-004"]["socket"])
 
+    def test_tmpfs_profile_layout_and_layer_cases(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        transport = cases[
+            "fanout-piece16-cc8-post1-in16-l8-tx128-transport-only-tmpfs"
+        ]
+        storage = cases[
+            "fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs"
+        ]
+        ignored = {"name", "category", "urmaPerformanceProfile"}
+        self.assertEqual(
+            {key: value for key, value in transport.items() if key not in ignored},
+            {key: value for key, value in storage.items() if key not in ignored},
+        )
+        self.assertEqual(transport["urmaPerformanceProfile"], "transport-only")
+        self.assertEqual(transport["warmups"], 0)
+        self.assertEqual(transport["repetitions"] * transport["concurrency"], 24)
+        _, _, generated = b7.generated_layout(
+            self.inventory,
+            "dual",
+            "b7-tmpfs",
+            None,
+            child_count=8,
+            storage_class="tmpfs",
+            urma_performance_profile="transport-only",
+        )
+        for layout in generated.values():
+            self.assertTrue(layout["storage"].startswith("/dev/shm/dragonfly-b7/"))
+            self.assertEqual(layout["storageClass"], "tmpfs")
+            self.assertEqual(layout["urmaPerformanceProfile"], "transport-only")
+
+    def test_transport_only_identity_skips_only_consumer_hash(self):
+        profile = {"urmaPerformanceProfile": "transport-only"}
+        b7.validate_transfer_identity(
+            profile,
+            "origin",
+            {"sha256": "origin", "bytes": 1024},
+            {"sha256": "intentionally-not-content", "bytes": 1024},
+            "test",
+        )
+        with self.assertRaises(b7.B7Error):
+            b7.validate_transfer_identity(
+                {},
+                "origin",
+                {"sha256": "origin", "bytes": 1024},
+                {"sha256": "intentionally-not-content", "bytes": 1024},
+                "test",
+            )
+
     def test_fanout_budget_comparison_cases_preserve_rx_budget(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
         pipe1 = cases["fanout-post1-in32-l4-pipe1-tx8"]

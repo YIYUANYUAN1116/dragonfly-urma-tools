@@ -70,7 +70,8 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 - start/stop 只接受 `.b7-owner.json` 与 manifest 一致的目录；stop 还会校验 `/proc/<pid>/cmdline`
   中的精确 dfdaemon binary/config，超时只报告错误，不自动 SIGKILL；
 - 后续 cleanup 只能处理 `/tmp/dragonfly-urma-b7/<run-id>`、
-  `/var/lib/dragonfly-b7/<run-id>` 和 `/var/www/dragonfly/b7-<run-id>-*`；
+  `/var/lib/dragonfly-b7/<run-id>`、`/dev/shm/dragonfly-b7/<run-id>` 和
+  `/var/www/dragonfly/b7-<run-id>-*`；
 - 显式 `cleanup` 同样逐资源持久化结果；一个资源清理失败时仍会继续尝试其他已记录资源；
 - 对旧版工具留下且 manifest resource record 已丢失的 partial prepare，显式 `cleanup --execute` 会尝试
   安全恢复：role 必须带匹配当前 run 的 owner marker，origin 必须与配置的 seed 是同一 inode 的硬链接；
@@ -194,6 +195,50 @@ L1/L2 使用 MCT32，L4 使用 MCT40，以容纳 32 个 steady transfers 和 per
 L1、L2、L4、L8。当前 dual inventory 会
 在 node2 上启动多个隔离 Child daemon，所以结果代表同一物理 Child host 的多 lane/多进程 fan-out，
 不能表述为多节点 fan-out。
+
+### transport-only 与 CRC32+pwrite tmpfs 分层对照
+
+以下两个 case 固定 `L8 × 每 lane CC8`、16 MiB Piece、post1、pipe2、in16、MCT80、TX128 MiB +
+RX32 MiB，只改变 Child 是否执行 CRC32+pwrite：
+
+- `fanout-piece16-cc8-post1-in16-l8-tx128-transport-only-tmpfs`；
+- `fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs`。
+
+两者都把 Parent/Child storage 和 dfget output 放到 `/dev/shm/dragonfly-b7/<run-id>`，prepare 会用
+`stat -f` 拒绝并非 tmpfs 的挂载。每个 case 为 3 个 measured batch × 8 lane × 1 GiB，即 24 GiB，
+不执行 warmup；运行前必须分别确认两台机器的 `/dev/shm` 至少还能容纳本轮 storage、output hard link
+及系统余量，每个 run 结束立即执行 manifest-owned cleanup。
+
+transport-only 是 validation-only profile：仍执行 TCP control、persistent lane、SEND_IMM/CQE、长度、
+Done 和 RX lease recycle，但跳过 Child CRC32 和 pwrite。该 profile 会信任 Parent 提供的 Piece digest，
+所以 Child 产物内容是无效的预分配文件；runner 只校验 Parent 内容 SHA、Parent/Child 长度、正常 URMA
+lifecycle，以及每个 task 恰好 64 条 transport-only Piece completion，明确不把 Child SHA 当作完整性
+证明。普通 `--features urma` binary 不支持这个 profile，测试前必须在两端构建：
+
+```bash
+cargo build --release -p dragonfly-client \
+  --features urma-test-failpoints --bin dfdaemon --bin dfget
+```
+
+运行示例：
+
+```bash
+python3 b7.py prepare --mode dual --run-id urma-l8-transport-tmpfs-001 \
+  --case fanout-piece16-cc8-post1-in16-l8-tx128-transport-only-tmpfs --execute
+python3 b7.py run --manifest results/urma-l8-transport-tmpfs-001/manifest.json --execute
+python3 b7.py cleanup --manifest results/urma-l8-transport-tmpfs-001/manifest.json --execute
+
+python3 b7.py prepare --mode dual --run-id urma-l8-storage-tmpfs-001 \
+  --case fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs --execute
+python3 b7.py run --manifest results/urma-l8-storage-tmpfs-001/manifest.json --execute
+python3 b7.py cleanup --manifest results/urma-l8-storage-tmpfs-001/manifest.json --execute
+```
+
+PR #1945 的 RDMA concurrency 曲线不是多 lane/QP 曲线：一个 daemon 只创建一个共享
+`FI_EP_RDM` endpoint、共享 CQ/progress thread；每个 Piece 各自建立 TCP rendezvous，再以独立 tag 在同一
+RDM endpoint 上并发。URMA 上最接近的严格结构对照是单 Parent + 单 Child persistent lane 内的并发
+Piece；本节 L8×CC8 用于测量 URMA 的多 lane 总饱和能力，结果必须同时报告 lane=8、每 lane CC8，
+不能直接标成“对齐 RDMA concurrency=8”。
 
 ### 并发 batch（B7.1）
 
