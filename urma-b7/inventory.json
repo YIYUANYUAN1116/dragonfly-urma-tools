@@ -10,16 +10,23 @@
       "host": "90.91.177.158",
       "user": "root",
       "roles": ["scheduler", "origin", "parent"],
-      "repo": "/home/yzd/dragonfly/dragonfly-client-urma-private",
-      "config": "/home/yzd/dragonfly/config/dfdaemon-parent.yaml",
-      "schedulerConfig": "/home/yzd/dragonfly/config/scheduler.yaml",
-      "schedulerBinary": "/home/yzd/dragonfly/scheduler"
+      "workspaceRoot": "/home/y30083740/dragonfly",
+      "repo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
+      "rcRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
+      "toolsRepo": "/home/y30083740/dragonfly/dragonfly-urma-tools",
+      "expectedBranch": "urma-rm-prototype",
+      "config": "/home/y30083740/dragonfly/config/dfdaemon-parent.yaml",
+      "schedulerConfig": "/home/y30083740/dragonfly/config/scheduler.yaml"
     },
     "node2": {
       "host": "90.91.177.157",
       "user": "root",
       "roles": ["child"],
-      "repo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
+      "workspaceRoot": "/home/y30083740/dragonfly",
+      "repo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
+      "rcRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
+      "toolsRepo": "/home/y30083740/dragonfly/dragonfly-urma-tools",
+      "expectedBranch": "urma-rm-prototype",
       "config": "/home/y30083740/dragonfly/config/dfdaemon-child.yaml"
     }
   },
@@ -27,6 +34,14 @@
     "device": "udmac0d1e2",
     "eidIndex": 1,
     "fabricTag": "validation-domain",
+    "transportMode": "rm",
+    "tpType": "rtp",
+    "requiredMaxMessageBytes": 65536,
+    "peerGuaranteedRxCredits": 0,
+    "crossNodeRmProbe": {
+      "status": "failed-unarchived",
+      "note": "User observed single-node RM success and cross-node RM failure; exact commands, output and resource snapshots still need to be archived."
+    },
     "includeDir": "/usr/include/ub/umdk/urma",
     "libDir": "/usr/lib64"
   },

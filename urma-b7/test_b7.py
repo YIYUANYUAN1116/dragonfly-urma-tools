@@ -18,11 +18,52 @@ SPEC.loader.exec_module(b7)
 class B7Tests(unittest.TestCase):
     def setUp(self):
         self.inventory = json.loads((TOOL_DIR / "inventory.json").read_text(encoding="utf-8"))
+        # Existing executor tests exercise remote orchestration rather than the
+        # real inventory's cross-node provider gate.
+        self.inventory["urma"]["crossNodeRmProbe"]["status"] = "passed"
 
     def test_rejects_unsafe_run_id(self):
         for value in ("../bad", "/tmp/bad", "BAD", ""):
             with self.assertRaises(b7.B7Error):
                 b7.validate_run_id(value)
+
+    def test_inventory_freezes_rm_preflight_contract(self):
+        b7.validate_inventory(self.inventory)
+        for node in self.inventory["nodes"].values():
+            self.assertTrue(node["repo"].endswith("/dragonfly-client-urma-rm"))
+            self.assertTrue(node["rcRepo"].endswith("/dragonfly-client-urma-private"))
+            self.assertNotEqual(node["repo"], node["rcRepo"])
+        metadata = b7.rm_validation_metadata(self.inventory, "dual")
+        self.assertEqual(metadata["transportMode"], "rm")
+        self.assertEqual(metadata["tpType"], "rtp")
+        self.assertEqual(metadata["requiredMaxMessageBytes"], 65536)
+        self.assertTrue(metadata["crossNodeGateRequired"])
+        self.assertEqual(
+            metadata["nativeResourceModel"],
+            "process-wide-shared-endpoint-with-peer-targets",
+        )
+        script = b7.inspection_script(self.inventory["nodes"]["node1"], self.inventory)
+        self.assertIn("urma_perftest_sha256", script)
+        self.assertIn("urma_admin_show_b64", script)
+        self.assertIn("urma_admin_topo_b64", script)
+        self.assertIn("network_b64", script)
+
+    def test_dual_rm_execution_requires_archived_cross_node_probe(self):
+        self.inventory["urma"]["crossNodeRmProbe"]["status"] = "failed-unarchived"
+        manifest = {
+            "mode": "dual",
+            "case": {"protocol": "urma"},
+            "urmaValidation": b7.rm_validation_metadata(self.inventory, "dual"),
+        }
+        with self.assertRaises(b7.B7Error):
+            b7.require_rm_preflight(manifest, False)
+        b7.require_rm_preflight(manifest, True)
+        manifest["urmaValidation"]["crossNodeRmProbe"]["status"] = "passed"
+        b7.require_rm_preflight(manifest, False)
+
+        manifest["mode"] = "single"
+        manifest["urmaValidation"]["crossNodeRmProbe"]["status"] = "failed"
+        b7.require_rm_preflight(manifest, False)
 
     def test_dual_plan_preheats_before_starting_child(self):
         plan = b7.build_plan(self.inventory, "dual", "b7-test", None)
@@ -345,6 +386,23 @@ class B7Tests(unittest.TestCase):
         args = b7.parser().parse_args(["discover"])
         self.assertEqual(args.nodes, [])
 
+    def test_discover_marks_wrong_checkout_and_missing_inputs_incomplete(self):
+        node = self.inventory["nodes"]["node1"]
+        output = "\n".join(
+            [
+                "repo_exists\tyes",
+                "repo_branch\tmain",
+                "config_sha256\tmissing",
+                "dfdaemon_sha256\tmissing",
+                "dfget_sha256\tmissing",
+            ]
+        )
+        completed = b7.subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with mock.patch.object(b7.subprocess, "run", return_value=completed):
+            result = b7.discover_node("node1", node, self.inventory)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(len(result["findings"]), 4)
+
     def test_invalid_base64_is_not_raised_to_caller(self):
         self.assertEqual(b7.decode_b64("not-base64!"), "<invalid-base64>")
 
@@ -372,6 +430,8 @@ storage:
         self.assertIn('socketPath: "/tmp/dragonfly-urma-b7/b7-test/parent/dfdaemon.sock"', rendered)
         self.assertIn("postListSize: 1", rendered)
         self.assertIn("pipelineDepth: 1", rendered)
+        self.assertIn('transportMode: "rm"', rendered)
+        self.assertIn("peerGuaranteedRxCredits: 0", rendered)
         self.assertIn("metrics:\n  server:\n    port: 44002", rendered)
         self.assertIn("enable: true", rendered)
 
@@ -1059,7 +1119,15 @@ storage:
                 mock.patch.object(b7, "stop_remote_role", side_effect=stop),
             ):
                 self.assertEqual(
-                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    b7.main(
+                        [
+                            "run",
+                            "--manifest",
+                            str(manifest_path),
+                            "--allow-unvalidated-rm",
+                            "--execute",
+                        ]
+                    ),
                     0,
                 )
             self.assertEqual(
@@ -1903,7 +1971,15 @@ RX BufferUnavailable
                 ),
             ):
                 self.assertEqual(
-                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    b7.main(
+                        [
+                            "run",
+                            "--manifest",
+                            str(manifest_path),
+                            "--allow-unvalidated-rm",
+                            "--execute",
+                        ]
+                    ),
                     0,
                 )
             warmups = manifest["case"]["warmups"]
@@ -2028,7 +2104,15 @@ RX BufferUnavailable
                 ),
             ):
                 self.assertEqual(
-                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    b7.main(
+                        [
+                            "run",
+                            "--manifest",
+                            str(manifest_path),
+                            "--allow-unvalidated-rm",
+                            "--execute",
+                        ]
+                    ),
                     0,
                 )
             self.assertEqual(len(batch_calls), 4)
@@ -2142,7 +2226,15 @@ RX BufferUnavailable
                 ),
             ):
                 self.assertEqual(
-                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    b7.main(
+                        [
+                            "run",
+                            "--manifest",
+                            str(manifest_path),
+                            "--allow-unvalidated-rm",
+                            "--execute",
+                        ]
+                    ),
                     0,
                 )
 
@@ -2277,7 +2369,15 @@ RX BufferUnavailable
                 ),
             ):
                 self.assertEqual(
-                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    b7.main(
+                        [
+                            "run",
+                            "--manifest",
+                            str(manifest_path),
+                            "--allow-unvalidated-rm",
+                            "--execute",
+                        ]
+                    ),
                     0,
                 )
             finished = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2342,7 +2442,15 @@ RX BufferUnavailable
                 ),
             ):
                 self.assertEqual(
-                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    b7.main(
+                        [
+                            "run",
+                            "--manifest",
+                            str(manifest_path),
+                            "--allow-unvalidated-rm",
+                            "--execute",
+                        ]
+                    ),
                     2,
                 )
             failed = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -2745,7 +2853,15 @@ dragonfly_client_urma_budget_pressure_total{direction="tx",stage="optional"} 13
                 ),
             ):
                 self.assertEqual(
-                    b7.main(["run", "--manifest", str(manifest_path), "--execute"]),
+                    b7.main(
+                        [
+                            "run",
+                            "--manifest",
+                            str(manifest_path),
+                            "--allow-unvalidated-rm",
+                            "--execute",
+                        ]
+                    ),
                     0,
                 )
             finished = json.loads(manifest_path.read_text(encoding="utf-8"))

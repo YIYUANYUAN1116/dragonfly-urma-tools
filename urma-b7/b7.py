@@ -36,7 +36,10 @@ LOG_TIMESTAMP_RE = re.compile(
 # were recorded with Debug (`task_id="..."`) or Display (`task_id=...`). Parent
 # `urma_piece` spans use Display, while several child spans use Debug.
 TASK_ID_RE = re.compile(r'\btask_id="?([A-Za-z0-9._:-]+)"?')
-LANE_ID_RE = re.compile(r"\blane_id=(\d+)")
+# The upper session facade still emits lane_id in some paths while the RM
+# native owner now emits peer_id. Treat both as one logical PeerTarget id;
+# neither value represents a dedicated native Jetty in RM mode.
+LANE_ID_RE = re.compile(r"\b(?:lane_id|peer_id)=(\d+)")
 TRANSFER_ID_RE = re.compile(r"\btransfer_id=(\d+)")
 WINDOW_START_CHUNK_RE = re.compile(r"\bwindow_start_chunk=(\d+)")
 WINDOW_CHUNK_COUNT_RE = re.compile(r"\bwindow_chunk_count=(\d+)")
@@ -86,9 +89,45 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
     for name, node in nodes.items():
         if not isinstance(node, dict):
             raise B7Error(f"node {name} must be an object")
-        for key in ("host", "user", "repo", "config"):
+        for key in (
+            "host",
+            "user",
+            "workspaceRoot",
+            "repo",
+            "rcRepo",
+            "toolsRepo",
+            "expectedBranch",
+            "config",
+        ):
             if not isinstance(node.get(key), str) or not node[key]:
                 raise B7Error(f"node {name} requires non-empty {key}")
+        if PurePosixPath(node["repo"]).name != "dragonfly-client-urma-rm":
+            raise B7Error(f"node {name} RM repo must be dragonfly-client-urma-rm")
+        if PurePosixPath(node["rcRepo"]).name != "dragonfly-client-urma-private":
+            raise B7Error(f"node {name} RC baseline repo must be dragonfly-client-urma-private")
+        if node["repo"] == node["rcRepo"]:
+            raise B7Error(f"node {name} RM and RC repos must be distinct")
+    urma = inventory.get("urma")
+    if not isinstance(urma, dict):
+        raise B7Error("inventory must define urma settings")
+    if urma.get("transportMode") != "rm":
+        raise B7Error("RM validation inventory requires urma.transportMode=rm")
+    if urma.get("tpType") not in ("rtp", "ctp"):
+        raise B7Error("inventory urma.tpType must be rtp or ctp")
+    required_message = urma.get("requiredMaxMessageBytes")
+    if not isinstance(required_message, int) or required_message <= 0:
+        raise B7Error("inventory urma.requiredMaxMessageBytes must be positive")
+    guaranteed = urma.get("peerGuaranteedRxCredits")
+    if not isinstance(guaranteed, int) or not 0 <= guaranteed <= 4096:
+        raise B7Error("inventory urma.peerGuaranteedRxCredits must be in 0..=4096")
+    probe = urma.get("crossNodeRmProbe")
+    if not isinstance(probe, dict) or probe.get("status") not in (
+        "unverified",
+        "failed-unarchived",
+        "failed",
+        "passed",
+    ):
+        raise B7Error("inventory urma.crossNodeRmProbe.status is invalid")
 
 
 def validate_run_id(run_id: str) -> str:
@@ -164,7 +203,7 @@ one_line() {{ "$@" 2>&1 | tr '\\n' ' ' | tr '\\t' ' '; }}
 file_hash() {{ if [ -f "$1" ]; then sha256sum "$1" | awk '{{print $1}}'; else printf missing; fi; }}
 config_keys() {{
   if [ -f "$1" ]; then
-    grep -E '^[[:space:]]*(ip|port|host|manager|scheduler|advertiseIP|listenIP|listenPort|tcpPort|quicPort|socketPath|dir|device|eidIndex|fabricTag|maxInflightChunks|maxConcurrentTransfers|transferTimeout|mmapContent|protocol|concurrentPieceCount):' "$1" 2>/dev/null | base64 | tr -d '\\n'
+    grep -E '^[[:space:]]*(ip|port|host|manager|scheduler|advertiseIP|listenIP|listenPort|tcpPort|quicPort|socketPath|dir|device|eidIndex|fabricTag|transportMode|peerGuaranteedRxCredits|maxInflightChunks|maxConcurrentTransfers|transferTimeout|mmapContent|protocol|concurrentPieceCount):' "$1" 2>/dev/null | base64 | tr -d '\\n'
   else
     printf missing
   fi
@@ -173,6 +212,9 @@ emit hostname "$(hostname 2>/dev/null || true)"
 emit uname "$(one_line uname -a)"
 emit identity "$(one_line id)"
 emit repo_exists "$(test -d {repo} && printf yes || printf no)"
+emit repo_head "$(one_line git -C {repo} rev-parse HEAD)"
+emit repo_branch "$(one_line git -C {repo} symbolic-ref --short HEAD)"
+emit repo_status_b64 "$(git -C {repo} status --short 2>/dev/null | base64 | tr -d '\\n')"
 emit config_sha256 "$(file_hash {config})"
 emit config_keys_b64 "$(config_keys {config})"
 emit scheduler_config_sha256 "$(file_hash {scheduler_config})"
@@ -186,6 +228,12 @@ emit perl "$(one_line perl -v)"
 emit memlock "$(ulimit -l 2>&1 | tr '\\n' ' ')"
 emit urma_device "$(test -e /sys/class/ubcore/{device} && printf present || printf unconfirmed)"
 emit urma_tools "$(one_line sh -c 'command -v urma_perftest; command -v urma_admin')"
+emit urma_perftest_sha256 "$(file_hash "$(command -v urma_perftest 2>/dev/null || true)")"
+emit urma_admin_sha256 "$(file_hash "$(command -v urma_admin 2>/dev/null || true)")"
+emit urma_admin_show_b64 "$(urma_admin show --all 2>&1 | base64 | tr -d '\\n')"
+emit urma_admin_topo_b64 "$(urma_admin show topo 2>&1 | base64 | tr -d '\\n')"
+emit urma_perftest_help_b64 "$(urma_perftest --help 2>&1 | base64 | tr -d '\\n')"
+emit network_b64 "$({{ ip -details addr show 2>&1; ip route show table all 2>&1; ip neigh show 2>&1; }} | base64 | tr -d '\\n')"
 emit listeners_b64 "$(ss -lntup 2>/dev/null | base64 | tr -d '\\n')"
 emit dragonfly_processes_b64 "$(pgrep -af 'dfdaemon|scheduler' 2>/dev/null | base64 | tr -d '\\n')"
 emit disk_b64 "$(df -h /tmp /var/lib /var/www/dragonfly 2>/dev/null | base64 | tr -d '\\n')"
@@ -216,7 +264,6 @@ def parse_inspection(stdout: str) -> dict[str, Any]:
 
 
 def discover_node(name: str, node: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
-    del name
     ssh = inventory["ssh"]
     command = [
         "ssh",
@@ -240,7 +287,25 @@ def discover_node(name: str, node: dict[str, Any], inventory: dict[str, Any]) ->
         return {"status": "unreachable", "error": str(error), "target": ssh_target(node)}
     result = parse_inspection(completed.stdout)
     status = "ok" if completed.returncode == 0 else "unreachable" if completed.returncode == 255 else "failed"
+    findings: list[str] = []
+    if status == "ok":
+        if result.get("repo_exists") != "yes":
+            findings.append(f"RM repo missing: {node['repo']}")
+        if result.get("repo_branch") != node["expectedBranch"]:
+            findings.append(
+                f"RM branch mismatch: expected {node['expectedBranch']}, "
+                f"got {result.get('repo_branch', 'missing')}"
+            )
+        if result.get("config_sha256") == "missing":
+            findings.append(f"source config missing: {node['config']}")
+        for binary in ("dfdaemon", "dfget"):
+            if result.get(f"{binary}_sha256") == "missing":
+                findings.append(f"RM {binary} binary missing under {node['repo']}")
+        if findings:
+            status = "incomplete"
     result.update({"status": status, "target": ssh_target(node), "returnCode": completed.returncode})
+    if findings:
+        result["findings"] = findings
     if completed.stderr.strip():
         result["stderr"] = completed.stderr.strip()
     return result
@@ -2472,6 +2537,11 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         concurrency = case.get("concurrency", 1)
         if not isinstance(concurrency, int) or not 1 <= concurrency <= 16:
             raise B7Error(f"case {case['name']} requires concurrency in 1..=16")
+        peer_guaranteed = case.get("peerGuaranteedRxCredits", 0)
+        if not isinstance(peer_guaranteed, int) or not 0 <= peer_guaranteed <= 4096:
+            raise B7Error(
+                f"case {case['name']} requires peerGuaranteedRxCredits in 0..=4096"
+            )
         topology = case.get("topology", "queue")
         if topology not in ("queue", "fanout", "fanin", "piece-concurrency"):
             raise B7Error(f"case {case['name']} has unsupported topology {topology!r}")
@@ -2634,6 +2704,10 @@ def role_overlays(
         ("storage", "server", "urma", "device"): inventory["urma"]["device"],
         ("storage", "server", "urma", "eidIndex"): inventory["urma"]["eidIndex"],
         ("storage", "server", "urma", "fabricTag"): inventory["urma"]["fabricTag"],
+        ("storage", "server", "urma", "transportMode"): inventory["urma"]["transportMode"],
+        ("storage", "server", "urma", "peerGuaranteedRxCredits"): case.get(
+            "peerGuaranteedRxCredits", inventory["urma"]["peerGuaranteedRxCredits"]
+        ),
         ("storage", "server", "urma", "maxRegisteredBytes"): case.get("maxRegisteredBytes", "40MiB"),
         ("storage", "server", "urma", "txRegisteredBytes"): case.get("txRegisteredBytes", "8MiB"),
         ("storage", "server", "urma", "maxInflightChunks"): case["maxInflightChunks"],
@@ -2695,9 +2769,44 @@ def build_plan(inventory: dict[str, Any], mode: str, run_id: str, host: str | No
         "childNode": child_node,
         "origin": origin,
         "generated": generated,
+        "urmaValidation": rm_validation_metadata(inventory, mode),
         "safety": {"readOnly": True, "note": "This is a plan only; mutating steps are not executed by this tool version."},
         "steps": steps,
     }
+
+
+def rm_validation_metadata(inventory: dict[str, Any], mode: str) -> dict[str, Any]:
+    urma = inventory["urma"]
+    probe = dict(urma["crossNodeRmProbe"])
+    return {
+        "transportMode": urma["transportMode"],
+        "tpType": urma["tpType"],
+        "requiredMaxMessageBytes": urma["requiredMaxMessageBytes"],
+        "peerGuaranteedRxCredits": urma["peerGuaranteedRxCredits"],
+        "nativeResourceModel": "process-wide-shared-endpoint-with-peer-targets",
+        "crossNodeRmProbe": probe,
+        "crossNodeGateRequired": mode == "dual",
+    }
+
+
+def require_rm_preflight(
+    manifest: dict[str, Any], allow_unvalidated_rm: bool
+) -> None:
+    case = manifest.get("case")
+    if not isinstance(case, dict) or case.get("protocol", "urma") != "urma":
+        return
+    validation = manifest.get("urmaValidation")
+    if not isinstance(validation, dict) or validation.get("transportMode") != "rm":
+        raise B7Error("URMA manifest lacks explicit RM validation metadata")
+    if manifest.get("mode") != "dual":
+        return
+    probe = validation.get("crossNodeRmProbe")
+    status = probe.get("status") if isinstance(probe, dict) else None
+    if status != "passed" and not allow_unvalidated_rm:
+        raise B7Error(
+            "cross-node RM preflight is not passed; archive a successful RM/RTP "
+            "probe in inventory or rerun with --allow-unvalidated-rm for diagnosis only"
+        )
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -2787,6 +2896,7 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "childNode": child_node,
         "origin": origin,
         "generated": generated,
+        "urmaValidation": rm_validation_metadata(inventory, args.mode),
         "state": "planned",
         "remote": {},
     }
@@ -3640,6 +3750,8 @@ def command_run_fanin(
 
 def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest = load_json(args.manifest)
+    if args.execute:
+        require_rm_preflight(manifest, args.allow_unvalidated_rm)
     case_value = manifest.get("case")
     topology = manifest.get("topology")
     if topology is None and isinstance(case_value, dict):
@@ -4194,6 +4306,11 @@ def parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="start owned daemons and transfer data; omitted means dry-run",
+    )
+    run.add_argument(
+        "--allow-unvalidated-rm",
+        action="store_true",
+        help="allow a dual-node RM diagnostic run without a passed archived RM preflight",
     )
     cleanup = subparsers.add_parser(
         "cleanup", help="remove only stopped resources owned by one run manifest"

@@ -13,6 +13,47 @@ UMDK 行为参考，不提供替代数据路径。
   传输并采集证据；
 - `cleanup`：只有显式 `--execute` 且 owner/PID/path gate 全部通过才删除本轮资源。
 
+当前测试对象是 `urma-rm-prototype` 的 RM-only 数据面。生成配置会显式写入
+`transportMode: rm` 和 `peerGuaranteedRxCredits`；manifest 的 `urmaValidation` 固化 TP 类型、要求的
+最大消息、cross-node probe 状态，以及 `process-wide shared endpoint + PeerTarget` native 资源模型。
+文档和结果中的 `lane_id` 仅是尚未改名的 session facade 标识，不再代表每 Peer 独占 Jetty/JFR。
+
+157、158 的统一工作区为 `/home/y30083740/dragonfly`。B7 的 `repo` 固定指向
+`dragonfly-client-urma-rm`；`dragonfly-client-urma-private` 只作为 RC A/B 基线记录，不能用于生成或启动
+本轮 RM binary。`dragonfly-urma-tools` 单独记录为工具仓库。`discover` 会核对 RM checkout 的分支应为
+`urma-rm-prototype`，并在 repo、分支、源配置或 release binary 不符合时返回 `incomplete`。
+
+当前目录清单中没有 inventory 仍依赖的 `/home/y30083740/dragonfly/config`。因此首次执行前需要恢复或
+迁移 `dfdaemon-parent.yaml`、`dfdaemon-child.yaml`（以及 158 上用于留档的 `scheduler.yaml`），再同步修改
+inventory；B7 不会凭空生成 scheduler/manager 地址未知的基础配置。
+
+## RM 跨节点前置门禁
+
+2026-09-07 用户初测观察到：RM perftest 单节点可运行、跨节点未跑通；精确命令、错误输出和
+`urma_admin` 资源快照尚未归档。因此 `inventory.json` 将 `crossNodeRmProbe.status` 置为
+`failed-unarchived`。这项结果只说明跨节点 RM provider/拓扑尚未成立，不能归因到 Dragonfly shared JFR。
+
+先执行只读发现并保存结果：
+
+```bash
+python3 b7.py discover
+```
+
+`discover` 会额外保存两节点 repo HEAD/dirty 状态、perftest/admin binary SHA-256、
+`urma_admin show --all`、`urma_admin show topo`、IP/route/neighbour 快照和 perftest help。随后在相同
+device/EID 下重新归档 RM/RTP 的 server/client 命令、stdout/stderr、退出码，并至少覆盖小消息和
+64 KiB。只有跨节点结果通过后，才把 inventory 状态改成 `passed`。
+
+当状态不是 `passed` 时，dual-node `run --execute` 会拒绝执行。若目的就是诊断 Dragonfly 与 perftest
+为何表现不同，可以显式越过门禁；这种结果必须标记为 diagnostic，不能登记为 RM PASS：
+
+```bash
+python3 b7.py run --manifest results/<run-id>/manifest.json \
+  --allow-unvalidated-rm --execute
+```
+
+single-node run 不受 cross-node 门禁影响，但其成功不能替代跨节点 provider 验证。
+
 ## 快速使用
 
 ```powershell
