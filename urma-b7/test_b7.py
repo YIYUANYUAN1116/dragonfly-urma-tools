@@ -19,8 +19,9 @@ class B7Tests(unittest.TestCase):
     def setUp(self):
         self.inventory = json.loads((TOOL_DIR / "inventory.json").read_text(encoding="utf-8"))
         # Existing executor tests exercise remote orchestration rather than the
-        # real inventory's cross-node provider gate.
-        self.inventory["urma"]["crossNodeRmProbe"]["status"] = "passed"
+        # real inventory's cross-node provider gate; default to the RM profile.
+        self.inventory = b7.select_profile(self.inventory, "rm")
+        self.inventory["urma"]["crossNodeProbe"]["status"] = "passed"
 
     def test_rejects_unsafe_run_id(self):
         for value in ("../bad", "/tmp/bad", "BAD", ""):
@@ -33,7 +34,7 @@ class B7Tests(unittest.TestCase):
             self.assertTrue(node["repo"].endswith("/dragonfly-client-urma-rm"))
             self.assertTrue(node["rcRepo"].endswith("/dragonfly-client-urma-private"))
             self.assertNotEqual(node["repo"], node["rcRepo"])
-        metadata = b7.rm_validation_metadata(self.inventory, "dual")
+        metadata = b7.urma_validation_metadata(self.inventory, "dual")
         self.assertEqual(metadata["transportMode"], "rm")
         self.assertEqual(metadata["tpType"], "rtp")
         self.assertEqual(metadata["requiredMaxMessageBytes"], 65536)
@@ -42,28 +43,61 @@ class B7Tests(unittest.TestCase):
             metadata["nativeResourceModel"],
             "process-wide-shared-endpoint-with-peer-targets",
         )
+        self.assertEqual(metadata["crossNodeProbes"]["rc"]["status"], "passed")
         script = b7.inspection_script(self.inventory["nodes"]["node1"], self.inventory)
         self.assertIn("urma_perftest_sha256", script)
         self.assertIn("urma_admin_show_b64", script)
         self.assertIn("urma_admin_topo_b64", script)
         self.assertIn("network_b64", script)
 
-    def test_dual_rm_execution_requires_archived_cross_node_probe(self):
-        self.inventory["urma"]["crossNodeRmProbe"]["status"] = "failed-unarchived"
+    def test_dual_urma_execution_requires_archived_cross_node_probe(self):
+        self.inventory["urma"]["crossNodeProbe"]["status"] = "failed-unarchived"
         manifest = {
+            "profile": self.inventory["selectedProfile"],
             "mode": "dual",
             "case": {"protocol": "urma"},
-            "urmaValidation": b7.rm_validation_metadata(self.inventory, "dual"),
+            "urmaValidation": b7.urma_validation_metadata(self.inventory, "dual"),
         }
         with self.assertRaises(b7.B7Error):
-            b7.require_rm_preflight(manifest, False)
-        b7.require_rm_preflight(manifest, True)
-        manifest["urmaValidation"]["crossNodeRmProbe"]["status"] = "passed"
-        b7.require_rm_preflight(manifest, False)
+            b7.require_urma_preflight(manifest, False)
+        b7.require_urma_preflight(manifest, True)
+        manifest["urmaValidation"]["crossNodeProbe"]["status"] = "passed"
+        b7.require_urma_preflight(manifest, False)
 
         manifest["mode"] = "single"
-        manifest["urmaValidation"]["crossNodeRmProbe"]["status"] = "failed"
-        b7.require_rm_preflight(manifest, False)
+        manifest["urmaValidation"]["crossNodeProbe"]["status"] = "failed"
+        b7.require_urma_preflight(manifest, False)
+
+    def test_select_profile_switches_repo_branch_and_transport(self):
+        rm = b7.select_profile(self.inventory, "rm")
+        self.assertEqual(rm["selectedProfile"], "rm")
+        self.assertEqual(rm["urma"]["transportMode"], "rm")
+        self.assertEqual(rm["urma"]["expectedBranch"], "urma-rm-prototype")
+        for node in rm["nodes"].values():
+            self.assertTrue(node["repo"].endswith("/dragonfly-client-urma-rm"))
+        self.assertEqual(rm["urma"]["peerGuaranteedRxCredits"], 0)
+
+        rc = b7.select_profile(self.inventory, "rc")
+        self.assertEqual(rc["selectedProfile"], "rc")
+        self.assertEqual(rc["urma"]["transportMode"], "rc")
+        self.assertEqual(rc["urma"]["expectedBranch"], "urma-main")
+        for node in rc["nodes"].values():
+            self.assertTrue(node["repo"].endswith("/dragonfly-client-urma-private"))
+        self.assertNotIn("peerGuaranteedRxCredits", rc["urma"])
+        # The two profiles never share a repo checkout.
+        self.assertNotEqual(
+            rm["nodes"]["node1"]["repo"], rc["nodes"]["node1"]["repo"]
+        )
+
+    def test_select_profile_rc_metadata_freezes_both_probes(self):
+        rc = b7.select_profile(self.inventory, "rc")
+        rc["urma"]["crossNodeProbe"]["status"] = "passed"
+        metadata = b7.urma_validation_metadata(rc, "dual")
+        self.assertEqual(metadata["profile"], "rc")
+        self.assertEqual(metadata["transportMode"], "rc")
+        self.assertEqual(metadata["crossNodeProbe"]["status"], "passed")
+        self.assertEqual(metadata["crossNodeProbes"]["rc"]["status"], "passed")
+        self.assertEqual(metadata["crossNodeProbes"]["rm"]["status"], "passed")
 
     def test_dual_plan_preheats_before_starting_child(self):
         plan = b7.build_plan(self.inventory, "dual", "b7-test", None)

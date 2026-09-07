@@ -10,6 +10,7 @@ import argparse
 import base64
 import binascii
 import calendar
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -96,7 +97,6 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
             "repo",
             "rcRepo",
             "toolsRepo",
-            "expectedBranch",
             "config",
         ):
             if not isinstance(node.get(key), str) or not node[key]:
@@ -110,24 +110,64 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
     urma = inventory.get("urma")
     if not isinstance(urma, dict):
         raise B7Error("inventory must define urma settings")
-    if urma.get("transportMode") != "rm":
-        raise B7Error("RM validation inventory requires urma.transportMode=rm")
-    if urma.get("tpType") not in ("rtp", "ctp"):
-        raise B7Error("inventory urma.tpType must be rtp or ctp")
-    required_message = urma.get("requiredMaxMessageBytes")
-    if not isinstance(required_message, int) or required_message <= 0:
-        raise B7Error("inventory urma.requiredMaxMessageBytes must be positive")
-    guaranteed = urma.get("peerGuaranteedRxCredits")
-    if not isinstance(guaranteed, int) or not 0 <= guaranteed <= 4096:
-        raise B7Error("inventory urma.peerGuaranteedRxCredits must be in 0..=4096")
-    probe = urma.get("crossNodeRmProbe")
-    if not isinstance(probe, dict) or probe.get("status") not in (
-        "unverified",
-        "failed-unarchived",
-        "failed",
-        "passed",
-    ):
-        raise B7Error("inventory urma.crossNodeRmProbe.status is invalid")
+    profiles = urma.get("profiles")
+    if not isinstance(profiles, dict) or set(profiles) != {"rc", "rm"}:
+        raise B7Error("inventory urma.profiles must define exactly rc and rm")
+    if urma.get("defaultProfile") not in profiles:
+        raise B7Error("inventory urma.defaultProfile must select an URMA profile")
+    for profile_name, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise B7Error(f"inventory URMA profile {profile_name} must be an object")
+        if profile.get("transportMode") != profile_name:
+            raise B7Error(
+                f"inventory URMA profile {profile_name} must use transportMode={profile_name}"
+            )
+        if profile.get("repoField") not in ("repo", "rcRepo"):
+            raise B7Error(f"inventory URMA profile {profile_name} has invalid repoField")
+        if not isinstance(profile.get("expectedBranch"), str) or not profile["expectedBranch"]:
+            raise B7Error(f"inventory URMA profile {profile_name} requires expectedBranch")
+        if profile.get("tpType") not in ("rtp", "ctp"):
+            raise B7Error(f"inventory URMA profile {profile_name} tpType must be rtp or ctp")
+        required_message = profile.get("requiredMaxMessageBytes")
+        if not isinstance(required_message, int) or required_message <= 0:
+            raise B7Error(
+                f"inventory URMA profile {profile_name} requiredMaxMessageBytes must be positive"
+            )
+        guaranteed = profile.get("peerGuaranteedRxCredits", 0)
+        if not isinstance(guaranteed, int) or not 0 <= guaranteed <= 4096:
+            raise B7Error(
+                f"inventory URMA profile {profile_name} peerGuaranteedRxCredits must be in 0..=4096"
+            )
+        if not isinstance(profile.get("nativeResourceModel"), str):
+            raise B7Error(f"inventory URMA profile {profile_name} requires nativeResourceModel")
+        probe = profile.get("crossNodeProbe")
+        if not isinstance(probe, dict) or probe.get("status") not in (
+            "unverified",
+            "failed-unarchived",
+            "failed",
+            "passed",
+        ):
+            raise B7Error(
+                f"inventory URMA profile {profile_name} crossNodeProbe.status is invalid"
+            )
+
+
+def select_profile(inventory: dict[str, Any], profile_name: str) -> dict[str, Any]:
+    profiles = inventory["urma"]["profiles"]
+    if profile_name not in profiles:
+        raise B7Error(f"unknown URMA profile {profile_name!r}")
+    selected = copy.deepcopy(inventory)
+    profile = selected["urma"]["profiles"][profile_name]
+    selected["selectedProfile"] = profile_name
+    # Replace (not merge) profile fields so rm-only keys such as
+    # peerGuaranteedRxCredits never leak into the rc selection.
+    for key in ("peerGuaranteedRxCredits",):
+        selected["urma"].pop(key, None)
+    selected["urma"].update(profile)
+    for node in selected["nodes"].values():
+        node["repo"] = node[profile["repoField"]]
+        node["expectedBranch"] = profile["expectedBranch"]
+    return selected
 
 
 def validate_run_id(run_id: str) -> str:
@@ -2688,7 +2728,7 @@ def role_overlays(
     is_urma_server = (topology == "fanin" and not is_parent) or (
         topology != "fanin" and is_parent
     )
-    return {
+    overlays = {
         ("host", "hostname"): f"{run_id}-{role}",
         ("host", "ip"): node["host"],
         ("server", "cacheDir"): layout["cache"],
@@ -2705,9 +2745,6 @@ def role_overlays(
         ("storage", "server", "urma", "eidIndex"): inventory["urma"]["eidIndex"],
         ("storage", "server", "urma", "fabricTag"): inventory["urma"]["fabricTag"],
         ("storage", "server", "urma", "transportMode"): inventory["urma"]["transportMode"],
-        ("storage", "server", "urma", "peerGuaranteedRxCredits"): case.get(
-            "peerGuaranteedRxCredits", inventory["urma"]["peerGuaranteedRxCredits"]
-        ),
         ("storage", "server", "urma", "maxRegisteredBytes"): case.get("maxRegisteredBytes", "40MiB"),
         ("storage", "server", "urma", "txRegisteredBytes"): case.get("txRegisteredBytes", "8MiB"),
         ("storage", "server", "urma", "maxInflightChunks"): case["maxInflightChunks"],
@@ -2722,6 +2759,11 @@ def role_overlays(
         ("metrics", "server", "port"): ports["metrics"],
         ("stats", "server", "port"): ports["stats"],
     }
+    if inventory["urma"]["transportMode"] == "rm":
+        overlays[("storage", "server", "urma", "peerGuaranteedRxCredits")] = case.get(
+            "peerGuaranteedRxCredits", inventory["urma"].get("peerGuaranteedRxCredits", 0)
+        )
+    return overlays
 
 
 def render_role_config(
@@ -2764,48 +2806,61 @@ def build_plan(inventory: dict[str, Any], mode: str, run_id: str, host: str | No
     return {
         "schemaVersion": 1,
         "runId": run_id,
+        "profile": inventory["selectedProfile"],
         "mode": mode,
         "parentNode": parent_node,
         "childNode": child_node,
         "origin": origin,
         "generated": generated,
-        "urmaValidation": rm_validation_metadata(inventory, mode),
+        "urmaValidation": urma_validation_metadata(inventory, mode),
         "safety": {"readOnly": True, "note": "This is a plan only; mutating steps are not executed by this tool version."},
         "steps": steps,
     }
 
 
-def rm_validation_metadata(inventory: dict[str, Any], mode: str) -> dict[str, Any]:
+def urma_validation_metadata(inventory: dict[str, Any], mode: str) -> dict[str, Any]:
     urma = inventory["urma"]
-    probe = dict(urma["crossNodeRmProbe"])
+    probe = dict(urma["crossNodeProbe"])
+    # Freeze the cross-node gate status of BOTH profiles so the manifest records
+    # rmCrossNodeProbe / rcCrossNodeProbe independently; crossNodeProbe keeps the
+    # selected profile's gate for backward compatibility.
+    cross_node_probes = {
+        name: dict(urma["profiles"][name]["crossNodeProbe"]) if name != inventory["selectedProfile"] else probe
+        for name in ("rm", "rc")
+    }
     return {
+        "profile": inventory["selectedProfile"],
         "transportMode": urma["transportMode"],
         "tpType": urma["tpType"],
         "requiredMaxMessageBytes": urma["requiredMaxMessageBytes"],
-        "peerGuaranteedRxCredits": urma["peerGuaranteedRxCredits"],
-        "nativeResourceModel": "process-wide-shared-endpoint-with-peer-targets",
-        "crossNodeRmProbe": probe,
+        "peerGuaranteedRxCredits": urma.get("peerGuaranteedRxCredits"),
+        "nativeResourceModel": urma["nativeResourceModel"],
+        "crossNodeProbe": probe,
+        "crossNodeProbes": cross_node_probes,
         "crossNodeGateRequired": mode == "dual",
     }
 
 
-def require_rm_preflight(
-    manifest: dict[str, Any], allow_unvalidated_rm: bool
+def require_urma_preflight(
+    manifest: dict[str, Any], allow_unvalidated_urma: bool
 ) -> None:
     case = manifest.get("case")
     if not isinstance(case, dict) or case.get("protocol", "urma") != "urma":
         return
     validation = manifest.get("urmaValidation")
-    if not isinstance(validation, dict) or validation.get("transportMode") != "rm":
-        raise B7Error("URMA manifest lacks explicit RM validation metadata")
+    if not isinstance(validation, dict):
+        raise B7Error("URMA manifest lacks explicit transport validation metadata")
+    profile = manifest.get("profile")
+    if validation.get("profile") != profile or validation.get("transportMode") != profile:
+        raise B7Error("URMA manifest profile and transport validation metadata disagree")
     if manifest.get("mode") != "dual":
         return
-    probe = validation.get("crossNodeRmProbe")
+    probe = validation.get("crossNodeProbe")
     status = probe.get("status") if isinstance(probe, dict) else None
-    if status != "passed" and not allow_unvalidated_rm:
+    if status != "passed" and not allow_unvalidated_urma:
         raise B7Error(
-            "cross-node RM preflight is not passed; archive a successful RM/RTP "
-            "probe in inventory or rerun with --allow-unvalidated-rm for diagnosis only"
+            f"cross-node {profile.upper()} preflight is not passed; archive a successful "
+            "probe in inventory or rerun with --allow-unvalidated-urma for diagnosis only"
         )
 
 
@@ -2833,6 +2888,7 @@ def command_discover(args: argparse.Namespace, inventory: dict[str, Any]) -> int
         raise B7Error(f"unknown nodes: {', '.join(unknown)}")
     discovered = {
         "schemaVersion": 1,
+        "profile": inventory["selectedProfile"],
         "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "inventorySha256": hashlib.sha256(args.inventory.read_bytes()).hexdigest(),
         "nodes": {name: discover_node(name, inventory["nodes"][name], inventory) for name in nodes},
@@ -2889,6 +2945,7 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest: dict[str, Any] = {
         "schemaVersion": 1,
         "runId": args.run_id,
+        "profile": inventory["selectedProfile"],
         "mode": args.mode,
         "case": case,
         "topology": topology,
@@ -2896,7 +2953,7 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "childNode": child_node,
         "origin": origin,
         "generated": generated,
-        "urmaValidation": rm_validation_metadata(inventory, args.mode),
+        "urmaValidation": urma_validation_metadata(inventory, args.mode),
         "state": "planned",
         "remote": {},
     }
@@ -3750,8 +3807,9 @@ def command_run_fanin(
 
 def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest = load_json(args.manifest)
+    inventory = select_profile(inventory, str(manifest.get("profile", "rm")))
     if args.execute:
-        require_rm_preflight(manifest, args.allow_unvalidated_rm)
+        require_urma_preflight(manifest, args.allow_unvalidated_urma)
     case_value = manifest.get("case")
     topology = manifest.get("topology")
     if topology is None and isinstance(case_value, dict):
@@ -4177,6 +4235,7 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
 
 def command_cleanup(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     manifest = load_json(args.manifest)
+    inventory = select_profile(inventory, str(manifest.get("profile", "rm")))
     run_id = validate_run_id(str(manifest.get("runId", "")))
     generated = manifest.get("generated")
     if not isinstance(generated, dict) or "parent" not in generated:
@@ -4268,14 +4327,17 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--inventory", type=Path, default=TOOL_DIR / "inventory.json")
     subparsers = result.add_subparsers(dest="command", required=True)
     discover = subparsers.add_parser("discover", help="read-only SSH environment discovery")
+    discover.add_argument("--profile", choices=("rc", "rm"), default="rm")
     discover.add_argument("nodes", nargs="*", metavar="NODE")
     discover.add_argument("--output", type=Path, default=TOOL_DIR / "results" / "inventory.discovered.json")
     plan = subparsers.add_parser("plan", help="generate a non-executing topology plan")
+    plan.add_argument("--profile", choices=("rc", "rm"), default="rm")
     plan.add_argument("--mode", choices=("dual", "single"), required=True)
     plan.add_argument("--host", choices=("node1", "node2"))
     plan.add_argument("--run-id", default=default_run_id())
     plan.add_argument("--output", type=Path)
     render = subparsers.add_parser("render-config", help="render an isolated dfdaemon YAML locally")
+    render.add_argument("--profile", choices=("rc", "rm"), default="rm")
     render.add_argument("--source", type=Path, required=True)
     render.add_argument("--output", type=Path, required=True)
     render.add_argument("--role", choices=("parent", "child"), required=True)
@@ -4287,6 +4349,7 @@ def parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser(
         "prepare", help="prepare isolated remote configs and a unique origin artifact"
     )
+    prepare.add_argument("--profile", choices=("rc", "rm"), default="rm")
     prepare.add_argument("--mode", choices=("dual", "single"), required=True)
     prepare.add_argument("--host", choices=("node1", "node2"))
     prepare.add_argument("--run-id", required=True)
@@ -4308,9 +4371,11 @@ def parser() -> argparse.ArgumentParser:
         help="start owned daemons and transfer data; omitted means dry-run",
     )
     run.add_argument(
+        "--allow-unvalidated-urma",
         "--allow-unvalidated-rm",
+        dest="allow_unvalidated_urma",
         action="store_true",
-        help="allow a dual-node RM diagnostic run without a passed archived RM preflight",
+        help="allow a dual-node URMA diagnostic run without a passed archived profile preflight",
     )
     cleanup = subparsers.add_parser(
         "cleanup", help="remove only stopped resources owned by one run manifest"
@@ -4330,14 +4395,14 @@ def main(argv: list[str] | None = None) -> int:
         inventory = load_json(args.inventory)
         validate_inventory(inventory)
         if args.command == "discover":
-            return command_discover(args, inventory)
+            return command_discover(args, select_profile(inventory, args.profile))
         if args.command == "plan":
-            return command_plan(args, inventory)
+            return command_plan(args, select_profile(inventory, args.profile))
         if args.command == "render-config":
             validate_run_id(args.run_id)
-            return command_render_config(args, inventory)
+            return command_render_config(args, select_profile(inventory, args.profile))
         if args.command == "prepare":
-            return command_prepare(args, inventory)
+            return command_prepare(args, select_profile(inventory, args.profile))
         if args.command == "run":
             return command_run(args, inventory)
         if args.command == "cleanup":
