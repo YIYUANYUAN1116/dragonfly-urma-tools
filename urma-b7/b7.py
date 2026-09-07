@@ -327,20 +327,21 @@ def discover_node(name: str, node: dict[str, Any], inventory: dict[str, Any]) ->
         return {"status": "unreachable", "error": str(error), "target": ssh_target(node)}
     result = parse_inspection(completed.stdout)
     status = "ok" if completed.returncode == 0 else "unreachable" if completed.returncode == 255 else "failed"
+    profile_label = inventory.get("selectedProfile", "rm").upper()
     findings: list[str] = []
     if status == "ok":
         if result.get("repo_exists") != "yes":
-            findings.append(f"RM repo missing: {node['repo']}")
-        if result.get("repo_branch") != node["expectedBranch"]:
+            findings.append(f"{profile_label} repo missing: {node['repo']}")
+        if str(result.get("repo_branch", "")).strip() != node["expectedBranch"]:
             findings.append(
-                f"RM branch mismatch: expected {node['expectedBranch']}, "
+                f"{profile_label} branch mismatch: expected {node['expectedBranch']}, "
                 f"got {result.get('repo_branch', 'missing')}"
             )
         if result.get("config_sha256") == "missing":
             findings.append(f"source config missing: {node['config']}")
         for binary in ("dfdaemon", "dfget"):
             if result.get(f"{binary}_sha256") == "missing":
-                findings.append(f"RM {binary} binary missing under {node['repo']}")
+                findings.append(f"{profile_label} {binary} binary missing under {node['repo']}")
         if findings:
             status = "incomplete"
     result.update({"status": status, "target": ssh_target(node), "returnCode": completed.returncode})
