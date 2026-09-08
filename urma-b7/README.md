@@ -13,30 +13,43 @@ UMDK 行为参考，不提供替代数据路径。
   传输并采集证据；
 - `cleanup`：只有显式 `--execute` 且 owner/PID/path gate 全部通过才删除本轮资源。
 
-当前测试对象是 `urma-rm-prototype` 的 RM-only 数据面。生成配置会显式写入
-`transportMode: rm` 和 `peerGuaranteedRxCredits`；manifest 的 `urmaValidation` 固化 TP 类型、要求的
-最大消息、cross-node probe 状态，以及 `process-wide shared endpoint + PeerTarget` native 资源模型。
-文档和结果中的 `lane_id` 仅是尚未改名的 session facade 标识，不再代表每 Peer 独占 Jetty/JFR。
+B7 同时支持两个显式 URMA profile，但两套 Dragonfly 代码不混编：
 
-157、158 的统一工作区为 `/home/y30083740/dragonfly`。B7 的 `repo` 固定指向
-`dragonfly-client-urma-rm`；`dragonfly-client-urma-private` 只作为 RC A/B 基线记录，不能用于生成或启动
-本轮 RM binary。`dragonfly-urma-tools` 单独记录为工具仓库。`discover` 会核对 RM checkout 的分支应为
-`urma-rm-prototype`，并在 repo、分支、源配置或 release binary 不符合时返回 `incomplete`。
+- `--profile rm`（默认）：`dragonfly-client-urma-rm` / `urma-rm-prototype`，当前诊断清单生成
+  `transportMode: rm`、`tpType: ctp` 和 `peerGuaranteedRxCredits`；Dragonfly 自身缺省仍为 RTP，B7 显式
+  选择 CTP 是为了复测已观察到的单机 CTP 路径。资源模型是 process-wide shared endpoint + PeerTarget；
+- `--profile rc`：`dragonfly-client-urma-private` / `urma-main`，生成 `transportMode: rc`，不写入 RM-only
+  的 per-peer guarantee，资源模型是 per-peer RC Jetty/JFR lane。
+
+manifest 固化 profile、transport、TP 类型、所需最大消息和两个 profile 各自的 cross-node probe 状态；
+后续 `run/cleanup` 从 manifest 恢复同一个 repo，不能在 prepare 后切换 profile。RM 文档和结果中的
+`lane_id` 仅是尚未改名的 session facade 标识，不代表 RM 中存在每 Peer 独占 Jetty/JFR。
+
+157、158 的统一工作区为 `/home/y30083740/dragonfly`。`dragonfly-urma-tools` 单独记录为工具仓库。
+`discover --profile ...` 会选择对应 checkout 并核对预期分支，在 repo、分支、源配置或 release binary
+不符合时返回 `incomplete`。
 
 当前目录清单中没有 inventory 仍依赖的 `/home/y30083740/dragonfly/config`。因此首次执行前需要恢复或
 迁移 `dfdaemon-parent.yaml`、`dfdaemon-child.yaml`（以及 158 上用于留档的 `scheduler.yaml`），再同步修改
 inventory；B7 不会凭空生成 scheduler/manager 地址未知的基础配置。
 
-## RM 跨节点前置门禁
+## RC/RM 跨节点前置门禁
 
 2026-09-07 用户初测观察到：RM perftest 单节点可运行、跨节点未跑通；精确命令、错误输出和
-`urma_admin` 资源快照尚未归档。因此 `inventory.json` 将 `crossNodeRmProbe.status` 置为
+`urma_admin` 资源快照尚未归档。因此 inventory 中 RM profile 的 `crossNodeProbe.status` 为
 `failed-unarchived`。这项结果只说明跨节点 RM provider/拓扑尚未成立，不能归因到 Dragonfly shared JFR。
+RC profile 保留既有 B5/B6/B8 跨节点通过状态，但正式 A/B 前仍应重新归档当前 binary/config hash。
+
+目前收到的局部日志显示：跨节点 RM+CTP `send_bw` 返回 completion status 4（当前 UMDK 枚举中的
+`URMA_CR_LOC_ACCESS_ERR`）；Dragonfly 单节点 RM 则在 Parent `import_jetty=-1` 后回退 TCP。当前 RM
+Dragonfly shim 固定使用 RTP，而已知成功的单节点 perftest 使用 CTP；应先完成同 binary 的 RTP/CTP
+最小矩阵，不能把现有 perftest 结果登记为 RM profile PASS。
 
 先执行只读发现并保存结果：
 
 ```bash
-python3 b7.py discover
+python3 b7.py discover --profile rm
+python3 b7.py discover --profile rc
 ```
 
 `discover` 会额外保存两节点 repo HEAD/dirty 状态、perftest/admin binary SHA-256、
@@ -44,12 +57,12 @@ python3 b7.py discover
 device/EID 下重新归档 RM/RTP 的 server/client 命令、stdout/stderr、退出码，并至少覆盖小消息和
 64 KiB。只有跨节点结果通过后，才把 inventory 状态改成 `passed`。
 
-当状态不是 `passed` 时，dual-node `run --execute` 会拒绝执行。若目的就是诊断 Dragonfly 与 perftest
-为何表现不同，可以显式越过门禁；这种结果必须标记为 diagnostic，不能登记为 RM PASS：
+所选 profile 状态不是 `passed` 时，dual-node `run --execute` 会拒绝执行。若目的就是诊断，可以显式
+越过门禁；这种结果必须标记为 diagnostic，不能登记为 PASS：
 
 ```bash
 python3 b7.py run --manifest results/<run-id>/manifest.json \
-  --allow-unvalidated-rm --execute
+  --allow-unvalidated-urma --execute
 ```
 
 single-node run 不受 cross-node 门禁影响，但其成功不能替代跨节点 provider 验证。
@@ -59,6 +72,7 @@ single-node run 不受 cross-node 门禁影响，但其成功不能替代跨节�
 ```powershell
 cd D:\Deveploment\Workplace\docs\engineering-lab\dragonfly-urma-adaptation\tools\urma-b7
 python .\b7.py plan --mode dual --run-id b7-dryrun
+python .\b7.py plan --profile rc --mode dual --run-id b7-rc-dryrun
 python .\b7.py plan --mode single --host node1 --run-id b7-single-dryrun
 python .\b7.py discover
 python -m unittest -v .\test_b7.py
@@ -72,7 +86,7 @@ python -m unittest -v .\test_b7.py
 下列命令不带 `--execute` 时都只是 dry-run：
 
 ```powershell
-python .\b7.py prepare --mode dual --run-id b7-smoke-001
+python .\b7.py prepare --profile rm --mode dual --run-id b7-smoke-001
 python .\b7.py run --manifest .\results\b7-smoke-001\manifest.json
 python .\b7.py cleanup --manifest .\results\b7-smoke-001\manifest.json
 ```
@@ -80,7 +94,7 @@ python .\b7.py cleanup --manifest .\results\b7-smoke-001\manifest.json
 确认 manifest、节点、端口和删除目标后，才逐步执行：
 
 ```powershell
-python .\b7.py prepare --mode dual --run-id b7-smoke-001 --execute
+python .\b7.py prepare --profile rm --mode dual --run-id b7-smoke-001 --execute
 python .\b7.py run --manifest .\results\b7-smoke-001\manifest.json --execute
 python .\b7.py cleanup --manifest .\results\b7-smoke-001\manifest.json --execute
 ```

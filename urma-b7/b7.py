@@ -94,18 +94,18 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
             "host",
             "user",
             "workspaceRoot",
-            "repo",
+            "rmRepo",
             "rcRepo",
             "toolsRepo",
             "config",
         ):
             if not isinstance(node.get(key), str) or not node[key]:
                 raise B7Error(f"node {name} requires non-empty {key}")
-        if PurePosixPath(node["repo"]).name != "dragonfly-client-urma-rm":
+        if PurePosixPath(node["rmRepo"]).name != "dragonfly-client-urma-rm":
             raise B7Error(f"node {name} RM repo must be dragonfly-client-urma-rm")
         if PurePosixPath(node["rcRepo"]).name != "dragonfly-client-urma-private":
             raise B7Error(f"node {name} RC baseline repo must be dragonfly-client-urma-private")
-        if node["repo"] == node["rcRepo"]:
+        if node["rmRepo"] == node["rcRepo"]:
             raise B7Error(f"node {name} RM and RC repos must be distinct")
     urma = inventory.get("urma")
     if not isinstance(urma, dict):
@@ -122,7 +122,7 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
             raise B7Error(
                 f"inventory URMA profile {profile_name} must use transportMode={profile_name}"
             )
-        if profile.get("repoField") not in ("repo", "rcRepo"):
+        if profile.get("repoField") not in ("rmRepo", "rcRepo"):
             raise B7Error(f"inventory URMA profile {profile_name} has invalid repoField")
         if not isinstance(profile.get("expectedBranch"), str) or not profile["expectedBranch"]:
             raise B7Error(f"inventory URMA profile {profile_name} requires expectedBranch")
@@ -243,7 +243,7 @@ one_line() {{ "$@" 2>&1 | tr '\\n' ' ' | tr '\\t' ' '; }}
 file_hash() {{ if [ -f "$1" ]; then sha256sum "$1" | awk '{{print $1}}'; else printf missing; fi; }}
 config_keys() {{
   if [ -f "$1" ]; then
-    grep -E '^[[:space:]]*(ip|port|host|manager|scheduler|advertiseIP|listenIP|listenPort|tcpPort|quicPort|socketPath|dir|device|eidIndex|fabricTag|transportMode|peerGuaranteedRxCredits|maxInflightChunks|maxConcurrentTransfers|transferTimeout|mmapContent|protocol|concurrentPieceCount):' "$1" 2>/dev/null | base64 | tr -d '\\n'
+    grep -E '^[[:space:]]*(ip|port|host|manager|scheduler|advertiseIP|listenIP|listenPort|tcpPort|quicPort|socketPath|dir|device|eidIndex|fabricTag|transportMode|tpType|peerGuaranteedRxCredits|maxInflightChunks|maxConcurrentTransfers|transferTimeout|mmapContent|protocol|concurrentPieceCount):' "$1" 2>/dev/null | base64 | tr -d '\\n'
   else
     printf missing
   fi
@@ -2761,6 +2761,7 @@ def role_overlays(
         ("stats", "server", "port"): ports["stats"],
     }
     if inventory["urma"]["transportMode"] == "rm":
+        overlays[("storage", "server", "urma", "tpType")] = inventory["urma"]["tpType"]
         overlays[("storage", "server", "urma", "peerGuaranteedRxCredits")] = case.get(
             "peerGuaranteedRxCredits", inventory["urma"].get("peerGuaranteedRxCredits", 0)
         )

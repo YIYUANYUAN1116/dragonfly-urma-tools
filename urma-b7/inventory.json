@@ -11,7 +11,7 @@
       "user": "root",
       "roles": ["scheduler", "origin", "parent"],
       "workspaceRoot": "/home/y30083740/dragonfly",
-      "repo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
+      "rmRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
       "rcRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
       "toolsRepo": "/home/y30083740/dragonfly/dragonfly-urma-tools",
       "config": "/home/y30083740/dragonfly/config/dfdaemon-parent.yaml",
@@ -22,7 +22,7 @@
       "user": "root",
       "roles": ["child"],
       "workspaceRoot": "/home/y30083740/dragonfly",
-      "repo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
+      "rmRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
       "rcRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
       "toolsRepo": "/home/y30083740/dragonfly/dragonfly-urma-tools",
       "config": "/home/y30083740/dragonfly/config/dfdaemon-child.yaml"
@@ -35,16 +35,16 @@
     "defaultProfile": "rm",
     "profiles": {
       "rm": {
-        "repoField": "repo",
+        "repoField": "rmRepo",
         "expectedBranch": "urma-rm-prototype",
         "transportMode": "rm",
-        "tpType": "rtp",
+        "tpType": "ctp",
         "requiredMaxMessageBytes": 65536,
         "peerGuaranteedRxCredits": 0,
         "nativeResourceModel": "process-wide-shared-endpoint-with-peer-targets",
         "crossNodeProbe": {
           "status": "failed-unarchived",
-          "note": "User observed single-node RM success and cross-node RM failure; exact commands, output and resource snapshots still need to be archived."
+          "note": "Partial 2026-09-07 evidence: single-node RM+CTP perftest succeeds; cross-node RM+CTP send_bw reports CR status 4 (LOC_ACCESS in the current UMDK enum); Dragonfly single-node RM fails at import_jetty and falls back to TCP. Full two-sided commands, raw logs and resource snapshots still need archiving."
         }
       },
       "rc": {

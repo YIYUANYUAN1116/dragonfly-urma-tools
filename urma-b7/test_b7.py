@@ -32,11 +32,12 @@ class B7Tests(unittest.TestCase):
         b7.validate_inventory(self.inventory)
         for node in self.inventory["nodes"].values():
             self.assertTrue(node["repo"].endswith("/dragonfly-client-urma-rm"))
+            self.assertTrue(node["rmRepo"].endswith("/dragonfly-client-urma-rm"))
             self.assertTrue(node["rcRepo"].endswith("/dragonfly-client-urma-private"))
             self.assertNotEqual(node["repo"], node["rcRepo"])
         metadata = b7.urma_validation_metadata(self.inventory, "dual")
         self.assertEqual(metadata["transportMode"], "rm")
-        self.assertEqual(metadata["tpType"], "rtp")
+        self.assertEqual(metadata["tpType"], "ctp")
         self.assertEqual(metadata["requiredMaxMessageBytes"], 65536)
         self.assertTrue(metadata["crossNodeGateRequired"])
         self.assertEqual(
@@ -72,6 +73,7 @@ class B7Tests(unittest.TestCase):
         rm = b7.select_profile(self.inventory, "rm")
         self.assertEqual(rm["selectedProfile"], "rm")
         self.assertEqual(rm["urma"]["transportMode"], "rm")
+        self.assertEqual(rm["urma"]["tpType"], "ctp")
         self.assertEqual(rm["urma"]["expectedBranch"], "urma-rm-prototype")
         for node in rm["nodes"].values():
             self.assertTrue(node["repo"].endswith("/dragonfly-client-urma-rm"))
@@ -88,6 +90,25 @@ class B7Tests(unittest.TestCase):
         self.assertNotEqual(
             rm["nodes"]["node1"]["repo"], rc["nodes"]["node1"]["repo"]
         )
+        # Selecting again from an already materialized profile must still use
+        # the immutable RM checkout, not the selected RC repo alias.
+        rm_again = b7.select_profile(rc, "rm")
+        self.assertEqual(
+            rm_again["nodes"]["node1"]["repo"], rm["nodes"]["node1"]["repo"]
+        )
+
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        _, _, generated = b7.generated_layout(rc, "single", "rc-profile", "node1")
+        overlays = b7.role_overlays(
+            rc, generated["parent"], "parent", "rc-profile", cases["smoke-post1-pipe1"]
+        )
+        self.assertEqual(
+            overlays[("storage", "server", "urma", "transportMode")], "rc"
+        )
+        self.assertNotIn(
+            ("storage", "server", "urma", "peerGuaranteedRxCredits"), overlays
+        )
+        self.assertNotIn(("storage", "server", "urma", "tpType"), overlays)
 
     def test_select_profile_rc_metadata_freezes_both_probes(self):
         rc = b7.select_profile(self.inventory, "rc")
@@ -465,6 +486,7 @@ storage:
         self.assertIn("postListSize: 1", rendered)
         self.assertIn("pipelineDepth: 1", rendered)
         self.assertIn('transportMode: "rm"', rendered)
+        self.assertIn('tpType: "ctp"', rendered)
         self.assertIn("peerGuaranteedRxCredits: 0", rendered)
         self.assertIn("metrics:\n  server:\n    port: 44002", rendered)
         self.assertIn("enable: true", rendered)
