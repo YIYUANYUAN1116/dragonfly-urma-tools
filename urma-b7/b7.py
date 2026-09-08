@@ -64,6 +64,7 @@ SAFE_REMOTE_ROOTS = (
     PurePosixPath("/var/lib/dragonfly-b7"),
     PurePosixPath("/dev/shm/dragonfly-b7"),
     PurePosixPath("/mnt/nvme/dragonfly-b7"),
+    PurePosixPath("/mnt/nvme/origin"),
     PurePosixPath("/var/www/dragonfly"),
 )
 
