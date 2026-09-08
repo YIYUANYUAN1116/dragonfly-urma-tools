@@ -78,7 +78,7 @@ python .\b7.py discover
 python -m unittest -v .\test_b7.py
 ```
 
-`discover` 默认连接 `root@90.91.177.158` 和 `root@90.91.177.157`。结果写入被 gitignore 的
+`discover` 默认连接 `root@90.91.195.135` 和 `root@90.91.195.136`。结果写入被 gitignore 的
 `results/`。配置文件只采集相关非敏感键与 SHA-256，不复制完整 YAML。
 
 ## Prepare/run/cleanup

@@ -65,7 +65,7 @@
   },
   "origin": {
     "node": "node1",
-    "baseUrl": "http://90.91.177.158:8080",
+    "baseUrl": "http://90.91.195.135:8080",
     "directory": "/var/www/dragonfly",
     "seedFiles": {"1g": "input-1g.bin"}
   },
