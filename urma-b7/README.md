@@ -21,6 +21,10 @@ B7 同时支持两个显式 URMA profile，但两套 Dragonfly 代码不混编�
 - `--profile rc`：`dragonfly-client-urma-private` / `urma-main`，生成 `transportMode: rc`，不写入 RM-only
   的 per-peer guarantee，资源模型是 per-peer RC Jetty/JFR lane。
 
+TCP case 不需要机器安装 URMA/UMDK，也不要求 release binary 使用 URMA feature：两端生成配置都会关闭
+`storage.server.urma.enable`，`run` 也会跳过 URMA provider preflight。`prepare --profile` 对 TCP 仍用于
+选择待测 Dragonfly checkout；与既有 12.6 节 RC 结果对齐时必须显式使用 `--profile rc`。
+
 manifest 固化 profile、transport、TP 类型、所需最大消息和两个 profile 各自的 cross-node probe 状态；
 后续 `run/cleanup` 从 manifest 恢复同一个 repo，不能在 prepare 后切换 profile。RM 文档和结果中的
 `lane_id` 仅是尚未改名的 session facade 标识，不代表 RM 中存在每 Peer 独占 Jetty/JFR。
@@ -57,8 +61,9 @@ python3 b7.py discover --profile rc
 device/EID 下重新归档 RM/RTP 的 server/client 命令、stdout/stderr、退出码，并至少覆盖小消息和
 64 KiB。只有跨节点结果通过后，才把 inventory 状态改成 `passed`。
 
-所选 profile 状态不是 `passed` 时，dual-node `run --execute` 会拒绝执行。若目的就是诊断，可以显式
-越过门禁；这种结果必须标记为 diagnostic，不能登记为 PASS：
+URMA case 所选 profile 状态不是 `passed` 时，dual-node `run --execute` 会拒绝执行。TCP case 不读取该
+门禁。若目的就是诊断未通过门禁的 URMA，可以显式越过；这种结果必须标记为 diagnostic，不能登记为
+PASS：
 
 ```bash
 python3 b7.py run --manifest results/<run-id>/manifest.json \
@@ -153,10 +158,29 @@ child 启动前完成全部唯一 task 的 parent preheat，再启动 child 并�
 
 ### 单任务 Piece concurrency TCP/URMA 对照
 
-`tcp-piece-cc{1,2,4,8,16,32}-post1-pipe2` 与
-`urma-piece-cc{1,2,4,8,16,32}-post1-pipe2` 固定一个 `dfget`、1 GiB 文件、2 次 warmup、3 次
-measured task，只改变 `download.concurrentPieceCount`。manifest 中的 task `concurrency` 因此始终为 1；
-case 名称里的 `cc` 表示单 task 内的 Piece concurrency，不是并发 `dfget` 数量。
+`tcp-piece-cc{1,2,4,8,16,32}-post1-pipe2` 固定一个 `dfget`、1 GiB 文件、16 MiB Piece、1 次 warmup、
+3 次 measured task，只改变 `download.concurrentPieceCount`，用于对齐设计台账 12.6 的 `pwritev` 后
+URMA 曲线。manifest 中的 task `concurrency` 始终为 1；case 名称里的 `cc` 表示单 task 内的 Piece
+concurrency，不是并发 `dfget` 数量。`post1-pipe2-in16` 是保留的 URMA 对照标签，对 TCP 数据路径没有
+调参意义。
+
+无 URMA 环境运行 TCP CC 曲线时，使用保存 12.6 对照代码的 RC checkout；无需执行 `discover` 或添加
+`--allow-unvalidated-urma`：
+
+```bash
+python3 b7.py prepare --profile rc --mode dual \
+  --run-id tcp-piece16-cc1-pwritev-001 \
+  --case tcp-piece-cc1-post1-pipe2 --execute
+python3 b7.py run \
+  --manifest results/tcp-piece16-cc1-pwritev-001/manifest.json --execute
+python3 b7.py cleanup \
+  --manifest results/tcp-piece16-cc1-pwritev-001/manifest.json --execute
+```
+
+CC2/4/8/16/32 分别替换 case 和 run ID，每轮完成后立即 cleanup，避免遗留文件影响后续样本。
+
+旧的 `urma-piece-cc{1,2,4,8,16,32}-post1-pipe2` case 使用默认 Piece 大小和 2 次 warmup；12.6 的
+16 MiB URMA 数据来自 `urma-piece-16mib-cc{1,2,4,8,16,32}-post1-pipe2`，不要混用两组名称。
 
 URMA 对照示例：
 

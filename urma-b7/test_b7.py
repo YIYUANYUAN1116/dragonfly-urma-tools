@@ -69,6 +69,19 @@ class B7Tests(unittest.TestCase):
         manifest["urmaValidation"]["crossNodeProbe"]["status"] = "failed"
         b7.require_urma_preflight(manifest, False)
 
+    def test_tcp_execution_does_not_require_urma_preflight(self):
+        manifest = {
+            "profile": "rm",
+            "mode": "dual",
+            "case": {"protocol": "tcp"},
+            "urmaValidation": {
+                "profile": "rm",
+                "transportMode": "rm",
+                "crossNodeProbe": {"status": "failed-unarchived"},
+            },
+        }
+        b7.require_urma_preflight(manifest, False)
+
     def test_select_profile_switches_repo_branch_and_transport(self):
         rm = b7.select_profile(self.inventory, "rm")
         self.assertEqual(rm["selectedProfile"], "rm")
@@ -1413,11 +1426,53 @@ storage:
             self.inventory, generated["parent"], "parent", "b7-test", dict(base_case, protocol="tcp")
         )
         self.assertEqual(tcp_overlay[("download", "protocol")], "tcp")
+        self.assertFalse(tcp_overlay[("storage", "server", "urma", "enable")])
+        self.assertFalse(tcp_overlay[("storage", "server", "urma", "mmapContent")])
+        tcp_child_overlay = b7.role_overlays(
+            self.inventory,
+            generated["child"],
+            "child",
+            "b7-test",
+            dict(base_case, protocol="tcp"),
+        )
+        self.assertFalse(
+            tcp_child_overlay[("storage", "server", "urma", "enable")]
+        )
         piece_overlay = b7.role_overlays(
             self.inventory, generated["parent"], "parent", "b7-test",
             dict(base_case, concurrentPieceCount=32),
         )
         self.assertEqual(piece_overlay[("download", "concurrentPieceCount")], 32)
+
+    def test_tcp_piece_cc_sweep_matches_post_pwritev_urma_curve(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        names = {
+            cc: f"tcp-piece-cc{cc}-post1-pipe2"
+            for cc in (1, 2, 4, 8, 16, 32)
+        }
+        ignored = {"name", "concurrentPieceCount"}
+        baseline = {
+            key: value
+            for key, value in cases[names[1]].items()
+            if key not in ignored
+        }
+        for cc, name in names.items():
+            case = cases[name]
+            self.assertEqual(case["protocol"], "tcp")
+            self.assertEqual(case["fileClass"], "1g")
+            self.assertEqual(case["pieceLength"], "16mib")
+            self.assertEqual(case["concurrentPieceCount"], cc)
+            self.assertEqual(case["warmups"], 1)
+            self.assertEqual(case["repetitions"], 3)
+            self.assertEqual(case.get("concurrency", 1), 1)
+            self.assertEqual(
+                {
+                    key: value
+                    for key, value in case.items()
+                    if key not in ignored
+                },
+                baseline,
+            )
 
     def test_task_timing_supports_tcp_protocol_marker(self):
         urma_line = (

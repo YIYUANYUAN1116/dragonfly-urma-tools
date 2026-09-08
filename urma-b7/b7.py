@@ -2726,15 +2726,17 @@ def role_overlays(
     # to the parent client, so each child must run its own URMA server on its
     # offset port range.
     topology = case.get("topology", "queue")
-    is_urma_server = (topology == "fanin" and not is_parent) or (
-        topology != "fanin" and is_parent
+    protocol = case.get("protocol", "urma")
+    is_urma_server = protocol == "urma" and (
+        (topology == "fanin" and not is_parent)
+        or (topology != "fanin" and is_parent)
     )
     overlays = {
         ("host", "hostname"): f"{run_id}-{role}",
         ("host", "ip"): node["host"],
         ("server", "cacheDir"): layout["cache"],
         ("download", "server", "socketPath"): layout["socket"],
-        ("download", "protocol"): case.get("protocol", "urma"),
+        ("download", "protocol"): protocol,
         ("upload", "server", "port"): ports["upload"],
         ("storage", "dir"): layout["storage"],
         ("storage", "server", "ip"): node["host"],
