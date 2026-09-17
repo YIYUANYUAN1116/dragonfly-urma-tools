@@ -39,7 +39,7 @@
         "expectedBranch": "urma-rm-prototype",
         "transportMode": "rm",
         "tpType": "ctp",
-        "requiredMaxMessageBytes": 65536,
+        "requiredMaxMessageBytes": 4096,
         "peerGuaranteedRxCredits": 0,
         "nativeResourceModel": "process-wide-shared-endpoint-with-peer-targets",
         "crossNodeProbe": {
