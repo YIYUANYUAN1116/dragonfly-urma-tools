@@ -38,8 +38,8 @@
         "repoField": "rmRepo",
         "expectedBranch": "urma-rm-prototype",
         "transportMode": "rm",
-        "tpType": "ctp",
-        "requiredMaxMessageBytes": 4096,
+        "tpType": "rtp",
+        "requiredMaxMessageBytes": 65536,
         "peerGuaranteedRxCredits": 0,
         "nativeResourceModel": "process-wide-shared-endpoint-with-peer-targets",
         "crossNodeProbe": {
