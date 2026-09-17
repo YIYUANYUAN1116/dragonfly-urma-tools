@@ -2869,9 +2869,10 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
             raise B7Error(
                 f"case {case['name']} performance profile requires protocol urma"
             )
-        if performance_profile is not None and topology != "fanout":
+        if performance_profile is not None and topology not in ("fanout", "queue"):
             raise B7Error(
-                f"case {case['name']} performance profile requires fanout topology"
+                f"case {case['name']} performance profile requires fanout or queue "
+                "topology"
             )
         piece_length = case.get("pieceLength")
         if piece_length is not None:
@@ -3010,7 +3011,13 @@ def role_overlays(
         ("storage", "server", "urma", "maxInflightChunks"): case["maxInflightChunks"],
         ("storage", "server", "urma", "postListSize"): case["postListSize"],
         ("storage", "server", "urma", "pipelineDepth"): case["pipelineDepth"],
-        ("storage", "server", "urma", "maxConcurrentTransfers"): case.get("maxConcurrentTransfers", 16),
+        # URMA lane transfer admission capacity must cover the case's piece
+        # concurrency; a smaller value makes the parent reject pieces with
+        # "URMA lane transfer admission is full" and children fall back to TCP.
+        ("storage", "server", "urma", "maxConcurrentTransfers"): case.get(
+            "maxConcurrentTransfers",
+            max(16, case.get("concurrentPieceCount", 8)),
+        ),
         ("storage", "server", "urma", "transferTimeout"): case.get("transferTimeout", "30s"),
         ("storage", "server", "urma", "mmapContent"): is_urma_server,
         ("download", "concurrentPieceCount"): case.get("concurrentPieceCount", 8),
@@ -4225,6 +4232,11 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "transfer": {
             "topology": topology,
             "concurrency": concurrency,
+            "integrityMode": (
+                "transport-lifecycle-only"
+                if case.get("urmaPerformanceProfile") == "transport-only"
+                else "sha256"
+            ),
             "warmups": [],
             "samples": [],
             "batches": {"warmups": [], "samples": []},
@@ -4360,6 +4372,25 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 child_transfer["taskTiming"] = analyze_task_timing(
                     child_transfer, task_log, expected_task_id, protocol
                 )
+                if case.get("urmaPerformanceProfile") == "transport-only":
+                    completed_pieces = filter_task_scoped_log(
+                        task_log, {expected_task_id}
+                    ).count("finished URMA transport-only validation Piece")
+                    piece_bytes = parse_piece_length_bytes(piece_length or "")
+                    if piece_bytes is None:
+                        raise B7Error(
+                            "transport-only profile requires an explicit valid pieceLength"
+                        )
+                    expected_pieces = (
+                        int(parent_transfer["bytes"]) + piece_bytes - 1
+                    ) // piece_bytes
+                    child_transfer["transportOnlyCompletedPieces"] = completed_pieces
+                    child_transfer["transportOnlyExpectedPieces"] = expected_pieces
+                    if completed_pieces != expected_pieces:
+                        raise B7Error(
+                            f"{batch_suffix}/{task_tag}: transport-only profile "
+                            f"completion count {completed_pieces} != {expected_pieces}"
+                        )
                 validate_transfer_identity(
                     case,
                     manifest["remote"]["origin"]["sha256"],

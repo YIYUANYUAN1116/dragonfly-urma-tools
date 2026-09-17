@@ -37,7 +37,7 @@ class B7Tests(unittest.TestCase):
             self.assertNotEqual(node["repo"], node["rcRepo"])
         metadata = b7.urma_validation_metadata(self.inventory, "dual")
         self.assertEqual(metadata["transportMode"], "rm")
-        self.assertEqual(metadata["tpType"], "ctp")
+        self.assertEqual(metadata["tpType"], "rtp")
         self.assertEqual(metadata["requiredMaxMessageBytes"], 65536)
         self.assertTrue(metadata["crossNodeGateRequired"])
         self.assertEqual(
@@ -99,7 +99,7 @@ class B7Tests(unittest.TestCase):
         rm = b7.select_profile(self.inventory, "rm")
         self.assertEqual(rm["selectedProfile"], "rm")
         self.assertEqual(rm["urma"]["transportMode"], "rm")
-        self.assertEqual(rm["urma"]["tpType"], "ctp")
+        self.assertEqual(rm["urma"]["tpType"], "rtp")
         self.assertEqual(rm["urma"]["expectedBranch"], "urma-rm-prototype")
         for node in rm["nodes"].values():
             self.assertTrue(node["repo"].endswith("/dragonfly-client-urma-rm"))
@@ -356,6 +356,37 @@ class B7Tests(unittest.TestCase):
                 {"sha256": "intentionally-not-content", "bytes": 1024},
                 "test",
             )
+
+    def test_single_lane_layer_cases_pair(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        transport = cases["urma-piece16-cc16-post1-pipe2-transport-only-tmpfs"]
+        storage = cases["urma-piece16-cc16-post1-pipe2-crc32-pwrite-tmpfs"]
+        ignored = {"name", "category", "urmaPerformanceProfile"}
+        self.assertEqual(
+            {key: value for key, value in transport.items() if key not in ignored},
+            {key: value for key, value in storage.items() if key not in ignored},
+        )
+        self.assertEqual(transport["urmaPerformanceProfile"], "transport-only")
+        self.assertNotIn("urmaPerformanceProfile", storage)
+        self.assertEqual(transport.get("topology", "queue"), "queue")
+        self.assertEqual(transport["concurrentPieceCount"], 16)
+        self.assertEqual(transport["maxConcurrentTransfers"], 16)
+        self.assertEqual(transport["storageClass"], "tmpfs")
+        self.assertEqual(transport["warmups"], 0)
+        self.assertEqual(transport["repetitions"], 3)
+        _, _, generated = b7.generated_layout(
+            self.inventory,
+            "dual",
+            "b7-single-lane-tmpfs",
+            None,
+            child_count=1,
+            storage_class="tmpfs",
+            urma_performance_profile="transport-only",
+        )
+        self.assertEqual(set(generated), {"parent", "child"})
+        for layout in generated.values():
+            self.assertEqual(layout["storageClass"], "tmpfs")
+            self.assertEqual(layout["urmaPerformanceProfile"], "transport-only")
 
     def test_fanout_budget_comparison_cases_preserve_rx_budget(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
@@ -632,7 +663,7 @@ storage:
         self.assertIn("postListSize: 1", rendered)
         self.assertIn("pipelineDepth: 1", rendered)
         self.assertIn('transportMode: "rm"', rendered)
-        self.assertIn('tpType: "ctp"', rendered)
+        self.assertIn('tpType: "rtp"', rendered)
         self.assertIn("peerGuaranteedRxCredits: 0", rendered)
         self.assertIn("metrics:\n  server:\n    port: 44002", rendered)
         self.assertIn("enable: true", rendered)
