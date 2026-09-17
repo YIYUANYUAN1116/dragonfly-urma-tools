@@ -10,6 +10,7 @@ import argparse
 import base64
 import binascii
 import calendar
+import concurrent.futures
 import copy
 import datetime as dt
 import hashlib
@@ -229,6 +230,28 @@ def default_run_id() -> str:
     return "b7-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ").lower()
 
 
+URMA_CR_STATUS_NAMES = {
+    0: "URMA_SUCCESS",
+    1: "URMA_CR_UNSUPPORTED_OPCODE_ERR",
+    2: "URMA_CR_LOC_LEN_ERR",
+    3: "URMA_CR_LOC_OPERATION_ERR",
+    4: "URMA_CR_LOC_ACCESS_ERR",
+    5: "URMA_CR_REM_RESP_LEN_ERR",
+    6: "URMA_CR_REM_UNSUPPORTED_REQ_ERR",
+    7: "URMA_CR_REM_OPERATION_ERR",
+    8: "URMA_CR_REM_ACCESS_ABORT_ERR",
+    9: "URMA_CR_ACK_TIMEOUT_ERR",
+    10: "URMA_CR_RNR_RETRY_CNT_EXC_ERR",
+    11: "URMA_CR_WR_FLUSH_ERR",
+    12: "URMA_CR_WR_SUSPEND_DONE",
+    13: "URMA_CR_WR_FLUSH_ERR_DONE",
+    14: "URMA_CR_WR_UNHANDLED",
+    15: "URMA_CR_LOC_DATA_POISON",
+    16: "URMA_CR_REM_DATA_POISON",
+}
+PERFTEST_CR_STATUS_RE = re.compile(r"Failed CR status\s+(\d+)")
+
+
 def ssh_target(node: dict[str, Any]) -> str:
     return f"{node['user']}@{node['host']}"
 
@@ -381,6 +404,209 @@ def ssh_script(
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise B7Error(f"SSH command failed for {ssh_target(node)}: {error}") from error
+
+
+def provider_probe_tp_types(profile: str, requested: str | None) -> list[str]:
+    if profile == "rc":
+        if requested not in (None, "rtp"):
+            raise B7Error("RC provider probes support only --tp-type rtp")
+        return ["rtp"]
+    if profile != "rm":
+        raise B7Error(f"unsupported provider probe profile {profile!r}")
+    if requested in (None, "both"):
+        return ["rtp", "ctp"]
+    if requested not in ("rtp", "ctp"):
+        raise B7Error(f"unsupported provider probe TP type {requested!r}")
+    return [requested]
+
+
+def provider_probe_argv(
+    inventory: dict[str, Any],
+    profile: str,
+    tp_type: str,
+    size: int,
+    iterations: int,
+    server_address: str | None = None,
+    priority: int | None = None,
+) -> list[str]:
+    if tp_type not in provider_probe_tp_types(profile, tp_type):
+        raise B7Error(f"invalid {profile.upper()} provider probe TP type {tp_type}")
+    maximum = 4096 if tp_type == "ctp" else 65536
+    if size <= 0 or size > maximum:
+        raise B7Error(f"{tp_type.upper()} provider probe size must be in 1..={maximum}")
+    if iterations < 5 or iterations > 1_000_000:
+        raise B7Error("provider probe iterations must be in 5..=1000000")
+    if priority is not None and not 0 <= priority <= 15:
+        raise B7Error("provider probe priority must be in 0..=15")
+    argv = [
+        "urma_perftest", "send_bw", "-d", str(inventory["urma"]["device"]),
+        "--eid_idx", str(inventory["urma"]["eidIndex"]), "--tp_aware",
+    ]
+    if tp_type == "ctp":
+        argv.append("--ctp")
+    argv.extend([
+        "-p", "0" if profile == "rm" else "1", "-j", "true",
+        "-n", str(iterations), "-s", str(size),
+    ])
+    # -O selects a service priority, not an operation. When absent the tool can
+    # select a TP-appropriate priority itself.
+    if priority is not None:
+        argv.extend(["-O", str(priority)])
+    if server_address is not None:
+        argv.extend(["-S", server_address])
+    return argv
+
+
+def provider_probe_script(argv: list[str], timeout_seconds: int) -> str:
+    return f"""set -u
+command -v urma_perftest >/dev/null
+export LD_LIBRARY_PATH=${{LD_LIBRARY_PATH:-}}
+exec timeout --signal=TERM --kill-after=5s {timeout_seconds}s {shlex.join(argv)}
+"""
+
+
+def provider_probe_process_result(
+    completed: subprocess.CompletedProcess[str], elapsed_seconds: float
+) -> dict[str, Any]:
+    return {
+        "returnCode": completed.returncode,
+        "timedOut": completed.returncode == 124,
+        "elapsedSeconds": round(elapsed_seconds, 6),
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def classify_provider_probe(
+    server: dict[str, Any], client: dict[str, Any]
+) -> dict[str, Any]:
+    statuses: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for role, result in (("server", server), ("client", client)):
+        output = str(result.get("stdout", "")) + "\n" + str(result.get("stderr", ""))
+        for match in PERFTEST_CR_STATUS_RE.finditer(output):
+            code = int(match.group(1))
+            if code not in seen:
+                statuses.append({
+                    "code": code,
+                    "name": URMA_CR_STATUS_NAMES.get(code, "UNKNOWN"),
+                    "firstSeenOn": role,
+                })
+                seen.add(code)
+    passed = all(result.get("returnCode") == 0 for result in (server, client))
+    return {
+        "status": "passed" if passed else "failed",
+        "completionStatuses": statuses,
+        "timedOut": any(bool(result.get("timedOut")) for result in (server, client)),
+    }
+
+
+def provider_probe_nodes(
+    inventory: dict[str, Any], mode: str, host: str | None,
+    server_node: str | None, client_node: str | None,
+) -> tuple[str, str]:
+    nodes = inventory["nodes"]
+    if mode == "single":
+        selected = host or inventory["singleHost"]["defaultNode"]
+        if selected not in nodes:
+            raise B7Error(f"unknown single-node provider probe host {selected!r}")
+        return selected, selected
+    server = server_node or "node1"
+    client = client_node or "node2"
+    if server not in nodes or client not in nodes:
+        raise B7Error("provider probe server/client node must exist in inventory")
+    if server == client:
+        raise B7Error("dual-node provider probe requires distinct server and client nodes")
+    return server, client
+
+
+def build_provider_probe_plan(
+    args: argparse.Namespace, inventory: dict[str, Any]
+) -> dict[str, Any]:
+    validate_run_id(args.run_id)
+    if not args.server_address.strip():
+        raise B7Error("--server-address must be a non-empty URMA EID address")
+    if not 5 <= args.timeout_seconds <= 600:
+        raise B7Error("provider probe timeout must be in 5..=600 seconds")
+    if not 0 <= args.server_start_delay_seconds <= 10:
+        raise B7Error("provider probe server start delay must be in 0..=10 seconds")
+    profile = inventory["selectedProfile"]
+    tp_types = provider_probe_tp_types(profile, args.tp_type)
+    server_name, client_name = provider_probe_nodes(
+        inventory, args.mode, args.host, args.server_node, args.client_node
+    )
+    cases = []
+    for tp_type in tp_types:
+        server_argv = provider_probe_argv(
+            inventory, profile, tp_type, args.size, args.iterations,
+            priority=args.priority,
+        )
+        client_argv = provider_probe_argv(
+            inventory, profile, tp_type, args.size, args.iterations,
+            server_address=args.server_address, priority=args.priority,
+        )
+        cases.append({
+            "name": f"{profile}-{tp_type}-send-bw",
+            "profile": profile,
+            "tpType": tp_type,
+            "server": {
+                "node": server_name,
+                "target": ssh_target(inventory["nodes"][server_name]),
+                "argv": server_argv,
+                "shell": shlex.join(server_argv),
+            },
+            "client": {
+                "node": client_name,
+                "target": ssh_target(inventory["nodes"][client_name]),
+                "argv": client_argv,
+                "shell": shlex.join(client_argv),
+            },
+        })
+    return {
+        "schemaVersion": 1,
+        "kind": "urma-provider-probe",
+        "runId": args.run_id,
+        "profile": profile,
+        "mode": args.mode,
+        "serverAddress": args.server_address,
+        "device": inventory["urma"]["device"],
+        "eidIndex": inventory["urma"]["eidIndex"],
+        "size": args.size,
+        "iterations": args.iterations,
+        "priority": args.priority,
+        "timeoutSeconds": args.timeout_seconds,
+        "serverStartDelaySeconds": args.server_start_delay_seconds,
+        "state": "planned",
+        "dryRun": not args.execute,
+        "cases": cases,
+    }
+
+
+def execute_provider_probe_case(
+    case: dict[str, Any], inventory: dict[str, Any], timeout_seconds: int,
+    server_start_delay_seconds: float,
+) -> dict[str, Any]:
+    server_node = inventory["nodes"][case["server"]["node"]]
+    client_node = inventory["nodes"][case["client"]["node"]]
+
+    def invoke(node: dict[str, Any], argv: list[str]) -> dict[str, Any]:
+        started = time.monotonic()
+        completed = ssh_script(
+            node, inventory, provider_probe_script(argv, timeout_seconds),
+            timeout=timeout_seconds + 20,
+        )
+        return provider_probe_process_result(completed, time.monotonic() - started)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        server_future = executor.submit(invoke, server_node, case["server"]["argv"])
+        time.sleep(server_start_delay_seconds)
+        client_result = invoke(client_node, case["client"]["argv"])
+        server_result = server_future.result(timeout=timeout_seconds + 25)
+    result = copy.deepcopy(case)
+    result["server"]["result"] = server_result
+    result["client"]["result"] = client_result
+    result["classification"] = classify_provider_probe(server_result, client_result)
+    return result
 
 
 def read_remote_file(node: dict[str, Any], inventory: dict[str, Any], path: str) -> str:
@@ -2904,6 +3130,85 @@ def command_discover(args: argparse.Namespace, inventory: dict[str, Any]) -> int
     return 0 if all(node["status"] == "ok" for node in discovered["nodes"].values()) else 2
 
 
+def command_probe_provider(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
+    evidence = build_provider_probe_plan(args, inventory)
+    output = args.output or TOOL_DIR / "results" / args.run_id / "provider-probe.json"
+    evidence["generatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    evidence["inventorySha256"] = hashlib.sha256(args.inventory.read_bytes()).hexdigest()
+    if output.exists():
+        previous = load_json(output)
+        if previous.get("runId") != args.run_id or previous.get("state") != "planned":
+            raise B7Error(
+                f"refusing to overwrite provider probe evidence in state "
+                f"{previous.get('state')!r}; choose a new run id"
+            )
+        immutable_fields = (
+            "profile", "mode", "serverAddress", "device", "eidIndex", "size",
+            "iterations", "priority", "timeoutSeconds", "serverStartDelaySeconds",
+            "cases",
+        )
+        changed = [
+            field for field in immutable_fields
+            if previous.get(field) != evidence.get(field)
+        ]
+        if changed:
+            raise B7Error(
+                "refusing to reuse a planned provider probe with changed fields "
+                f"{changed}; choose a new run id"
+            )
+    if not args.execute:
+        write_json(output, evidence)
+        print(output)
+        return 0
+
+    evidence["dryRun"] = False
+    evidence["state"] = "running"
+    write_json(output, evidence)
+    involved_nodes = sorted(
+        {
+            role["node"]
+            for case in evidence["cases"]
+            for role in (case["server"], case["client"])
+        }
+    )
+    evidence["environment"] = {
+        name: discover_node(name, inventory["nodes"][name], inventory)
+        for name in involved_nodes
+    }
+    write_json(output, evidence)
+    results = []
+    for case in evidence["cases"]:
+        try:
+            result = execute_provider_probe_case(
+                case,
+                inventory,
+                args.timeout_seconds,
+                args.server_start_delay_seconds,
+            )
+        except (B7Error, concurrent.futures.TimeoutError) as error:
+            result = copy.deepcopy(case)
+            result["classification"] = {
+                "status": "failed",
+                "completionStatuses": [],
+                "timedOut": isinstance(error, concurrent.futures.TimeoutError),
+                "orchestrationError": str(error),
+            }
+        results.append(result)
+        evidence["cases"] = results + evidence["cases"][len(results):]
+        write_json(output, evidence)
+    evidence["cases"] = results
+    evidence["state"] = "completed"
+    evidence["status"] = (
+        "passed"
+        if all(case["classification"]["status"] == "passed" for case in results)
+        else "failed"
+    )
+    evidence["completedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    write_json(output, evidence)
+    print(output)
+    return 0 if evidence["status"] == "passed" else 1
+
+
 def command_plan(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
     plan = build_plan(inventory, args.mode, args.run_id, args.host)
     if args.output:
@@ -4336,6 +4641,41 @@ def parser() -> argparse.ArgumentParser:
     discover.add_argument("--profile", choices=("rc", "rm"), default="rm")
     discover.add_argument("nodes", nargs="*", metavar="NODE")
     discover.add_argument("--output", type=Path, default=TOOL_DIR / "results" / "inventory.discovered.json")
+    probe = subparsers.add_parser(
+        "probe-provider",
+        help="run an isolated urma_perftest provider probe and archive evidence",
+    )
+    probe.add_argument("--profile", choices=("rc", "rm"), default="rm")
+    probe.add_argument("--mode", choices=("dual", "single"), required=True)
+    probe.add_argument("--host", choices=("node1", "node2"))
+    probe.add_argument("--server-node", choices=("node1", "node2"))
+    probe.add_argument("--client-node", choices=("node1", "node2"))
+    probe.add_argument(
+        "--server-address",
+        required=True,
+        help="server URMA EID address passed to urma_perftest -S; never inferred from SSH",
+    )
+    probe.add_argument(
+        "--tp-type",
+        choices=("rtp", "ctp", "both"),
+        help="defaults to both for RM and rtp for RC",
+    )
+    probe.add_argument("--run-id", required=True)
+    probe.add_argument("--size", type=int, default=4096)
+    probe.add_argument("--iterations", type=int, default=1000)
+    probe.add_argument(
+        "--priority",
+        type=int,
+        help="optional urma_perftest -O priority; omitted by default",
+    )
+    probe.add_argument("--timeout-seconds", type=int, default=90)
+    probe.add_argument("--server-start-delay-seconds", type=float, default=1.0)
+    probe.add_argument("--output", type=Path)
+    probe.add_argument(
+        "--execute",
+        action="store_true",
+        help="execute remote perftest processes; omitted means evidence-plan dry-run",
+    )
     plan = subparsers.add_parser("plan", help="generate a non-executing topology plan")
     plan.add_argument("--profile", choices=("rc", "rm"), default="rm")
     plan.add_argument("--mode", choices=("dual", "single"), required=True)
@@ -4402,6 +4742,8 @@ def main(argv: list[str] | None = None) -> int:
         validate_inventory(inventory)
         if args.command == "discover":
             return command_discover(args, select_profile(inventory, args.profile))
+        if args.command == "probe-provider":
+            return command_probe_provider(args, select_profile(inventory, args.profile))
         if args.command == "plan":
             return command_plan(args, select_profile(inventory, args.profile))
         if args.command == "render-config":

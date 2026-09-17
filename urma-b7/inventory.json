@@ -7,7 +7,7 @@
   },
   "nodes": {
     "node1": {
-      "host": "192.168.83.135",
+      "host": "141.61.17.196",
       "user": "root",
       "roles": ["scheduler", "origin", "parent"],
       "workspaceRoot": "/home/y30083740/dragonfly",
@@ -18,7 +18,7 @@
       "schedulerConfig": "/home/y30083740/dragonfly/config/scheduler.yaml"
     },
     "node2": {
-      "host": "192.168.83.136",
+      "host": "141.61.17.198",
       "user": "root",
       "roles": ["child"],
       "workspaceRoot": "/home/y30083740/dragonfly",
@@ -65,7 +65,7 @@
   },
   "origin": {
     "node": "node1",
-    "baseUrl": "http://192.168.83.135:8080",
+    "baseUrl": "http://141.61.17.196:8080",
     "directory": "/var/www/dragonfly",
     "seedFiles": {"1g": "input-1g.bin"}
   },

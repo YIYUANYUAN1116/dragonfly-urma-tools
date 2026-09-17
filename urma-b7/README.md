@@ -6,6 +6,8 @@ UMDK 行为参考，不提供替代数据路径。
 当前提供：
 
 - `discover`：通过 SSH 执行只读环境检查；
+- `probe-provider`：用 `urma_perftest` 执行单/双节点 RC/RM provider 前置探测，归档两端命令、输出、
+  退出码、completion status 和环境快照；默认只生成计划，显式 `--execute` 才通过 SSH 执行；
 - `plan`：生成双机或单机双实例的确定性执行计划，不执行其中的变更操作。
 - `render-config`：从现有 YAML 生成隔离配置，不覆盖源文件；
 - `prepare`：生成 manifest；只有显式 `--execute` 才在远端创建隔离目录、配置和唯一 origin 链接；
@@ -45,9 +47,9 @@ inventory；B7 不会凭空生成 scheduler/manager 地址未知的基础配置�
 RC profile 保留既有 B5/B6/B8 跨节点通过状态，但正式 A/B 前仍应重新归档当前 binary/config hash。
 
 目前收到的局部日志显示：跨节点 RM+CTP `send_bw` 返回 completion status 4（当前 UMDK 枚举中的
-`URMA_CR_LOC_ACCESS_ERR`）；Dragonfly 单节点 RM 则在 Parent `import_jetty=-1` 后回退 TCP。当前 RM
-Dragonfly shim 固定使用 RTP，而已知成功的单节点 perftest 使用 CTP；应先完成同 binary 的 RTP/CTP
-最小矩阵，不能把现有 perftest 结果登记为 RM profile PASS。
+`URMA_CR_LOC_ACCESS_ERR`）；Dragonfly 单节点 RM 则在 Parent `import_jetty=-1` 后回退 TCP。RM 分支现已支持
+`tpType: rtp|ctp` 并在 wire/import 层 fail-closed 校验一致性，但尚无真机结果；应先完成同 binary 的
+RTP/CTP 最小矩阵，不能把离线改造或现有 perftest 结果登记为 RM profile PASS。
 
 先执行只读发现并保存结果：
 
@@ -57,9 +59,30 @@ python3 b7.py discover --profile rc
 ```
 
 `discover` 会额外保存两节点 repo HEAD/dirty 状态、perftest/admin binary SHA-256、
-`urma_admin show --all`、`urma_admin show topo`、IP/route/neighbour 快照和 perftest help。随后在相同
-device/EID 下重新归档 RM/RTP 的 server/client 命令、stdout/stderr、退出码，并至少覆盖小消息和
-64 KiB。只有跨节点结果通过后，才把 inventory 状态改成 `passed`。
+`urma_admin show --all`、`urma_admin show topo`、IP/route/neighbour 快照和 perftest help。provider 最小
+矩阵可先 dry-run 检查，再执行：
+
+```bash
+# RM：默认依次执行 RTP、CTP；双节点默认 node1 server、node2 client。
+python3 b7.py probe-provider --profile rm --mode dual \
+  --server-address 90.91.177.158 --run-id rm-provider-001
+python3 b7.py probe-provider --profile rm --mode dual \
+  --server-address 90.91.177.158 --run-id rm-provider-001 --execute
+
+# 单节点 RM；--server-address 仍必须是该节点的 URMA EID 地址。
+python3 b7.py probe-provider --profile rm --mode single --host node1 \
+  --server-address 90.91.177.158 --run-id rm-loopback-001 --execute
+
+# RC 基线默认只执行 RTP。
+python3 b7.py probe-provider --profile rc --mode dual \
+  --server-address 90.91.177.158 --run-id rc-provider-001 --execute
+```
+
+结果写入 `results/<run-id>/provider-probe.json`。工具始终从 inventory 传入 `--eid_idx`，且不会把 SSH
+管理地址推断为 `-S` 的 URMA EID。`urma_perftest -O` 是 priority，不是 opcode；默认不传，让工具按
+RTP/CTP 选择 priority。只有需要复现实验时才显式传 `--priority 6`。RM 的 CTP 最大探测消息为 4096
+bytes，所以默认矩阵使用 4096；后续 64 KiB 能力应在 RTP 或 Dragonfly 分片路径单独验证。只有跨节点
+结果通过并审阅证据后，才人工把对应 inventory profile 状态改成 `passed`。
 
 URMA case 所选 profile 状态不是 `passed` 时，dual-node `run --execute` 会拒绝执行。TCP case 不读取该
 门禁。若目的就是诊断未通过门禁的 URMA，可以显式越过；这种结果必须标记为 diagnostic，不能登记为
@@ -83,7 +106,7 @@ python .\b7.py discover
 python -m unittest -v .\test_b7.py
 ```
 
-`discover` 默认连接 `root@90.91.195.135` 和 `root@90.91.195.136`。结果写入被 gitignore 的
+`discover` 使用 inventory 当前配置的 SSH 管理地址。结果写入被 gitignore 的
 `results/`。配置文件只采集相关非敏感键与 SHA-256，不复制完整 YAML。
 
 ## Prepare/run/cleanup

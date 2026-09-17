@@ -133,6 +133,124 @@ class B7Tests(unittest.TestCase):
         self.assertEqual(metadata["crossNodeProbes"]["rc"]["status"], "passed")
         self.assertEqual(metadata["crossNodeProbes"]["rm"]["status"], "passed")
 
+    def test_provider_probe_builds_rm_rtp_ctp_matrix_without_forced_priority(self):
+        args = b7.parser().parse_args(
+            [
+                "probe-provider",
+                "--profile", "rm",
+                "--mode", "dual",
+                "--server-address", "90.91.177.158",
+                "--run-id", "provider-probe-test",
+            ]
+        )
+        plan = b7.build_provider_probe_plan(args, self.inventory)
+        self.assertEqual([case["tpType"] for case in plan["cases"]], ["rtp", "ctp"])
+        for case in plan["cases"]:
+            server_argv = case["server"]["argv"]
+            client_argv = case["client"]["argv"]
+            self.assertEqual(server_argv[server_argv.index("--eid_idx") + 1], "1")
+            self.assertNotIn("-O", server_argv)
+            self.assertNotIn("-S", server_argv)
+            self.assertEqual(client_argv[client_argv.index("-S") + 1], "90.91.177.158")
+        self.assertNotIn("--ctp", plan["cases"][0]["server"]["argv"])
+        self.assertIn("--ctp", plan["cases"][1]["server"]["argv"])
+
+    def test_provider_probe_rc_defaults_to_rtp_and_rejects_ctp(self):
+        rc = b7.select_profile(self.inventory, "rc")
+        args = b7.parser().parse_args(
+            [
+                "probe-provider",
+                "--profile", "rc",
+                "--mode", "single",
+                "--host", "node1",
+                "--server-address", "90.91.177.158",
+                "--run-id", "rc-provider-test",
+            ]
+        )
+        plan = b7.build_provider_probe_plan(args, rc)
+        self.assertEqual([case["tpType"] for case in plan["cases"]], ["rtp"])
+        server_argv = plan["cases"][0]["server"]["argv"]
+        self.assertEqual(server_argv[server_argv.index("-p") + 1], "1")
+        args.tp_type = "ctp"
+        with self.assertRaises(b7.B7Error):
+            b7.build_provider_probe_plan(args, rc)
+
+    def test_provider_probe_classifies_completion_status(self):
+        server = {"returnCode": 1, "timedOut": False, "stdout": "", "stderr": ""}
+        client = {
+            "returnCode": 1,
+            "timedOut": False,
+            "stdout": "Failed CR status 4, tot_scnt: 128, tot_ccnt: 0.",
+            "stderr": "",
+        }
+        classified = b7.classify_provider_probe(server, client)
+        self.assertEqual(classified["status"], "failed")
+        self.assertEqual(
+            classified["completionStatuses"],
+            [
+                {
+                    "code": 4,
+                    "name": "URMA_CR_LOC_ACCESS_ERR",
+                    "firstSeenOn": "client",
+                }
+            ],
+        )
+
+    def test_provider_probe_dry_run_writes_plan_without_ssh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "provider.json"
+            with mock.patch.object(b7, "ssh_script") as ssh:
+                status = b7.main(
+                    [
+                        "probe-provider",
+                        "--profile", "rm",
+                        "--mode", "dual",
+                        "--server-address", "90.91.177.158",
+                        "--run-id", "dry-provider-test",
+                        "--output", str(output),
+                    ]
+                )
+            self.assertEqual(status, 0)
+            ssh.assert_not_called()
+            evidence = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(evidence["dryRun"])
+            self.assertEqual(evidence["state"], "planned")
+
+    def test_provider_probe_execute_archives_both_process_results(self):
+        completed = b7.subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout="4096 1000 1 1 1\n", stderr=""
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "provider.json"
+            with (
+                mock.patch.object(
+                    b7, "discover_node", return_value={"status": "ok"}
+                ),
+                mock.patch.object(b7, "ssh_script", return_value=completed) as ssh,
+            ):
+                status = b7.main(
+                    [
+                        "probe-provider",
+                        "--profile", "rm",
+                        "--mode", "dual",
+                        "--server-address", "90.91.177.158",
+                        "--tp-type", "rtp",
+                        "--server-start-delay-seconds", "0",
+                        "--run-id", "execute-provider-test",
+                        "--output", str(output),
+                        "--execute",
+                    ]
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(ssh.call_count, 2)
+            evidence = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(evidence["dryRun"])
+            self.assertEqual(evidence["state"], "completed")
+            self.assertEqual(evidence["status"], "passed")
+            self.assertEqual(
+                evidence["cases"][0]["client"]["result"]["returnCode"], 0
+            )
+
     def test_dual_plan_preheats_before_starting_child(self):
         plan = b7.build_plan(self.inventory, "dual", "b7-test", None)
         names = [step["name"] for step in plan["steps"]]
