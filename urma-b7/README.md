@@ -139,7 +139,7 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 ## 已冻结的安全规则
 
 - 不覆盖服务器现有 YAML；
-- 不清空 `/var/lib/dragonfly`；
+- 不清空 `/var/lib/dragonfly` 或测试外的其他 storage；
 - 不停止非本轮启动的进程；
 - `plan` 永不执行 `mutates=true` 的步骤，其他变更命令必须显式指定 `--execute`；
 - `prepare` 在任何远端变更前先写 `state=preparing` manifest，便于部分失败后按已记录资源恢复；
@@ -152,9 +152,10 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
   `prepare-rolled-back` 状态才允许使用同一 run ID 重新 prepare；
 - start/stop 只接受 `.b7-owner.json` 与 manifest 一致的目录；stop 还会校验 `/proc/<pid>/cmdline`
   中的精确 dfdaemon binary/config，超时只报告错误，不自动 SIGKILL；
-- 后续 cleanup 只能处理 `/tmp/dragonfly-urma-b7/<run-id>`、
-  `/var/lib/dragonfly-b7/<run-id>`、`/dev/shm/dragonfly-b7/<run-id>` 和
-  `/var/www/dragonfly/b7-<run-id>-*`；
+- 后续 cleanup 只能处理 inventory 配置的 B7 run/storage/origin 根目录下、带本轮 owner marker
+  或 run-id 的资源；当前单机默认目录为 `/home/y30083740/dragonfly-b7/run/<run-id>`、
+  `/home/y30083740/dragonfly-b7/storage/<run-id>` 和
+  `/home/y30083740/dragonfly-b7/origin/b7-<run-id>-*`；兼容旧 inventory 的旧目录仍保留在安全根列表中；
 - 显式 `cleanup` 同样逐资源持久化结果；一个资源清理失败时仍会继续尝试其他已记录资源；
 - 对旧版工具留下且 manifest resource record 已丢失的 partial prepare，显式 `cleanup --execute` 会尝试
   安全恢复：role 必须带匹配当前 run 的 owner marker，origin 必须与配置的 seed 是同一 inode 的硬链接；
@@ -166,6 +167,18 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 单机模式在同一节点规划 parent/child 两套 socket、storage 和完整端口组。它首先用于验证配置隔离；
 后续真实执行器会先做 provider loopback smoke。如果同一 device/EID 不支持双进程 RC Jetty，结果应标记
 为 `UNSUPPORTED`，不能冒充真实 URMA E2E PASS。
+
+单机 B7 默认将本轮文件集中在：
+
+```text
+/home/y30083740/dragonfly-b7/origin   # seed 与每轮 hard link；必须由 origin HTTP 服务提供
+/home/y30083740/dragonfly-b7/storage  # parent/child storage 与 output
+/home/y30083740/dragonfly-b7/run      # 配置、socket、pid、daemon/dfget 日志
+```
+
+如果 origin HTTP 服务仍以 `/var/www/dragonfly` 为 document root，需要先把服务切换到新的
+`origin` 目录，或将 inventory 的 `origin.directory` 改回服务实际提供的目录；B7 不会自动修改
+nginx/HTTP 服务配置。
 
 ## Performance case
 
@@ -306,10 +319,11 @@ RX32 MiB，只改变 Child 是否执行 CRC32+pwrite：
 - `fanout-piece16-cc8-post1-in16-l8-tx128-transport-only-tmpfs`；
 - `fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs`。
 
-两者都把 Parent/Child storage 和 dfget output 放到 `/dev/shm/dragonfly-b7/<run-id>`，prepare 会用
-`stat -f` 拒绝并非 tmpfs 的挂载。每个 case 为 3 个 measured batch × 8 lane × 1 GiB，即 24 GiB，
-不执行 warmup；运行前必须分别确认两台机器的 `/dev/shm` 至少还能容纳本轮 storage、output hard link
-及系统余量，每个 run 结束立即执行 manifest-owned cleanup。
+两者都把 Parent/Child storage 和 dfget output 放到 inventory 的
+`singleHost.storageRoot/<run-id>`（当前为 `/home/y30083740/dragonfly-b7/storage/<run-id>`），prepare
+会用 `stat -f` 拒绝并非 tmpfs 的挂载。需要跑这两个 case 时，应先把该 storage root 挂载为 tmpfs，
+并确认它至少还能容纳本轮 storage、output hard link 及系统余量。每个 case 为 3 个 measured batch ×
+8 lane × 1 GiB，即 24 GiB，不执行 warmup；每个 run 结束立即执行 manifest-owned cleanup。
 
 transport-only 是 validation-only profile：仍执行 TCP control、persistent lane、SEND_IMM/CQE、长度、
 Done 和 RX lease recycle，但跳过 Child CRC32 和 pwrite。该 profile 会信任 Parent 提供的 Piece digest，

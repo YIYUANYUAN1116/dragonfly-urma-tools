@@ -67,6 +67,9 @@ SAFE_REMOTE_ROOTS = (
     PurePosixPath("/mnt/nvme/dragonfly-b7"),
     PurePosixPath("/mnt/nvme/origin"),
     PurePosixPath("/var/www/dragonfly"),
+    PurePosixPath("/home/y30083740/dragonfly-b7/origin"),
+    PurePosixPath("/home/y30083740/dragonfly-b7/storage"),
+    PurePosixPath("/home/y30083740/dragonfly-b7/run"),
 )
 
 
@@ -262,6 +265,15 @@ def inspection_script(node: dict[str, Any], inventory: dict[str, Any]) -> str:
     scheduler_config = shlex.quote(node.get("schedulerConfig", "/nonexistent"))
     device = shlex.quote(inventory["urma"]["device"])
     origin_url = shlex.quote(inventory["origin"]["baseUrl"] + "/")
+    disk_paths = " ".join(
+        shlex.quote(path)
+        for path in (
+            "/tmp",
+            inventory["singleHost"]["runRoot"],
+            inventory["singleHost"]["storageRoot"],
+            inventory["origin"]["directory"],
+        )
+    )
     return f"""set -u
 emit() {{ printf '%s\\t%s\\n' "$1" "$2"; }}
 one_line() {{ "$@" 2>&1 | tr '\\n' ' ' | tr '\\t' ' '; }}
@@ -301,7 +313,7 @@ emit urma_perftest_help_b64 "$(urma_perftest --help 2>&1 | base64 | tr -d '\\n')
 emit network_b64 "$({{ ip -details addr show 2>&1; ip route show table all 2>&1; ip neigh show 2>&1; }} | base64 | tr -d '\\n')"
 emit listeners_b64 "$(ss -lntup 2>/dev/null | base64 | tr -d '\\n')"
 emit dragonfly_processes_b64 "$(pgrep -af 'dfdaemon|scheduler' 2>/dev/null | base64 | tr -d '\\n')"
-emit disk_b64 "$(df -h /tmp /var/lib /var/www/dragonfly 2>/dev/null | base64 | tr -d '\\n')"
+emit disk_b64 "$(df -h {disk_paths} 2>/dev/null | base64 | tr -d '\\n')"
 emit origin_head "$(one_line curl -fsSI --max-time 5 {origin_url})"
 """
 
@@ -2570,15 +2582,29 @@ def cleanup_remote_role(
     role: str,
     run_id: str,
 ) -> None:
-    expected_run = f"/tmp/dragonfly-urma-b7/{run_id}/{role}"
-    expected_staging = expected_run + ".b7-preparing"
-    allowed_storage = {
+    storage_class = layout.get("storageClass", "filesystem")
+    expected_layout = role_paths(inventory, run_id, role, storage_class)
+    legacy_run = f"/tmp/dragonfly-urma-b7/{run_id}/{role}"
+    legacy_storage = {
         f"/var/lib/dragonfly-b7/{run_id}/{role}",
         f"/dev/shm/dragonfly-b7/{run_id}/{role}",
     }
-    expected_storage = layout["storage"]
-    if layout["runDir"] != expected_run or expected_storage not in allowed_storage:
+    current_layout = (
+        layout.get("runDir") == expected_layout["runDir"]
+        and layout.get("storage") == expected_layout["storage"]
+        and layout.get("config") == expected_layout["config"]
+    )
+    legacy_layout = (
+        layout.get("runDir") == legacy_run
+        and layout.get("storage") in legacy_storage
+        and layout.get("config")
+        == f"{legacy_run.rsplit('/', 1)[0]}/{role}.yaml"
+    )
+    if not current_layout and not legacy_layout:
         raise B7Error(f"cleanup layout mismatch for {role}")
+    expected_run = layout["runDir"]
+    expected_staging = expected_run + ".b7-preparing"
+    expected_storage = layout["storage"]
     safe_remote_path(PurePosixPath(layout["config"]))
     script = f"""set -eu
 run_dir={shlex.quote(expected_run)}
@@ -2735,7 +2761,10 @@ def role_paths(
     if storage_class == "filesystem":
         storage_base = PurePosixPath(single["storageRoot"])
     elif storage_class == "tmpfs":
-        storage_base = PurePosixPath("/dev/shm/dragonfly-b7")
+        # Keep all B7 artifacts under the inventory-managed storage root.  A
+        # tmpfs case therefore requires that root (or its mounted filesystem)
+        # to actually be tmpfs; prepare_remote_role verifies the mount type.
+        storage_base = PurePosixPath(single["storageRoot"])
     else:
         raise B7Error(f"unsupported storage class {storage_class!r}")
     storage_root = storage_base / run_id / role

@@ -66,7 +66,7 @@
   "origin": {
     "node": "node1",
     "baseUrl": "http://141.61.17.196:8080",
-    "directory": "/var/www/dragonfly",
+    "directory": "/home/y30083740/dragonfly-b7/origin",
     "seedFiles": {"1g": "input-1g.bin"}
   },
   "dragonfly": {
@@ -79,8 +79,8 @@
   },
   "singleHost": {
     "defaultNode": "node1",
-    "runRoot": "/tmp/dragonfly-urma-b7",
-    "storageRoot": "/var/lib/dragonfly-b7",
+    "runRoot": "/home/y30083740/dragonfly-b7/run",
+    "storageRoot": "/home/y30083740/dragonfly-b7/storage",
     "parentPorts": {"upload": 44000, "health": 44001, "metrics": 44002, "proxy": 44003, "tcp": 44005, "quic": 44006, "stats": 44007, "urma": 44008},
     "childPorts": {"upload": 44100, "health": 44101, "metrics": 44102, "proxy": 44103, "tcp": 44105, "quic": 44106, "stats": 44107, "urma": 44108}
   }

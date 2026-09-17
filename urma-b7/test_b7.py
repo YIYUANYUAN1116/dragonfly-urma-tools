@@ -50,6 +50,19 @@ class B7Tests(unittest.TestCase):
         self.assertIn("urma_admin_show_b64", script)
         self.assertIn("urma_admin_topo_b64", script)
         self.assertIn("network_b64", script)
+        self.assertIn("df -h /tmp /home/y30083740/dragonfly-b7/run /home/y30083740/dragonfly-b7/storage /home/y30083740/dragonfly-b7/origin", script)
+        self.assertEqual(
+            self.inventory["origin"]["directory"],
+            "/home/y30083740/dragonfly-b7/origin",
+        )
+        self.assertEqual(
+            self.inventory["singleHost"]["runRoot"],
+            "/home/y30083740/dragonfly-b7/run",
+        )
+        self.assertEqual(
+            self.inventory["singleHost"]["storageRoot"],
+            "/home/y30083740/dragonfly-b7/storage",
+        )
 
     def test_dual_urma_execution_requires_archived_cross_node_probe(self):
         self.inventory["urma"]["crossNodeProbe"]["status"] = "failed-unarchived"
@@ -320,7 +333,9 @@ class B7Tests(unittest.TestCase):
             urma_performance_profile="transport-only",
         )
         for layout in generated.values():
-            self.assertTrue(layout["storage"].startswith("/dev/shm/dragonfly-b7/"))
+            self.assertTrue(
+                layout["storage"].startswith("/home/y30083740/dragonfly-b7/storage/")
+            )
             self.assertEqual(layout["storageClass"], "tmpfs")
             self.assertEqual(layout["urmaPerformanceProfile"], "transport-only")
 
@@ -613,7 +628,7 @@ storage:
             source, self.inventory, generated["parent"], "parent", "b7-test", case
         )
         self.assertIn('hostname: "b7-test-parent"', rendered)
-        self.assertIn('socketPath: "/tmp/dragonfly-urma-b7/b7-test/parent/dfdaemon.sock"', rendered)
+        self.assertIn('socketPath: "/home/y30083740/dragonfly-b7/run/b7-test/parent/dfdaemon.sock"', rendered)
         self.assertIn("postListSize: 1", rendered)
         self.assertIn("pipelineDepth: 1", rendered)
         self.assertIn('transportMode: "rm"', rendered)
@@ -724,7 +739,7 @@ storage:
         script = execute.call_args.args[2]
         self.assertIn("prepare target already exists", script)
         self.assertIn(".b7-preparing", script)
-        self.assertIn("run_parent=/tmp/dragonfly-urma-b7/b7-test", script)
+        self.assertIn("run_parent=/home/y30083740/dragonfly-b7/run/b7-test", script)
         self.assertLess(
             script.index('mkdir -p "$run_parent"'), script.index('mkdir "$staging"')
         )
@@ -735,7 +750,7 @@ storage:
         self.assertIn('ss -H -lun "sport = :$port"', script)
         self.assertIn('ss -H -tan "sport = :$port"', script)
         self.assertIn("port not reusable after previous run", script)
-        self.assertIn("/tmp/dragonfly-urma-b7/b7-test/parent", script)
+        self.assertIn("/home/y30083740/dragonfly-b7/run/b7-test/parent", script)
         self.assertEqual(result["configSha256"], "abc123")
         self.assertEqual(execute.call_args.kwargs["timeout"], 100)
 
@@ -802,7 +817,7 @@ storage:
         self.assertLess(script.index('> "$owner_marker"'), script.index('ln "$seed" "$target"'))
         self.assertEqual(
             result["ownerMarker"],
-            "/var/www/dragonfly/b7-test-1g.bin.b7-owner.json",
+            "/home/y30083740/dragonfly-b7/origin/b7-test-1g.bin.b7-owner.json",
         )
 
     def test_prepare_failure_persists_steps_and_rolls_back_in_reverse(self):
@@ -919,11 +934,11 @@ storage:
         self.assertIn("log_start=$(wc -l", script)
         self.assertEqual(
             result["output"],
-            "/var/lib/dragonfly-b7/b7-test/parent/output.bin.sample-001",
+            "/home/y30083740/dragonfly-b7/storage/b7-test/parent/output.bin.sample-001",
         )
         self.assertEqual(
             result["transferLog"],
-            "/tmp/dragonfly-urma-b7/b7-test/parent/dfget.log.sample-001",
+            "/home/y30083740/dragonfly-b7/run/b7-test/parent/dfget.log.sample-001",
         )
         self.assertEqual(result["daemonLogFirstLine"], 11)
         self.assertEqual(result["daemonLogLastLine"], 20)
@@ -1119,7 +1134,28 @@ storage:
         script = execute.call_args.args[2]
         self.assertIn(".b7-owner.json", script)
         self.assertIn("refusing cleanup while owned pid", script)
-        self.assertIn("/var/lib/dragonfly-b7/b7-test/child", script)
+        self.assertIn("/home/y30083740/dragonfly-b7/storage/b7-test/child", script)
+
+    def test_cleanup_accepts_legacy_layout_for_recovery(self):
+        layout = {
+            "runDir": "/tmp/dragonfly-urma-b7/b7-legacy/parent",
+            "config": "/tmp/dragonfly-urma-b7/b7-legacy/parent.yaml",
+            "pid": "/tmp/dragonfly-urma-b7/b7-legacy/parent/dfdaemon.pid",
+            "storage": "/var/lib/dragonfly-b7/b7-legacy/parent",
+            "storageClass": "filesystem",
+        }
+        completed = b7.subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            b7.cleanup_remote_role(
+                self.inventory["nodes"]["node1"],
+                self.inventory,
+                layout,
+                "parent",
+                "b7-legacy",
+            )
+        script = execute.call_args.args[2]
+        self.assertIn("run_dir=/tmp/dragonfly-urma-b7/b7-legacy/parent", script)
+        self.assertIn("storage=/var/lib/dragonfly-b7/b7-legacy/parent", script)
 
     def test_cleanup_recovers_legacy_prepare_with_empty_remote_record(self):
         with tempfile.TemporaryDirectory() as directory:
