@@ -70,6 +70,7 @@ SAFE_REMOTE_ROOTS = (
     PurePosixPath("/home/y30083740/dragonfly-b7/origin"),
     PurePosixPath("/home/y30083740/dragonfly-b7/storage"),
     PurePosixPath("/home/y30083740/dragonfly-b7/run"),
+    PurePosixPath("/home/y30083740/dragonfly-b7/tmpfs-storage"),
 )
 
 
