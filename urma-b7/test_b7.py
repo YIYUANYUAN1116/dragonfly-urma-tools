@@ -50,7 +50,12 @@ class B7Tests(unittest.TestCase):
         self.assertIn("urma_admin_show_b64", script)
         self.assertIn("urma_admin_topo_b64", script)
         self.assertIn("network_b64", script)
-        self.assertIn("df -h /tmp /home/y30083740/dragonfly-b7/run /home/y30083740/dragonfly-b7/storage /home/y30083740/dragonfly-b7/origin", script)
+        self.assertIn(
+            "df -h /tmp /home/y30083740/dragonfly-b7/run "
+            "/home/y30083740/dragonfly-b7/tmpfs-storage "
+            "/home/y30083740/dragonfly-b7/origin",
+            script,
+        )
         self.assertEqual(
             self.inventory["origin"]["directory"],
             "/home/y30083740/dragonfly-b7/origin",
@@ -61,7 +66,7 @@ class B7Tests(unittest.TestCase):
         )
         self.assertEqual(
             self.inventory["singleHost"]["storageRoot"],
-            "/home/y30083740/dragonfly-b7/storage",
+            "/home/y30083740/dragonfly-b7/tmpfs-storage",
         )
 
     def test_dual_urma_execution_requires_archived_cross_node_probe(self):
@@ -334,7 +339,9 @@ class B7Tests(unittest.TestCase):
         )
         for layout in generated.values():
             self.assertTrue(
-                layout["storage"].startswith("/home/y30083740/dragonfly-b7/storage/")
+                layout["storage"].startswith(
+                    self.inventory["singleHost"]["storageRoot"] + "/"
+                )
             )
             self.assertEqual(layout["storageClass"], "tmpfs")
             self.assertEqual(layout["urmaPerformanceProfile"], "transport-only")
@@ -387,6 +394,48 @@ class B7Tests(unittest.TestCase):
         for layout in generated.values():
             self.assertEqual(layout["storageClass"], "tmpfs")
             self.assertEqual(layout["urmaPerformanceProfile"], "transport-only")
+
+    def test_single_lane_layer_v2_cases_isolate_warmup_and_budget(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        pairs = (
+            (
+                "urma-piece16-cc16-post1-in16-pipe2-tx48-rx48-warm1-transport-only-tmpfs",
+                "urma-piece16-cc16-post1-in16-pipe2-tx48-rx48-warm1-crc32-pwrite-tmpfs",
+                "96MiB",
+                "48MiB",
+            ),
+            (
+                "urma-piece16-cc16-post1-in16-pipe2-tx64-rx96-warm1-transport-only-tmpfs",
+                "urma-piece16-cc16-post1-in16-pipe2-tx64-rx96-warm1-crc32-pwrite-tmpfs",
+                "160MiB",
+                "64MiB",
+            ),
+        )
+        ignored = {"name", "category", "urmaPerformanceProfile"}
+        for transport_name, storage_name, total_budget, tx_budget in pairs:
+            transport = cases[transport_name]
+            storage = cases[storage_name]
+            self.assertEqual(
+                {key: value for key, value in transport.items() if key not in ignored},
+                {key: value for key, value in storage.items() if key not in ignored},
+            )
+            self.assertEqual(transport["urmaPerformanceProfile"], "transport-only")
+            self.assertNotIn("urmaPerformanceProfile", storage)
+            self.assertEqual(transport["warmups"], 1)
+            self.assertEqual(transport["repetitions"], 5)
+            self.assertEqual(transport["maxRegisteredBytes"], total_budget)
+            self.assertEqual(transport["txRegisteredBytes"], tx_budget)
+            self.assertEqual(transport["maxInflightChunks"], 16)
+            self.assertEqual(transport["maxConcurrentTransfers"], 16)
+            self.assertEqual(transport["storageClass"], "tmpfs")
+
+        baseline = cases[pairs[0][0]]
+        roomy = cases[pairs[1][0]]
+        budget_keys = {"name", "category", "maxRegisteredBytes", "txRegisteredBytes"}
+        self.assertEqual(
+            {key: value for key, value in baseline.items() if key not in budget_keys},
+            {key: value for key, value in roomy.items() if key not in budget_keys},
+        )
 
     def test_fanout_budget_comparison_cases_preserve_rx_budget(self):
         cases = b7.load_cases(TOOL_DIR / "cases.json")
@@ -965,7 +1014,7 @@ storage:
         self.assertIn("log_start=$(wc -l", script)
         self.assertEqual(
             result["output"],
-            "/home/y30083740/dragonfly-b7/storage/b7-test/parent/output.bin.sample-001",
+            "/home/y30083740/dragonfly-b7/tmpfs-storage/b7-test/parent/output.bin.sample-001",
         )
         self.assertEqual(
             result["transferLog"],
@@ -1165,7 +1214,9 @@ storage:
         script = execute.call_args.args[2]
         self.assertIn(".b7-owner.json", script)
         self.assertIn("refusing cleanup while owned pid", script)
-        self.assertIn("/home/y30083740/dragonfly-b7/storage/b7-test/child", script)
+        self.assertIn(
+            "/home/y30083740/dragonfly-b7/tmpfs-storage/b7-test/child", script
+        )
 
     def test_cleanup_accepts_legacy_layout_for_recovery(self):
         layout = {

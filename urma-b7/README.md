@@ -154,7 +154,7 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
   中的精确 dfdaemon binary/config，超时只报告错误，不自动 SIGKILL；
 - 后续 cleanup 只能处理 inventory 配置的 B7 run/storage/origin 根目录下、带本轮 owner marker
   或 run-id 的资源；当前单机默认目录为 `/home/y30083740/dragonfly-b7/run/<run-id>`、
-  `/home/y30083740/dragonfly-b7/storage/<run-id>` 和
+  `/home/y30083740/dragonfly-b7/tmpfs-storage/<run-id>` 和
   `/home/y30083740/dragonfly-b7/origin/b7-<run-id>-*`；兼容旧 inventory 的旧目录仍保留在安全根列表中；
 - 显式 `cleanup` 同样逐资源持久化结果；一个资源清理失败时仍会继续尝试其他已记录资源；
 - 对旧版工具留下且 manifest resource record 已丢失的 partial prepare，显式 `cleanup --execute` 会尝试
@@ -172,7 +172,7 @@ python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execu
 
 ```text
 /home/y30083740/dragonfly-b7/origin   # seed 与每轮 hard link；必须由 origin HTTP 服务提供
-/home/y30083740/dragonfly-b7/storage  # parent/child storage 与 output
+/home/y30083740/dragonfly-b7/tmpfs-storage  # parent/child storage 与 output
 /home/y30083740/dragonfly-b7/run      # 配置、socket、pid、daemon/dfget 日志
 ```
 
@@ -320,7 +320,7 @@ RX32 MiB，只改变 Child 是否执行 CRC32+pwrite：
 - `fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs`。
 
 两者都把 Parent/Child storage 和 dfget output 放到 inventory 的
-`singleHost.storageRoot/<run-id>`（当前为 `/home/y30083740/dragonfly-b7/storage/<run-id>`），prepare
+`singleHost.storageRoot/<run-id>`（当前为 `/home/y30083740/dragonfly-b7/tmpfs-storage/<run-id>`），prepare
 会用 `stat -f` 拒绝并非 tmpfs 的挂载。需要跑这两个 case 时，应先把该 storage root 挂载为 tmpfs，
 并确认它至少还能容纳本轮 storage、output hard link 及系统余量。每个 case 为 3 个 measured batch ×
 8 lane × 1 GiB，即 24 GiB，不执行 warmup；每个 run 结束立即执行 manifest-owned cleanup。
@@ -349,6 +349,46 @@ python3 b7.py prepare --mode dual --run-id urma-l8-storage-tmpfs-001 \
 python3 b7.py run --manifest results/urma-l8-storage-tmpfs-001/manifest.json --execute
 python3 b7.py cleanup --manifest results/urma-l8-storage-tmpfs-001/manifest.json --execute
 ```
+
+#### single-host 分层复测矩阵（warmup 与 registered budget）
+
+首轮 single-host CC16 分层结果中，transport-only 的 measured sample 从 2307 MiB/s 逐步升至
+2868 MiB/s，且出现 1145 次 RX optional single-window fallback；正常 CRC32+pwrite 路径为约
+2046 MiB/s。为避免把冷启动和 optional Window 压力混入 CRC/Storage 结论，保留上述历史 case，新增两对
+`1 warmup + 5 measured` case：
+
+```text
+# 保持首轮 TX48 MiB + RX48 MiB，只修正 warmup/repetition。
+urma-piece16-cc16-post1-in16-pipe2-tx48-rx48-warm1-transport-only-tmpfs
+urma-piece16-cc16-post1-in16-pipe2-tx48-rx48-warm1-crc32-pwrite-tmpfs
+
+# 扩为 TX64 MiB + RX96 MiB，检查 optional pressure 是否影响分层差值。
+urma-piece16-cc16-post1-in16-pipe2-tx64-rx96-warm1-transport-only-tmpfs
+urma-piece16-cc16-post1-in16-pipe2-tx64-rx96-warm1-crc32-pwrite-tmpfs
+```
+
+四组都固定 1 GiB、16 MiB Piece、CC16、post1、in16、pipe2、MCT16 和 tmpfs。第一对总注册预算
+96 MiB、TX48 MiB，隐含 RX48 MiB；第二对总预算 160 MiB、TX64 MiB，隐含 RX96 MiB。建议用不同
+run-id 按 `transport/base → storage/base → storage/roomy → transport/roomy` 执行，全部 cleanup 后再反向
+重复一轮。只有同一预算内的 transport/storage 可以直接计算 CRC32+pwrite 差值；base/roomy 之间用于判断
+registered budget 和 optional Window pressure。
+
+single-host 示例：
+
+```bash
+python3 b7.py prepare --profile rm --mode single --host node1 \
+  --run-id rm-layer-base-transport-001 \
+  --case urma-piece16-cc16-post1-in16-pipe2-tx48-rx48-warm1-transport-only-tmpfs \
+  --execute
+python3 b7.py run \
+  --manifest results/rm-layer-base-transport-001/manifest.json --execute
+python3 b7.py cleanup \
+  --manifest results/rm-layer-base-transport-001/manifest.json --execute
+```
+
+其余三组只替换 run-id 和 case。每轮至少记录 measured sample、aggregate/mean/p50/p95、
+`startToFirstPiece`、`firstToLastPiece`、TX/RX optional pressure、single-ring/window fallback、TCP fallback、
+session retirement 和 unexpected shutdown error。
 
 PR #1945 的 RDMA concurrency 曲线不是多 lane/QP 曲线：一个 daemon 只创建一个共享
 `FI_EP_RDM` endpoint、共享 CQ/progress thread；每个 Piece 各自建立 TCP rendezvous，再以独立 tag 在同一
