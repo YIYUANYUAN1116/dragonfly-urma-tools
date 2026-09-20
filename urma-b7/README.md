@@ -184,6 +184,7 @@ placement，应先固定 CPU 做可比测试，再单独增加 `numactl --membin
   中的精确 dfdaemon binary/config，超时只报告错误，不自动 SIGKILL；
 - 后续 cleanup 只能处理 inventory 配置的 B7 run/storage/origin 根目录下、带本轮 owner marker
   或 run-id 的资源；当前单机默认目录为 `/home/y30083740/dragonfly-b7/run/<run-id>`、
+  `/home/y30083740/dragonfly-b7/storage/<run-id>`、
   `/home/y30083740/dragonfly-b7/tmpfs-storage/<run-id>` 和
   `/home/y30083740/dragonfly-b7/origin/b7-<run-id>-*`；兼容旧 inventory 的旧目录仍保留在安全根列表中；
 - 显式 `cleanup` 同样逐资源持久化结果；一个资源清理失败时仍会继续尝试其他已记录资源；
@@ -202,7 +203,8 @@ placement，应先固定 CPU 做可比测试，再单独增加 `numactl --membin
 
 ```text
 /home/y30083740/dragonfly-b7/origin   # seed 与每轮 hard link；必须由 origin HTTP 服务提供
-/home/y30083740/dragonfly-b7/tmpfs-storage  # parent/child storage 与 output
+/home/y30083740/dragonfly-b7/storage        # 普通 filesystem case 的 storage 与 output
+/home/y30083740/dragonfly-b7/tmpfs-storage  # tmpfs case 的 storage 与 output
 /home/y30083740/dragonfly-b7/run      # 配置、socket、pid、daemon/dfget 日志
 ```
 
@@ -350,7 +352,7 @@ RX32 MiB，只改变 Child 是否执行 CRC32+pwrite：
 - `fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs`。
 
 两者都把 Parent/Child storage 和 dfget output 放到 inventory 的
-`singleHost.storageRoot/<run-id>`（当前为 `/home/y30083740/dragonfly-b7/tmpfs-storage/<run-id>`），prepare
+`singleHost.tmpfsStorageRoot/<run-id>`（当前为 `/home/y30083740/dragonfly-b7/tmpfs-storage/<run-id>`），prepare
 会用 `stat -f` 拒绝并非 tmpfs 的挂载。需要跑这两个 case 时，应先把该 storage root 挂载为 tmpfs，
 并确认它至少还能容纳本轮 storage、output hard link 及系统余量。每个 case 为 3 个 measured batch ×
 8 lane × 1 GiB，即 24 GiB，不执行 warmup；每个 run 结束立即执行 manifest-owned cleanup。

@@ -61,6 +61,7 @@ class B7Tests(unittest.TestCase):
         self.assertIn("numa_hardware_b64", script)
         self.assertIn(
             "df -h /tmp /home/y30083740/dragonfly-b7/run "
+            "/home/y30083740/dragonfly-b7/storage "
             "/home/y30083740/dragonfly-b7/tmpfs-storage "
             "/home/y30083740/dragonfly-b7/origin",
             script,
@@ -75,6 +76,10 @@ class B7Tests(unittest.TestCase):
         )
         self.assertEqual(
             self.inventory["singleHost"]["storageRoot"],
+            "/home/y30083740/dragonfly-b7/storage",
+        )
+        self.assertEqual(
+            self.inventory["singleHost"]["tmpfsStorageRoot"],
             "/home/y30083740/dragonfly-b7/tmpfs-storage",
         )
 
@@ -349,7 +354,7 @@ class B7Tests(unittest.TestCase):
         for layout in generated.values():
             self.assertTrue(
                 layout["storage"].startswith(
-                    self.inventory["singleHost"]["storageRoot"] + "/"
+                    self.inventory["singleHost"]["tmpfsStorageRoot"] + "/"
                 )
             )
             self.assertEqual(layout["storageClass"], "tmpfs")
@@ -1077,7 +1082,7 @@ storage:
         self.assertIn("log_start=$(wc -l", script)
         self.assertEqual(
             result["output"],
-            "/home/y30083740/dragonfly-b7/tmpfs-storage/b7-test/parent/output.bin.sample-001",
+            "/home/y30083740/dragonfly-b7/storage/b7-test/parent/output.bin.sample-001",
         )
         self.assertEqual(
             result["transferLog"],
@@ -1303,7 +1308,7 @@ storage:
         self.assertIn(".b7-owner.json", script)
         self.assertIn("refusing cleanup while owned pid", script)
         self.assertIn(
-            "/home/y30083740/dragonfly-b7/tmpfs-storage/b7-test/child", script
+            "/home/y30083740/dragonfly-b7/storage/b7-test/child", script
         )
 
     def test_cleanup_accepts_legacy_layout_for_recovery(self):

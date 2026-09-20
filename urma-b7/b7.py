@@ -115,6 +115,12 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
             raise B7Error(f"node {name} RC baseline repo must be dragonfly-client-urma-private")
         if node["rmRepo"] == node["rcRepo"]:
             raise B7Error(f"node {name} RM and RC repos must be distinct")
+    single_host = inventory.get("singleHost")
+    if not isinstance(single_host, dict):
+        raise B7Error("inventory must define singleHost settings")
+    for key in ("runRoot", "storageRoot", "tmpfsStorageRoot"):
+        if not isinstance(single_host.get(key), str) or not single_host[key]:
+            raise B7Error(f"inventory singleHost requires non-empty {key}")
     urma = inventory.get("urma")
     if not isinstance(urma, dict):
         raise B7Error("inventory must define urma settings")
@@ -295,6 +301,7 @@ def inspection_script(node: dict[str, Any], inventory: dict[str, Any]) -> str:
             "/tmp",
             inventory["singleHost"]["runRoot"],
             inventory["singleHost"]["storageRoot"],
+            inventory["singleHost"]["tmpfsStorageRoot"],
             inventory["origin"]["directory"],
         )
     )
@@ -2825,10 +2832,9 @@ def role_paths(
     if storage_class == "filesystem":
         storage_base = PurePosixPath(single["storageRoot"])
     elif storage_class == "tmpfs":
-        # Keep all B7 artifacts under the inventory-managed storage root.  A
-        # tmpfs case therefore requires that root (or its mounted filesystem)
-        # to actually be tmpfs; prepare_remote_role verifies the mount type.
-        storage_base = PurePosixPath(single["storageRoot"])
+        # Keep tmpfs cases on a dedicated inventory-managed root so switching
+        # case classes never requires editing the normal filesystem root.
+        storage_base = PurePosixPath(single["tmpfsStorageRoot"])
     else:
         raise B7Error(f"unsupported storage class {storage_class!r}")
     storage_root = storage_base / run_id / role
