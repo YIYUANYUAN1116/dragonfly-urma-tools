@@ -30,6 +30,7 @@ from yaml_overlay import OverlayError, apply as apply_yaml_overlays
 
 TOOL_DIR = Path(__file__).resolve().parent
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+CPU_AFFINITY_RE = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 LOG_TIMESTAMP_RE = re.compile(
     r"^(?P<second>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
     r"(?:\.(?P<fraction>\d{1,9}))?Z\b"
@@ -183,6 +184,28 @@ def validate_run_id(run_id: str) -> str:
     return run_id
 
 
+def validate_cpu_affinity(value: str) -> str:
+    """Validate a taskset(1) CPU list before embedding it in a manifest."""
+    value = value.strip()
+    if not CPU_AFFINITY_RE.fullmatch(value):
+        raise B7Error("CPU list must look like 32, 32-47, or 32-47,64-79")
+    for item in value.split(","):
+        if "-" in item:
+            first, last = (int(part) for part in item.split("-", 1))
+            if first > last:
+                raise B7Error(f"CPU range starts after it ends: {item}")
+    return value
+
+
+def cpu_pinned_command(args: list[str], layout: dict[str, Any]) -> list[str]:
+    affinity = layout.get("cpuAffinity")
+    if affinity is None:
+        return args
+    if not isinstance(affinity, str):
+        raise B7Error("manifest cpuAffinity must be a taskset CPU-list string")
+    return ["taskset", "-c", validate_cpu_affinity(affinity), *args]
+
+
 def standard_task_id(url: str, tag: str, piece_length: str | None = None) -> str:
     """Reproduce Dragonfly's URL-based standard task ID for B7-owned dfget calls.
 
@@ -303,6 +326,9 @@ emit rustc "$(one_line rustc --version)"
 emit cargo "$(one_line cargo --version)"
 emit protoc "$(one_line protoc --version)"
 emit perl "$(one_line perl -v)"
+emit taskset "$(one_line taskset --version)"
+emit cpu_topology_b64 "$(lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE 2>&1 | base64 | tr -d '\\n')"
+emit numa_hardware_b64 "$(if command -v numactl >/dev/null 2>&1; then numactl --hardware 2>&1; else printf unavailable; fi | base64 | tr -d '\\n')"
 emit memlock "$(ulimit -l 2>&1 | tr '\\n' ' ')"
 emit urma_device "$(test -e /sys/class/ubcore/{device} && printf present || printf unconfirmed)"
 emit urma_tools "$(one_line sh -c 'command -v urma_perftest; command -v urma_admin')"
@@ -794,6 +820,22 @@ def start_remote_role(
         if performance_profile is None
         else f"export DF_URMA_PERFORMANCE_PROFILE={shlex.quote(performance_profile)}"
     )
+    affinity = layout.get("cpuAffinity")
+    launch_args = cpu_pinned_command(
+        ["$binary", "--config", "$config", "--log-level", "debug", "--console"],
+        layout,
+    )
+    launch_command = " ".join(
+        value if value.startswith("$") else shlex.quote(value) for value in launch_args
+    )
+    taskset_check = "command -v taskset >/dev/null" if affinity is not None else ":"
+    affinity_report = (
+        "effective=$(awk '/^Cpus_allowed_list:/ {print $2}' \"/proc/$pid/status\")\n"
+        "test -n \"$effective\"\n"
+        "printf '%s\\t%s\\n' \"$pid\" \"$effective\""
+        if affinity is not None
+        else "printf '%s\\n' \"$pid\""
+    )
     script = f"""set -eu
 {assert_owned_script(layout, run_id, role)}
 binary={shlex.quote(binary)}
@@ -804,6 +846,7 @@ socket={shlex.quote(layout['socket'])}
 pid=
 test -x "$binary"
 test -f "$config"
+{taskset_check}
 if [ -f "$pidfile" ]; then
   old_pid=$(cat "$pidfile")
   if kill -0 "$old_pid" 2>/dev/null; then
@@ -834,7 +877,7 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export NO_PROXY='*' no_proxy='*'
 export LD_LIBRARY_PATH={shlex.quote(inventory['urma']['libDir'])}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}
 {profile_export}
-nohup "$binary" --config "$config" --log-level debug --console >"$log" 2>&1 </dev/null &
+nohup {launch_command} >"$log" 2>&1 </dev/null &
 pid=$!
 printf '%s\\n' "$pid" > "$pidfile"
 ready=0
@@ -862,13 +905,26 @@ if [ "$ready" -ne 1 ]; then
   echo "dfdaemon socket did not become ready" >&2
   exit 23
 fi
+{affinity_report}
 trap - EXIT
-printf '%s\\n' "$pid"
 """
     completed = ssh_script(node, inventory, script, timeout=50)
     if completed.returncode != 0:
         raise B7Error(f"cannot start {role} on {ssh_target(node)}: {completed.stderr.strip()}")
-    return {"pid": int(completed.stdout.strip()), "target": ssh_target(node)}
+    fields = completed.stdout.strip().split("\t")
+    if len(fields) not in (1, 2):
+        raise B7Error(f"unexpected start result from {ssh_target(node)}")
+    result = {"pid": int(fields[0]), "target": ssh_target(node)}
+    if affinity is not None:
+        if len(fields) != 2:
+            raise B7Error(f"missing effective CPU affinity from {ssh_target(node)}")
+        result.update(
+            {
+                "cpuAffinityRequested": validate_cpu_affinity(str(affinity)),
+                "cpuAffinityEffective": fields[1],
+            }
+        )
+    return result
 
 
 def run_remote_dfget(
@@ -901,7 +957,7 @@ def run_remote_dfget(
         args.append("--disable-back-to-source")
     if piece_length is not None:
         args.extend(["--piece-length", piece_length])
-    command = " ".join(shlex.quote(value) for value in args)
+    command = " ".join(shlex.quote(value) for value in cpu_pinned_command(args, layout))
     daemon_log = shlex.quote(layout["log"])
     script = f"""set -u
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
@@ -937,6 +993,7 @@ printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
         "expectedTaskId": standard_task_id(url, task_tag, piece_length),
         "output": output,
         "transferLog": transfer_log,
+        "cpuAffinityRequested": layout.get("cpuAffinity"),
     }
 
 
@@ -987,7 +1044,9 @@ def run_remote_dfget_batch(
             args.append("--disable-back-to-source")
         if piece_length is not None:
             args.extend(["--piece-length", piece_length])
-        command = " ".join(shlex.quote(value) for value in args)
+        command = " ".join(
+            shlex.quote(value) for value in cpu_pinned_command(args, layout)
+        )
         launch_blocks.append(
             "\n".join(
                 [
@@ -1075,6 +1134,7 @@ def run_remote_dfget_batch(
                 "output": f"{layout['output']}.{artifact_suffix}",
                 "transferLog": f"{layout['transferLog']}.{artifact_suffix}",
                 "workerIndex": worker,
+                "cpuAffinityRequested": layout.get("cpuAffinity"),
             }
         )
         value.pop("status")
@@ -1131,7 +1191,9 @@ def run_remote_dfget_fanout_batch(
         ]
         if piece_length is not None:
             args.extend(["--piece-length", piece_length])
-        command = " ".join(shlex.quote(value) for value in args)
+        command = " ".join(
+            shlex.quote(value) for value in cpu_pinned_command(args, layout)
+        )
         launch_blocks.extend(
             [
                 f"log_start_{worker}=$(wc -l < {shlex.quote(layout['log'])})",
@@ -1228,6 +1290,7 @@ def run_remote_dfget_fanout_batch(
                 "transferLog": f"{layout['transferLog']}.{artifact_suffix}",
                 "workerIndex": worker,
                 "role": role,
+                "cpuAffinityRequested": layout.get("cpuAffinity"),
             }
         )
         value.pop("status")
@@ -3288,6 +3351,14 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         case.get("storageClass", "filesystem"),
         case.get("urmaPerformanceProfile"),
     )
+    parent_cpus = getattr(args, "parent_cpus", None)
+    child_cpus = getattr(args, "child_cpus", None)
+    if parent_cpus is not None:
+        generated["parent"]["cpuAffinity"] = validate_cpu_affinity(parent_cpus)
+    if child_cpus is not None:
+        child_affinity = validate_cpu_affinity(child_cpus)
+        for role in child_roles(generated):
+            generated[role]["cpuAffinity"] = child_affinity
     origin = origin_artifact(inventory, args.run_id, case.get("fileClass", "1g"))
     output = args.output or TOOL_DIR / "results" / args.run_id / "manifest.json"
     manifest: dict[str, Any] = {
@@ -3301,6 +3372,9 @@ def command_prepare(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         "childNode": child_node,
         "origin": origin,
         "generated": generated,
+        "cpuPlacement": {
+            role: layout.get("cpuAffinity") for role, layout in generated.items()
+        },
         "urmaValidation": urma_validation_metadata(inventory, args.mode),
         "state": "planned",
         "remote": {},
@@ -4762,6 +4836,16 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--run-id", required=True)
     prepare.add_argument("--cases", type=Path, default=TOOL_DIR / "cases.json")
     prepare.add_argument("--case", default="smoke-post1-pipe1")
+    prepare.add_argument(
+        "--parent-cpus",
+        metavar="CPU_LIST",
+        help="pin the remote parent dfdaemon and dfget processes with taskset -c",
+    )
+    prepare.add_argument(
+        "--child-cpus",
+        metavar="CPU_LIST",
+        help="pin every remote child dfdaemon and dfget process with taskset -c",
+    )
     prepare.add_argument("--output", type=Path)
     prepare.add_argument(
         "--execute",

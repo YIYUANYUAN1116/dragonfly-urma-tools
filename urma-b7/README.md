@@ -133,6 +133,36 @@ python .\b7.py cleanup --manifest .\results\b7-smoke-001\manifest.json --execute
 python .\b7.py prepare --mode single --host node1 --run-id b7-single-001 --execute
 ```
 
+### CPU/NUMA placement
+
+不要在 controller 外层用 `taskset python3 b7.py ...`：B7 通过 SSH 在目标节点另起 shell，远端
+`dfdaemon`/`dfget` 不会继承 controller 上 Python 进程的 CPU affinity。需要在 `prepare` 时把每个角色的
+CPU 列表固化进 manifest，例如：
+
+```bash
+python3 b7.py prepare --profile rm --mode single --host node1 \
+  --run-id rm-numa23-001 --case urma-piece-16mib-cc1-post1-pipe2 \
+  --parent-cpus 192-223 --child-cpus 288-319 --execute
+python3 b7.py run --manifest results/rm-numa23-001/manifest.json --execute
+```
+
+`run` 会在远端用 `taskset -c` 启动 Parent/Child 的 `dfdaemon`，并以相同角色的 CPU 列表运行该角色的
+每个 `dfget`。fan-out/fan-in 中 `--child-cpus` 会应用于全部 Child role。daemon 启动后，B7 从
+`/proc/<pid>/status` 读取实际 `Cpus_allowed_list`，分别写入
+`result.started.<role>.cpuAffinityRequested` 和 `cpuAffinityEffective`；计划值同时保存在
+`cpuPlacement` 与 `generated.<role>.cpuAffinity`。可用下面的命令核对：
+
+```bash
+jq '{planned: .cpuPlacement, started: (.result.started // {}) |
+  with_entries(.value |= {pid, cpuAffinityRequested, cpuAffinityEffective})}' \
+  results/rm-numa23-001/manifest.json
+```
+
+CPU ID 必须以测试机 `lscpu -e=CPU,NODE,CORE,SOCKET` 的结果为准；每物理 core 有两个逻辑 CPU 时，不能
+只凭连续编号推断 sibling 关系。该功能保证 CPU affinity，不等同于强制 NUMA memory binding。tmpfs 页、
+registered buffer 和进程 heap 仍受 first-touch/系统 NUMA policy 影响；若要区分 CPU placement 与内存
+placement，应先固定 CPU 做可比测试，再单独增加 `numactl --membind` 实验。
+
 `prepare` 使用 mapping-only YAML overlay，支持补齐缺失 mapping，但会拒绝 tab 缩进和非 block-mapping
 父节点。生成配置完整保留源 YAML 的其他字段；完整源配置只在内存中处理，不写入本地结果。
 

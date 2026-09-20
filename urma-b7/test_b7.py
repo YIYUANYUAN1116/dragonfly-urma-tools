@@ -28,6 +28,12 @@ class B7Tests(unittest.TestCase):
             with self.assertRaises(b7.B7Error):
                 b7.validate_run_id(value)
 
+    def test_cpu_affinity_accepts_taskset_lists_and_rejects_bad_ranges(self):
+        self.assertEqual(b7.validate_cpu_affinity("32-47,64-79"), "32-47,64-79")
+        for value in ("", "32 33", "47-32", "node2", "1,"):
+            with self.assertRaises(b7.B7Error):
+                b7.validate_cpu_affinity(value)
+
     def test_inventory_freezes_rm_preflight_contract(self):
         b7.validate_inventory(self.inventory)
         for node in self.inventory["nodes"].values():
@@ -50,6 +56,9 @@ class B7Tests(unittest.TestCase):
         self.assertIn("urma_admin_show_b64", script)
         self.assertIn("urma_admin_topo_b64", script)
         self.assertIn("network_b64", script)
+        self.assertIn("cpu_topology_b64", script)
+        self.assertIn("lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE", script)
+        self.assertIn("numa_hardware_b64", script)
         self.assertIn(
             "df -h /tmp /home/y30083740/dragonfly-b7/run "
             "/home/y30083740/dragonfly-b7/tmpfs-storage "
@@ -379,7 +388,7 @@ class B7Tests(unittest.TestCase):
         self.assertEqual(transport["concurrentPieceCount"], 16)
         self.assertEqual(transport["maxConcurrentTransfers"], 16)
         self.assertEqual(transport["storageClass"], "tmpfs")
-        self.assertEqual(transport["warmups"], 0)
+        self.assertEqual(transport["warmups"], 1)
         self.assertEqual(transport["repetitions"], 3)
         _, _, generated = b7.generated_layout(
             self.inventory,
@@ -422,7 +431,7 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(transport["urmaPerformanceProfile"], "transport-only")
             self.assertNotIn("urmaPerformanceProfile", storage)
             self.assertEqual(transport["warmups"], 1)
-            self.assertEqual(transport["repetitions"], 5)
+            self.assertEqual(transport["repetitions"], 3)
             self.assertEqual(transport["maxRegisteredBytes"], total_budget)
             self.assertEqual(transport["txRegisteredBytes"], tx_budget)
             self.assertEqual(transport["maxInflightChunks"], 16)
@@ -759,6 +768,36 @@ storage:
                 b7.child_roles(manifest["generated"]), ["child-001", "child-002"]
             )
 
+    def test_prepare_freezes_parent_and_child_cpu_affinity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "manifest.json"
+            status = b7.main(
+                [
+                    "prepare",
+                    "--mode",
+                    "dual",
+                    "--run-id",
+                    "b7-numa",
+                    "--case",
+                    "fanout-post1-in32-l2",
+                    "--parent-cpus",
+                    "192-223",
+                    "--child-cpus",
+                    "288-319",
+                    "--output",
+                    str(output),
+                ]
+            )
+            self.assertEqual(status, 0)
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["cpuPlacement"]["parent"], "192-223")
+            self.assertEqual(manifest["generated"]["parent"]["cpuAffinity"], "192-223")
+            for role in b7.child_roles(manifest["generated"]):
+                self.assertEqual(manifest["cpuPlacement"][role], "288-319")
+                self.assertEqual(
+                    manifest["generated"][role]["cpuAffinity"], "288-319"
+                )
+
     def test_execute_prepare_creates_every_fanout_role(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "manifest.json"
@@ -886,6 +925,30 @@ storage:
         self.assertIn('ss -H -uan "sport = :$port"', stop_script)
         self.assertIn("port did not become reusable", stop_script)
         self.assertEqual(execute.call_args_list[1].kwargs["timeout"], 130)
+
+    def test_role_start_pins_daemon_and_records_effective_affinity(self):
+        _, _, generated = b7.generated_layout(
+            self.inventory, "single", "b7-numa", "node1"
+        )
+        layout = generated["parent"]
+        layout["cpuAffinity"] = "192-223"
+        completed = b7.subprocess.CompletedProcess(
+            [], 0, stdout="321\t192-223\n", stderr=""
+        )
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            result = b7.start_remote_role(
+                self.inventory["nodes"]["node1"],
+                self.inventory,
+                layout,
+                "parent",
+                "b7-numa",
+            )
+        script = execute.call_args.args[2]
+        self.assertIn("command -v taskset", script)
+        self.assertIn("nohup taskset -c 192-223 $binary", script)
+        self.assertIn("Cpus_allowed_list", script)
+        self.assertEqual(result["cpuAffinityRequested"], "192-223")
+        self.assertEqual(result["cpuAffinityEffective"], "192-223")
 
     def test_prepare_origin_creates_owner_marker_before_link(self):
         origin = b7.origin_artifact(self.inventory, "b7-test", "1g")
@@ -1022,6 +1085,31 @@ storage:
         )
         self.assertEqual(result["daemonLogFirstLine"], 11)
         self.assertEqual(result["daemonLogLastLine"], 20)
+
+    def test_dfget_is_pinned_from_manifest_layout(self):
+        _, _, generated = b7.generated_layout(self.inventory, "dual", "b7-numa", None)
+        generated["parent"]["cpuAffinity"] = "288-319"
+        completed = b7.subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                "1048576\tsame\t1000000\t1788158495000000000\t"
+                "1788158495001000000\t11\t20\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(b7, "ssh_script", return_value=completed) as execute:
+            result = b7.run_remote_dfget(
+                self.inventory["nodes"]["node1"],
+                self.inventory,
+                generated["parent"],
+                "http://example.test/input.bin",
+                False,
+                "b7-numa-sample-001",
+                "sample-001",
+            )
+        self.assertIn("timeout 600 taskset -c 288-319", execute.call_args.args[2])
+        self.assertEqual(result["cpuAffinityRequested"], "288-319")
 
     def test_standard_task_id_matches_dragonfly_url_based_vector(self):
         self.assertEqual(
