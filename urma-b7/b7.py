@@ -39,6 +39,7 @@ LOG_TIMESTAMP_RE = re.compile(
 # were recorded with Debug (`task_id="..."`) or Display (`task_id=...`). Parent
 # `urma_piece` spans use Display, while several child spans use Debug.
 TASK_ID_RE = re.compile(r'\btask_id="?([A-Za-z0-9._:-]+)"?')
+PIECE_ID_RE = re.compile(r'\bpiece_id="?([A-Za-z0-9._:-]+)"?')
 # The upper session facade still emits lane_id in some paths while the RM
 # native owner now emits peer_id. Treat both as one logical PeerTarget id;
 # neither value represents a dedicated native Jetty in RM mode.
@@ -241,6 +242,11 @@ def standard_task_id(url: str, tag: str, piece_length: str | None = None) -> str
 
 def last_task_id(line: str) -> str | None:
     matches = list(TASK_ID_RE.finditer(line))
+    return matches[-1].group(1) if matches else None
+
+
+def last_piece_id(line: str) -> str | None:
+    matches = list(PIECE_ID_RE.finditer(line))
     return matches[-1].group(1) if matches else None
 
 
@@ -1481,6 +1487,76 @@ def analyze_task_timing(
     }
 
 
+def analyze_urma_server_transport_span(
+    parent_log: str,
+    task_ids: set[str],
+    total_bytes: int,
+) -> dict[str, Any]:
+    """Measure one batch using only timestamps from the Parent URMA server.
+
+    The interval starts at the first Piece-service start and ends after the last
+    Piece has sent Done. It intentionally excludes dfget startup, scheduling,
+    task-file creation/preallocation, and final output publication.
+    """
+    if not task_ids:
+        raise B7Error("URMA server transport span requires measured task ids")
+    if total_bytes <= 0:
+        raise B7Error("URMA server transport span requires positive total bytes")
+    starts: dict[tuple[str, str], int] = {}
+    finishes: dict[tuple[str, str], int] = {}
+    for line in parent_log.splitlines():
+        is_start = "start upload piece content over urma" in line
+        is_finish = "finished uploading piece content over urma" in line
+        if not is_start and not is_finish:
+            continue
+        task_id = last_task_id(line)
+        if task_id not in task_ids:
+            continue
+        piece_id = last_piece_id(line)
+        if piece_id is None:
+            raise B7Error("URMA server Piece lifecycle log is missing piece_id")
+        key = (task_id, piece_id)
+        lifecycle = starts if is_start else finishes
+        if key in lifecycle:
+            event = "start" if is_start else "finish"
+            raise B7Error(f"duplicate URMA server Piece {event} for {piece_id}")
+        lifecycle[key] = parse_log_timestamp_ns(line)
+    if set(starts) != set(finishes):
+        missing_finishes = sorted(set(starts) - set(finishes))
+        missing_starts = sorted(set(finishes) - set(starts))
+        raise B7Error(
+            "incomplete URMA server Piece lifecycle for transport span: "
+            f"missing finishes={missing_finishes} missing starts={missing_starts}"
+        )
+    if not starts:
+        raise B7Error("no task-scoped URMA server Piece lifecycle found")
+    observed_task_ids = {task_id for task_id, _piece_id in starts}
+    if observed_task_ids != task_ids:
+        raise B7Error(
+            "URMA server transport span is missing measured tasks: "
+            f"{sorted(task_ids - observed_task_ids)}"
+        )
+    for key, started in starts.items():
+        if finishes[key] < started:
+            raise B7Error(f"URMA server Piece finished before it started: {key[1]}")
+    started = min(starts.values())
+    finished = max(finishes.values())
+    elapsed = finished - started
+    if elapsed <= 0:
+        raise B7Error("URMA server transport span is non-positive")
+    return {
+        "scope": "parent-server-piece-service",
+        "taskCount": len(task_ids),
+        "pieceCount": len(starts),
+        "totalBytes": total_bytes,
+        "startedAtUnixNs": started,
+        "finishedAtUnixNs": finished,
+        "elapsedNs": elapsed,
+        "throughputMiBps": total_bytes * 1_000_000_000 / elapsed / (1024 * 1024),
+        "throughputGbps": total_bytes * 8 / elapsed,
+    }
+
+
 def filter_task_scoped_log(task_log: str, task_ids: set[str]) -> str:
     """Keep structured daemon lines belonging to measured task IDs only."""
     if not task_ids:
@@ -2535,6 +2611,41 @@ def concurrent_batches_summary(batches: list[dict[str, Any]]) -> dict[str, Any]:
         "meanCompletionSkewNs": statistics.fmean(
             int(summary["completionSkewNs"]) for summary in summaries
         ),
+    }
+
+
+def urma_server_transport_spans_summary(
+    batches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not batches:
+        raise B7Error("at least one measured URMA server transport span is required")
+    spans = [batch["urmaServerTransportSpan"] for batch in batches]
+    total_bytes = sum(int(span["totalBytes"]) for span in spans)
+    total_elapsed_ns = sum(int(span["elapsedNs"]) for span in spans)
+    if total_elapsed_ns <= 0:
+        raise B7Error("aggregate URMA server transport span is non-positive")
+    rates = [float(span["throughputMiBps"]) for span in spans]
+    rates_gbps = [float(span["throughputGbps"]) for span in spans]
+    ordered = sorted(rates)
+    p95_index = max(0, (len(ordered) * 95 + 99) // 100 - 1)
+    return {
+        "scope": "parent-server-piece-service",
+        "batches": len(spans),
+        "totalBytes": total_bytes,
+        "totalElapsedNs": total_elapsed_ns,
+        "aggregateThroughputMiBps": total_bytes
+        * 1_000_000_000
+        / total_elapsed_ns
+        / (1024 * 1024),
+        "aggregateThroughputGbps": total_bytes * 8 / total_elapsed_ns,
+        "bestThroughputGbps": max(rates_gbps),
+        "throughputMiBps": {
+            "min": min(rates),
+            "median": statistics.median(rates),
+            "mean": statistics.fmean(rates),
+            "p95": ordered[p95_index],
+            "max": max(rates),
+        },
     }
 
 
@@ -3707,19 +3818,29 @@ def command_run_fanout(
                     )
                 lane_by_role[role] = lane_id
             lane_evidence["laneByRole"] = lane_by_role
-            result["transfer"]["batches"][group].append(
-                {
-                    "index": index,
-                    "taskIds": sorted(task_ids),
-                    "laneEvidence": lane_evidence,
-                    "taskScopedEvidence": {
-                        "parent": parent_scoped_name,
-                        "children": child_scoped,
-                    },
-                    "transfers": batch_transfers,
-                    "summary": concurrent_batch_summary(batch_transfers),
-                }
-            )
+            batch_result = {
+                "index": index,
+                "taskIds": sorted(task_ids),
+                "laneEvidence": lane_evidence,
+                "taskScopedEvidence": {
+                    "parent": parent_scoped_name,
+                    "children": child_scoped,
+                },
+                "transfers": batch_transfers,
+                "summary": concurrent_batch_summary(batch_transfers),
+            }
+            if case.get("urmaPerformanceProfile") == "transport-only":
+                batch_result["urmaServerTransportSpan"] = (
+                    analyze_urma_server_transport_span(
+                        parent_task_log,
+                        task_ids,
+                        sum(
+                            int(transfer["child"]["bytes"])
+                            for transfer in batch_transfers
+                        ),
+                    )
+                )
+            result["transfer"]["batches"][group].append(batch_result)
         first_sample = result["transfer"]["samples"][0]
         result["transfer"]["parent"] = first_sample["parent"]
         result["transfer"]["child"] = first_sample["child"]
@@ -3743,6 +3864,12 @@ def command_run_fanout(
         result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
             result["transfer"]["batches"]["samples"]
         )
+        if case.get("urmaPerformanceProfile") == "transport-only":
+            result["transfer"]["urmaServerTransportSpanSummary"] = (
+                urma_server_transport_spans_summary(
+                    result["transfer"]["batches"]["samples"]
+                )
+            )
         result["transfer"]["measuredTaskIds"] = [
             sample["child"]["expectedTaskId"]
             for sample in result["transfer"]["samples"]
@@ -4554,6 +4681,17 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 "transfers": batch_transfers,
                 "summary": concurrent_batch_summary(batch_transfers),
             }
+            if case.get("urmaPerformanceProfile") == "transport-only":
+                batch_result["urmaServerTransportSpan"] = (
+                    analyze_urma_server_transport_span(
+                        parent_task_log,
+                        task_ids,
+                        sum(
+                            int(transfer["child"]["bytes"])
+                            for transfer in batch_transfers
+                        ),
+                    )
+                )
             if piece_concurrency_evidence is not None:
                 batch_result["pieceConcurrencyEvidence"] = piece_concurrency_evidence
                 batch_result["pieceConcurrencyEvidenceFile"] = (
@@ -4576,6 +4714,12 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
             result["transfer"]["batches"]["samples"]
         )
+        if case.get("urmaPerformanceProfile") == "transport-only":
+            result["transfer"]["urmaServerTransportSpanSummary"] = (
+                urma_server_transport_spans_summary(
+                    result["transfer"]["batches"]["samples"]
+                )
+            )
         result["transfer"]["measuredTaskIds"] = [
             sample["child"]["expectedTaskId"]
             for sample in result["transfer"]["samples"]

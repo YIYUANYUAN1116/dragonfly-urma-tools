@@ -1691,6 +1691,42 @@ storage:
         self.assertEqual(aggregate["concurrency"], 2)
         self.assertAlmostEqual(aggregate["aggregateThroughputMiBps"], 2 / 1.1)
 
+    def test_urma_server_transport_span_uses_parent_piece_lifecycle(self):
+        parent_log = "\n".join(
+            [
+                '2026-09-20T10:00:00.000000000Z INFO start upload piece content over urma task_id="task-a" piece_id="piece-a-0"',
+                '2026-09-20T10:00:00.100000000Z INFO start upload piece content over urma task_id="unrelated" piece_id="other-0"',
+                '2026-09-20T10:00:00.200000000Z INFO start upload piece content over urma task_id="task-b" piece_id="piece-b-0"',
+                '2026-09-20T10:00:01.000000000Z DEBUG finished uploading piece content over urma task_id="task-a" piece_id="piece-a-0"',
+                '2026-09-20T10:00:02.000000000Z DEBUG finished uploading piece content over urma task_id="task-b" piece_id="piece-b-0"',
+            ]
+        )
+        span = b7.analyze_urma_server_transport_span(
+            parent_log, {"task-a", "task-b"}, 256 * 1024 * 1024
+        )
+        self.assertEqual(span["taskCount"], 2)
+        self.assertEqual(span["pieceCount"], 2)
+        self.assertEqual(span["elapsedNs"], 2_000_000_000)
+        self.assertEqual(span["throughputMiBps"], 128.0)
+        self.assertAlmostEqual(span["throughputGbps"], 1.073741824)
+        aggregate = b7.urma_server_transport_spans_summary(
+            [{"urmaServerTransportSpan": span}, {"urmaServerTransportSpan": span}]
+        )
+        self.assertEqual(aggregate["batches"], 2)
+        self.assertEqual(aggregate["aggregateThroughputMiBps"], 128.0)
+        self.assertAlmostEqual(aggregate["bestThroughputGbps"], 1.073741824)
+
+    def test_urma_server_transport_span_rejects_incomplete_lifecycle(self):
+        parent_log = (
+            '2026-09-20T10:00:00.000000000Z INFO '
+            'start upload piece content over urma task_id="task-a" '
+            'piece_id="piece-a-0"\n'
+        )
+        with self.assertRaisesRegex(b7.B7Error, "missing finishes"):
+            b7.analyze_urma_server_transport_span(
+                parent_log, {"task-a"}, 16 * 1024 * 1024
+            )
+
     def test_piece_length_parsing_and_case_validation(self):
         self.assertEqual(b7.parse_piece_length_bytes("4mib"), 4 * 1024 * 1024)
         self.assertEqual(b7.parse_piece_length_bytes("16MiB"), 16 * 1024 * 1024)

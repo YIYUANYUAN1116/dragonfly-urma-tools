@@ -363,6 +363,21 @@ Done 和 RX lease recycle，但跳过 Child CRC32 和 pwrite。该 profile 会�
 lifecycle，以及每个 task 恰好 64 条 transport-only Piece completion，明确不把 Child SHA 当作完整性
 证明。普通 `--features urma` binary 不支持这个 profile，测试前必须在两端构建：
 
+manifest 同时保留两种口径：`transfer.summary` / `concurrentSummary` 是 dfget 端到端耗时，会包含
+启动、调度、任务文件创建/预分配和收尾；`transfer.urmaServerTransportSpanSummary` 则使用 Parent 同一时钟，
+从首个 Piece 进入 URMA server 到最后一个 Piece 完成 Done，只覆盖 Piece 服务区间。与 RDMA
+transport-only 对照时应读取后者；RDMA 台账采用三次取最佳值时，使用 `bestThroughputGbps`，若改为
+按总字节/总耗时汇总则使用 `aggregateThroughputGbps`。同时保留前者用于说明 Dragonfly 端到端开销。
+该口径仍包含 Parent source open/fill、TX Window 等待以及 URMA SEND/CQE，不应表述为纯网卡线速。
+
+```bash
+jq '{endToEnd: .result.transfer.concurrentSummary.aggregateThroughputMiBps,
+     transportMiBps: .result.transfer.urmaServerTransportSpanSummary.aggregateThroughputMiBps,
+     transportGbps: .result.transfer.urmaServerTransportSpanSummary.aggregateThroughputGbps,
+     transportBestGbps: .result.transfer.urmaServerTransportSpanSummary.bestThroughputGbps}' \
+  results/<run-id>/manifest.json
+```
+
 ```bash
 cargo build --release -p dragonfly-client \
   --features urma-test-failpoints --bin dfdaemon --bin dfget
