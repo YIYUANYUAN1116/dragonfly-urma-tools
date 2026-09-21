@@ -2392,7 +2392,12 @@ def analyze_evidence(
         return bool(set(log_task_id_pattern.findall(line)) & task_ids)
 
     child_attempt_lines = [
-        line for line in child.splitlines() if "finished dragonfly urma piece attempt" in line
+        line
+        for line in child.splitlines()
+        if "finished dragonfly urma piece attempt" in line
+        # The READ data plane logs its own per-piece span; the substring
+        # "urma piece attempt" never matches inside it, so count both.
+        or "finished dragonfly urma READ piece attempt" in line
     ]
     parent_peer_piece_lines = [
         line
@@ -2415,7 +2420,10 @@ def analyze_evidence(
         "failed to download piece over urma",
     )
     summary = {
-        "parentUrmaFinished": parent.count("finished uploading piece content over urma"),
+        "parentUrmaFinished": parent.count("finished uploading piece content over urma")
+        # The READ parent never runs the SEND/RECV upload path; each served
+        # piece logs exactly one of these, after the child has fully read it.
+        + parent.count("urma READ source fully read; revoking export"),
         "childUrmaAttempts": len(child_attempt_lines),
         "childUrmaSuccesses": sum("success=true" in line for line in child_attempt_lines),
         "laneFinished": parent.count("urma piece finished on peer lane")

@@ -1568,6 +1568,28 @@ storage:
                 "finished dragonfly urma piece attempt success=true\nrestarting over tcp\n",
             )
 
+    def test_evidence_accepts_read_data_plane_markers(self):
+        # A READ run: the child logs the READ attempt span and the parent logs
+        # the per-piece source revocation line instead of SEND/RECV uploads.
+        summary = b7.analyze_evidence(
+            "urma READ source fully read; revoking export\n",
+            "finished dragonfly urma READ piece attempt success=true\n",
+        )
+        self.assertEqual(summary["parentUrmaFinished"], 1)
+        self.assertEqual(summary["childUrmaSuccesses"], 1)
+        self.assertEqual(summary["childUrmaAttempts"], 1)
+        with self.assertRaises(b7.B7Error):
+            b7.analyze_evidence(
+                "urma READ source fully read; revoking export\n",
+                "finished dragonfly urma READ piece attempt success=false\n",
+            )
+        with self.assertRaisesRegex(b7.B7Error, "fallback/error"):
+            b7.analyze_evidence(
+                "urma READ source fully read; revoking export\n",
+                "finished dragonfly urma READ piece attempt success=true\n"
+                "urma READ download failed; falling back to tcp downloader\n",
+            )
+
     def test_evidence_rejects_piece_count_mismatch_and_transport_error(self):
         with self.assertRaises(b7.B7Error):
             b7.analyze_evidence(
