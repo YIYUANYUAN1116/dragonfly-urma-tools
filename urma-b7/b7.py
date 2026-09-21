@@ -3143,7 +3143,7 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 or parse_piece_length_bytes(piece_length) is None
             ):
                 raise B7Error(
-                    f"case {case['name']} requires pieceLength in 4MiB..=64MiB "
+                    f"case {case['name']} requires pieceLength in 4MiB..=256MiB "
                     "(human readable, e.g. 4mib)"
                 )
         result[case["name"]] = case
@@ -3170,7 +3170,7 @@ def validate_transfer_identity(
 
 PIECE_LENGTH_RE = re.compile(r"^(\d+)(mib|gib)$", re.IGNORECASE)
 MIN_PIECE_LENGTH_BYTES = 4 * 1024 * 1024
-MAX_PIECE_LENGTH_BYTES = 64 * 1024 * 1024
+MAX_PIECE_LENGTH_BYTES = 256 * 1024 * 1024
 
 
 def parse_piece_length_bytes(piece_length: str) -> int | None:

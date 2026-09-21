@@ -92,6 +92,7 @@
     {"name": "fanin-post1-in32-l2-pipe2-rx16", "fileClass": "1g", "topology": "fanin", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "maxRegisteredBytes": "24MiB", "txRegisteredBytes": "8MiB", "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
     {"name": "fanin-post1-in32-l2-pipe2-rx8", "fileClass": "1g", "topology": "fanin", "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 32, "maxRegisteredBytes": "16MiB", "txRegisteredBytes": "8MiB", "concurrency": 2, "repetitions": 3, "warmups": 1, "category": "multi-lane"},
     {"name": "read-smoke-post1-pipe1", "fileClass": "1g", "postListSize": 1, "pipelineDepth": 1, "maxInflightChunks": 16, "repetitions": 1, "warmups": 0, "urmaRead": {"maxReadSize": "4MiB"}, "category": "urma-read-correctness"},
-    {"name": "read-piece16-cc8-post1-pipe2", "fileClass": "1g", "pieceLength": "16mib", "concurrentPieceCount": 8, "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 3, "warmups": 1, "urmaRead": {"maxReadSize": "4MiB"}, "category": "urma-read-performance"}
+    {"name": "read-piece16-cc8-post1-pipe2", "fileClass": "1g", "pieceLength": "16mib", "concurrentPieceCount": 8, "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 3, "warmups": 1, "urmaRead": {"maxReadSize": "4MiB"}, "category": "urma-read-performance"},
+    {"name": "read-piece256-single", "fileClass": "256m", "pieceLength": "256mib", "concurrentPieceCount": 1, "postListSize": 1, "pipelineDepth": 2, "maxInflightChunks": 16, "repetitions": 2, "warmups": 1, "urmaRead": {"quarantineBytes": "512MiB", "maxReadSize": "4MiB"}, "category": "urma-read-giant-piece"}
   ]
 }

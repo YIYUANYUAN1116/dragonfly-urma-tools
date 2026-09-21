@@ -82,7 +82,7 @@
     "node": "node1",
     "baseUrl": "http://141.61.17.196:8080",
     "directory": "/home/y30083740/dragonfly-b7/origin",
-    "seedFiles": {"1g": "input-1g.bin"}
+    "seedFiles": {"1g": "input-1g.bin", "256m": "input-256m.bin"}
   },
   "dragonfly": {
     "defaultSocket": "/var/run/dragonfly/dfdaemon.sock",
