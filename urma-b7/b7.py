@@ -3062,13 +3062,24 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 "totalBytes",
                 "sourceBytes",
                 "destinationBytes",
+                "perPeerSourceBytes",
+                "perPeerDestinationBytes",
+                "quarantineBytes",
                 "maxReadSize",
             }
             if unknown:
                 raise B7Error(
                     f"case {case['name']} has unsupported urmaRead keys {sorted(unknown)}"
                 )
-            for key in ("totalBytes", "sourceBytes", "destinationBytes", "maxReadSize"):
+            for key in (
+                "totalBytes",
+                "sourceBytes",
+                "destinationBytes",
+                "perPeerSourceBytes",
+                "perPeerDestinationBytes",
+                "quarantineBytes",
+                "maxReadSize",
+            ):
                 if key in urma_read and not isinstance(urma_read[key], str):
                     raise B7Error(
                         f"case {case['name']} urmaRead.{key} must be a human-readable byte size"
@@ -3263,13 +3274,31 @@ def role_overlays(
             "providerRevocationValidated", True
         )
         overlays[("storage", "server", "urma", "read", "totalBytes")] = read.get(
-            "totalBytes", "128MiB"
+            "totalBytes", "2GiB"
         )
         overlays[("storage", "server", "urma", "read", "sourceBytes")] = read.get(
-            "sourceBytes", "64MiB"
+            "sourceBytes", "1GiB"
         )
         overlays[("storage", "server", "urma", "read", "destinationBytes")] = read.get(
-            "destinationBytes", "64MiB"
+            "destinationBytes", "1GiB"
+        )
+        # READ registers one whole registered destination/source buffer per
+        # in-flight piece, and each allocation is additionally capped by the
+        # per-peer budgets. The built-in defaults (4MiB) assume 1MiB RM-era
+        # chunks and would reject whole-piece allocations, so default the
+        # per-peer budgets to their pool values unless a case overrides them.
+        source_budget = read.get("sourceBytes", "1GiB")
+        destination_budget = read.get("destinationBytes", "1GiB")
+        overlays[("storage", "server", "urma", "read", "perPeerSourceBytes")] = read.get(
+            "perPeerSourceBytes", source_budget
+        )
+        overlays[("storage", "server", "urma", "read", "perPeerDestinationBytes")] = read.get(
+            "perPeerDestinationBytes", destination_budget
+        )
+        # A failed owner is quarantined with its full piece charge, so the
+        # quarantine budget must hold at least a couple of the largest pieces.
+        overlays[("storage", "server", "urma", "read", "quarantineBytes")] = read.get(
+            "quarantineBytes", "128MiB"
         )
         overlays[("storage", "server", "urma", "read", "maxReadSize")] = read.get(
             "maxReadSize", "1MiB"
