@@ -754,6 +754,7 @@ for _ in $(seq 1 180); do
     fi
   done
   if [ -z "$busy_port" ]; then ports_ready=1; break; fi
+  echo "waiting for port $busy_port to become reusable..." >&2
   sleep 0.5
 done
 if [ "$ports_ready" -ne 1 ]; then
@@ -2763,6 +2764,7 @@ for _ in $(seq 1 180); do
     fi
   done
   if [ -z "$busy_port" ]; then ports_ready=1; break; fi
+  echo "waiting for port $busy_port to become reusable..." >&2
   sleep 0.5
 done
 if [ "$ports_ready" -ne 1 ]; then
