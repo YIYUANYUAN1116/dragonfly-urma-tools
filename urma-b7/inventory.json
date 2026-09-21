@@ -97,7 +97,7 @@
     "runRoot": "/home/y30083740/dragonfly-b7/run",
     "storageRoot": "/home/y30083740/dragonfly-b7/storage",
     "tmpfsStorageRoot": "/home/y30083740/dragonfly-b7/tmpfs-storage",
-    "parentPorts": {"upload": 44000, "health": 44001, "metrics": 44002, "proxy": 44003, "tcp": 44005, "quic": 44006, "stats": 44007, "urma": 44008},
-    "childPorts": {"upload": 44100, "health": 44101, "metrics": 44102, "proxy": 44103, "tcp": 44105, "quic": 44106, "stats": 44107, "urma": 44108}
+    "parentPorts": {"upload": 24000, "health": 24001, "metrics": 24002, "proxy": 24003, "tcp": 24005, "quic": 24006, "stats": 24007, "urma": 24008},
+    "childPorts": {"upload": 24100, "health": 24101, "metrics": 24102, "proxy": 24103, "tcp": 24105, "quic": 24106, "stats": 24107, "urma": 24108}
   }
 }

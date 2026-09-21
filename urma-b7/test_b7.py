@@ -728,7 +728,7 @@ storage:
         self.assertIn('transportMode: "rm"', rendered)
         self.assertIn('tpType: "rtp"', rendered)
         self.assertIn("peerGuaranteedRxCredits: 0", rendered)
-        self.assertIn("metrics:\n  server:\n    port: 44002", rendered)
+        self.assertIn("metrics:\n  server:\n    port: 24002", rendered)
         self.assertIn("enable: true", rendered)
 
     def test_prepare_defaults_to_manifest_only(self):
@@ -3056,7 +3056,7 @@ storage:
         ]
         self.assertIn("enable: true", child_lines)
         self.assertIn("mmapContent: true", child_lines)
-        self.assertIn("port: 44108", child_lines)
+        self.assertIn("port: 24108", child_lines)
         rendered_parent = b7.render_role_config(
             source, self.inventory, generated["parent"], "parent", "b7-fanin", case
         )
