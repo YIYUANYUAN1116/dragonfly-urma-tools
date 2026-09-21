@@ -3085,6 +3085,7 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 "perPeerSourceBytes",
                 "perPeerDestinationBytes",
                 "quarantineBytes",
+                "maxOutstandingPerPeer",
                 "maxReadSize",
             }
             if unknown:
@@ -3104,6 +3105,13 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                     raise B7Error(
                         f"case {case['name']} urmaRead.{key} must be a human-readable byte size"
                     )
+            if "maxOutstandingPerPeer" in urma_read and not (
+                isinstance(urma_read["maxOutstandingPerPeer"], int)
+                and 1 <= urma_read["maxOutstandingPerPeer"] <= 1024
+            ):
+                raise B7Error(
+                    f"case {case['name']} urmaRead.maxOutstandingPerPeer must be an int in 1..=1024"
+                )
         if protocol == "tcp" and topology != "queue":
             raise B7Error(
                 f"case {case['name']} protocol tcp only supports queue topology"
@@ -3330,6 +3338,14 @@ def role_overlays(
         # quarantine budget must hold at least a couple of the largest pieces.
         overlays[("storage", "server", "urma", "read", "quarantineBytes")] = read.get(
             "quarantineBytes", "128MiB"
+        )
+        # The per-peer WR credit pool is shared by ALL concurrent piece
+        # transfers towards one parent: demand is roughly concurrentPieceCount
+        # x pieceLength / maxReadSize. The 4-WR default (sized for one legacy
+        # transfer) exhausts under any concurrency and fails pieces over to
+        # TCP; 256 covers cc32 x 16MiB pieces with 1MiB maxReadSize.
+        overlays[("storage", "server", "urma", "read", "maxOutstandingPerPeer")] = read.get(
+            "maxOutstandingPerPeer", 256
         )
         overlays[("storage", "server", "urma", "read", "maxReadSize")] = read.get(
             "maxReadSize", "1MiB"

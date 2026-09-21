@@ -55,6 +55,40 @@ class B7Tests(unittest.TestCase):
                 ),
             )
 
+    def test_read_overlay_injects_shared_wr_credits(self):
+        # The per-peer WR credit pool is shared across concurrent transfers;
+        # the 8-WR default exhausts at cc8 x 16MiB / 4MiB = 32 outstanding WRs
+        # (read-perf-001 diagnosis) and fails pieces over to TCP.
+        inventory = b7.select_profile(self.inventory, "read")
+        _, _, generated = b7.generated_layout(inventory, "dual", "run-read-credits", None)
+        case = b7.load_cases(TOOL_DIR / "cases.json")["read-piece16-cc8-post1-pipe2"]
+        for role in ("parent", "child"):
+            overlays = b7.role_overlays(
+                inventory, generated[role], role, "run-read-credits", case
+            )
+            self.assertEqual(
+                overlays[("storage", "server", "urma", "read", "maxOutstandingPerPeer")], 256
+            )
+        cases_path = TOOL_DIR / "cases-negative-credits.json"
+        cases_path.write_text(json.dumps({
+            "schemaVersion": 1,
+            "cases": [{
+                "name": "bad-read-credits",
+                "fileClass": "1g",
+                "protocol": "urma",
+                "postListSize": 1,
+                "pipelineDepth": 1,
+                "maxInflightChunks": 16,
+                "repetitions": 1,
+                "urmaRead": {"maxOutstandingPerPeer": "8MiB"},
+            }],
+        }))
+        try:
+            with self.assertRaisesRegex(b7.B7Error, "maxOutstandingPerPeer"):
+                b7.load_cases(cases_path)
+        finally:
+            cases_path.unlink()
+
     def test_inventory_freezes_rm_preflight_contract(self):
         b7.validate_inventory(self.inventory)
         for node in self.inventory["nodes"].values():
