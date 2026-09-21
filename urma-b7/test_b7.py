@@ -1808,9 +1808,8 @@ storage:
         self.assertEqual(b7.parse_piece_length_bytes("4mib"), 4 * 1024 * 1024)
         self.assertEqual(b7.parse_piece_length_bytes("16MiB"), 16 * 1024 * 1024)
         self.assertEqual(b7.parse_piece_length_bytes("64mib"), 64 * 1024 * 1024)
-        self.assertEqual(b7.parse_piece_length_bytes("256mib"), 256 * 1024 * 1024)
         self.assertIsNone(b7.parse_piece_length_bytes("2mib"))
-        self.assertIsNone(b7.parse_piece_length_bytes("257mib"))
+        self.assertIsNone(b7.parse_piece_length_bytes("65mib"))
         self.assertIsNone(b7.parse_piece_length_bytes("4kb"))
         self.assertIsNone(b7.parse_piece_length_bytes("abc"))
         cases = {
