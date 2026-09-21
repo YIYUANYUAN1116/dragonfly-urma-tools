@@ -13,6 +13,7 @@
       "workspaceRoot": "/home/y30083740/dragonfly",
       "rmRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
       "rcRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
+      "readRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-read",
       "toolsRepo": "/home/y30083740/dragonfly/dragonfly-urma-tools",
       "config": "/home/y30083740/dragonfly/config/dfdaemon-parent.yaml",
       "schedulerConfig": "/home/y30083740/dragonfly/config/scheduler.yaml"
@@ -24,6 +25,7 @@
       "workspaceRoot": "/home/y30083740/dragonfly",
       "rmRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-rm",
       "rcRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-private",
+      "readRepo": "/home/y30083740/dragonfly/dragonfly-client-urma-read",
       "toolsRepo": "/home/y30083740/dragonfly/dragonfly-urma-tools",
       "config": "/home/y30083740/dragonfly/config/dfdaemon-child.yaml"
     }
@@ -57,6 +59,19 @@
         "crossNodeProbe": {
           "status": "passed",
           "note": "Historical B5/B6/B8 cross-node RC provider validation; rerun discover and archive fresh binary/config hashes before comparison."
+        }
+      },
+      "read": {
+        "repoField": "readRepo",
+        "expectedBranch": "urma-read-prototype",
+        "transportMode": "rm",
+        "tpType": "ctp",
+        "requiredMaxMessageBytes": 65536,
+        "peerGuaranteedRxCredits": 0,
+        "nativeResourceModel": "process-wide-shared-endpoint-with-peer-targets",
+        "crossNodeProbe": {
+          "status": "passed",
+          "note": "2026-09-21 manual two-node evidence: rm_read_memory_to_memory_session harness on eid0 passes; urma_perftest 1MiB 256 repeats ~48GB/s CTP read_bw on eid0."
         }
       }
     },

@@ -105,6 +105,7 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
             "workspaceRoot",
             "rmRepo",
             "rcRepo",
+            "readRepo",
             "toolsRepo",
             "config",
         ):
@@ -114,8 +115,10 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
             raise B7Error(f"node {name} RM repo must be dragonfly-client-urma-rm")
         if PurePosixPath(node["rcRepo"]).name != "dragonfly-client-urma-private":
             raise B7Error(f"node {name} RC baseline repo must be dragonfly-client-urma-private")
-        if node["rmRepo"] == node["rcRepo"]:
-            raise B7Error(f"node {name} RM and RC repos must be distinct")
+        if PurePosixPath(node["readRepo"]).name != "dragonfly-client-urma-read":
+            raise B7Error(f"node {name} READ repo must be dragonfly-client-urma-read")
+        if len({node["rmRepo"], node["rcRepo"], node["readRepo"]}) != 3:
+            raise B7Error(f"node {name} RM, RC, and READ repos must be distinct")
     single_host = inventory.get("singleHost")
     if not isinstance(single_host, dict):
         raise B7Error("inventory must define singleHost settings")
@@ -126,18 +129,21 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
     if not isinstance(urma, dict):
         raise B7Error("inventory must define urma settings")
     profiles = urma.get("profiles")
-    if not isinstance(profiles, dict) or set(profiles) != {"rc", "rm"}:
-        raise B7Error("inventory urma.profiles must define exactly rc and rm")
+    if not isinstance(profiles, dict) or set(profiles) != {"rc", "rm", "read"}:
+        raise B7Error("inventory urma.profiles must define exactly rc, rm, and read")
     if urma.get("defaultProfile") not in profiles:
         raise B7Error("inventory urma.defaultProfile must select an URMA profile")
     for profile_name, profile in profiles.items():
         if not isinstance(profile, dict):
             raise B7Error(f"inventory URMA profile {profile_name} must be an object")
-        if profile.get("transportMode") != profile_name:
+        # The READ profile reuses the RM transport (RM + CTP) with the
+        # RM-READ-only data plane enabled by the dfdaemon read config.
+        expected_transport = "rm" if profile_name == "read" else profile_name
+        if profile.get("transportMode") != expected_transport:
             raise B7Error(
-                f"inventory URMA profile {profile_name} must use transportMode={profile_name}"
+                f"inventory URMA profile {profile_name} must use transportMode={expected_transport}"
             )
-        if profile.get("repoField") not in ("rmRepo", "rcRepo"):
+        if profile.get("repoField") not in ("rmRepo", "rcRepo", "readRepo"):
             raise B7Error(f"inventory URMA profile {profile_name} has invalid repoField")
         if not isinstance(profile.get("expectedBranch"), str) or not profile["expectedBranch"]:
             raise B7Error(f"inventory URMA profile {profile_name} requires expectedBranch")
@@ -463,6 +469,13 @@ def provider_probe_tp_types(profile: str, requested: str | None) -> list[str]:
         if requested not in (None, "rtp"):
             raise B7Error("RC provider probes support only --tp-type rtp")
         return ["rtp"]
+    if profile == "read":
+        # The RM-READ data plane only serves CTP lanes, and the cluster CTP
+        # resources are bound to eid0 (see the read profile crossNodeProbe
+        # note), so the READ probe matrix is CTP-only.
+        if requested not in (None, "ctp"):
+            raise B7Error("READ provider probes support only --tp-type ctp")
+        return ["ctp"]
     if profile != "rm":
         raise B7Error(f"unsupported provider probe profile {profile!r}")
     if requested in (None, "both"):
@@ -490,14 +503,21 @@ def provider_probe_argv(
         raise B7Error("provider probe iterations must be in 5..=1000000")
     if priority is not None and not 0 <= priority <= 15:
         raise B7Error("provider probe priority must be in 0..=15")
-    argv = [
-        "urma_perftest", "send_bw", "-d", str(inventory["urma"]["device"]),
-        "--eid_idx", str(inventory["urma"]["eidIndex"]), "--tp_aware",
-    ]
+    argv = ["urma_perftest", "send_bw", "-d", str(inventory["urma"]["device"])]
+    if profile != "read":
+        # The READ probe mirrors the archived manual evidence, which used the
+        # provider auto-import path without a TP-aware get_tp_list pre-pass.
+        argv.append("--tp_aware")
+    argv.extend(["--eid_idx", str(inventory["urma"]["eidIndex"])])
     if tp_type == "ctp":
         argv.append("--ctp")
+    if profile != "read":
+        # READ probes omit -p so urma_perftest auto-selects the CTP service
+        # priority (6 on the validation cluster), matching the manual
+        # cross-node evidence archived for the read profile.
+        argv.extend(["-p", "0" if profile == "rm" else "1"])
     argv.extend([
-        "-p", "0" if profile == "rm" else "1", "-j", "true",
+        "-j", "true",
         "-n", str(iterations), "-s", str(size),
     ])
     # -O selects a service priority, not an operation. When absent the tool can
@@ -3031,6 +3051,26 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         protocol = case.get("protocol", "urma")
         if protocol not in ("urma", "tcp"):
             raise B7Error(f"case {case['name']} has unsupported protocol {protocol!r}")
+        urma_read = case.get("urmaRead")
+        if urma_read is not None:
+            if not isinstance(urma_read, dict):
+                raise B7Error(f"case {case['name']} urmaRead must be an object")
+            unknown = set(urma_read) - {
+                "providerRevocationValidated",
+                "totalBytes",
+                "sourceBytes",
+                "destinationBytes",
+                "maxReadSize",
+            }
+            if unknown:
+                raise B7Error(
+                    f"case {case['name']} has unsupported urmaRead keys {sorted(unknown)}"
+                )
+            for key in ("totalBytes", "sourceBytes", "destinationBytes", "maxReadSize"):
+                if key in urma_read and not isinstance(urma_read[key], str):
+                    raise B7Error(
+                        f"case {case['name']} urmaRead.{key} must be a human-readable byte size"
+                    )
         if protocol == "tcp" and topology != "queue":
             raise B7Error(
                 f"case {case['name']} protocol tcp only supports queue topology"
@@ -3212,6 +3252,26 @@ def role_overlays(
         overlays[("storage", "server", "urma", "peerGuaranteedRxCredits")] = case.get(
             "peerGuaranteedRxCredits", inventory["urma"].get("peerGuaranteedRxCredits", 0)
         )
+    if inventory.get("selectedProfile") == "read":
+        # Enable the RM-READ-only data plane on both roles. The budgets live
+        # in the read config section (validated against each other by the
+        # dfdaemon config schema) and are overrideable per case via urmaRead.
+        read = case.get("urmaRead", {})
+        overlays[("storage", "server", "urma", "read", "providerRevocationValidated")] = read.get(
+            "providerRevocationValidated", True
+        )
+        overlays[("storage", "server", "urma", "read", "totalBytes")] = read.get(
+            "totalBytes", "128MiB"
+        )
+        overlays[("storage", "server", "urma", "read", "sourceBytes")] = read.get(
+            "sourceBytes", "64MiB"
+        )
+        overlays[("storage", "server", "urma", "read", "destinationBytes")] = read.get(
+            "destinationBytes", "64MiB"
+        )
+        overlays[("storage", "server", "urma", "read", "maxReadSize")] = read.get(
+            "maxReadSize", "1MiB"
+        )
     return overlays
 
 
@@ -3275,7 +3335,7 @@ def urma_validation_metadata(inventory: dict[str, Any], mode: str) -> dict[str, 
     # selected profile's gate for backward compatibility.
     cross_node_probes = {
         name: dict(urma["profiles"][name]["crossNodeProbe"]) if name != inventory["selectedProfile"] else probe
-        for name in ("rm", "rc")
+        for name in ("rm", "rc", "read")
     }
     return {
         "profile": inventory["selectedProfile"],
@@ -3300,7 +3360,10 @@ def require_urma_preflight(
     if not isinstance(validation, dict):
         raise B7Error("URMA manifest lacks explicit transport validation metadata")
     profile = manifest.get("profile")
-    if validation.get("profile") != profile or validation.get("transportMode") != profile:
+    # The READ profile rides the RM transport (RM + CTP) with the READ-only
+    # data plane enabled, so its manifest transportMode is rm, not "read".
+    expected_transport = "rm" if profile == "read" else profile
+    if validation.get("profile") != profile or validation.get("transportMode") != expected_transport:
         raise B7Error("URMA manifest profile and transport validation metadata disagree")
     if manifest.get("mode") != "dual":
         return
@@ -4923,14 +4986,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--inventory", type=Path, default=TOOL_DIR / "inventory.json")
     subparsers = result.add_subparsers(dest="command", required=True)
     discover = subparsers.add_parser("discover", help="read-only SSH environment discovery")
-    discover.add_argument("--profile", choices=("rc", "rm"), default="rm")
+    discover.add_argument("--profile", choices=("rc", "rm", "read"), default="rm")
     discover.add_argument("nodes", nargs="*", metavar="NODE")
     discover.add_argument("--output", type=Path, default=TOOL_DIR / "results" / "inventory.discovered.json")
     probe = subparsers.add_parser(
         "probe-provider",
         help="run an isolated urma_perftest provider probe and archive evidence",
     )
-    probe.add_argument("--profile", choices=("rc", "rm"), default="rm")
+    probe.add_argument("--profile", choices=("rc", "rm", "read"), default="rm")
     probe.add_argument("--mode", choices=("dual", "single"), required=True)
     probe.add_argument("--host", choices=("node1", "node2"))
     probe.add_argument("--server-node", choices=("node1", "node2"))
@@ -4962,13 +5025,13 @@ def parser() -> argparse.ArgumentParser:
         help="execute remote perftest processes; omitted means evidence-plan dry-run",
     )
     plan = subparsers.add_parser("plan", help="generate a non-executing topology plan")
-    plan.add_argument("--profile", choices=("rc", "rm"), default="rm")
+    plan.add_argument("--profile", choices=("rc", "rm", "read"), default="rm")
     plan.add_argument("--mode", choices=("dual", "single"), required=True)
     plan.add_argument("--host", choices=("node1", "node2"))
     plan.add_argument("--run-id", default=default_run_id())
     plan.add_argument("--output", type=Path)
     render = subparsers.add_parser("render-config", help="render an isolated dfdaemon YAML locally")
-    render.add_argument("--profile", choices=("rc", "rm"), default="rm")
+    render.add_argument("--profile", choices=("rc", "rm", "read"), default="rm")
     render.add_argument("--source", type=Path, required=True)
     render.add_argument("--output", type=Path, required=True)
     render.add_argument("--role", choices=("parent", "child"), required=True)
@@ -4980,7 +5043,7 @@ def parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser(
         "prepare", help="prepare isolated remote configs and a unique origin artifact"
     )
-    prepare.add_argument("--profile", choices=("rc", "rm"), default="rm")
+    prepare.add_argument("--profile", choices=("rc", "rm", "read"), default="rm")
     prepare.add_argument("--mode", choices=("dual", "single"), required=True)
     prepare.add_argument("--host", choices=("node1", "node2"))
     prepare.add_argument("--run-id", required=True)
