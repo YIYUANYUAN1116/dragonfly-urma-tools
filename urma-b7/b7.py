@@ -3259,6 +3259,15 @@ def role_overlays(
         ("health", "server", "port"): ports["health"],
         ("metrics", "server", "port"): ports["metrics"],
         ("stats", "server", "port"): ports["stats"],
+        # Every dfdaemon server section has an optional listen ip. Pin each one
+        # to the role's node address so the rendered config is self-consistent;
+        # stale ip values inherited from the checked-in node config would bind
+        # (and advertise) the wrong host.
+        ("upload", "server", "ip"): node["host"],
+        ("proxy", "server", "ip"): node["host"],
+        ("health", "server", "ip"): node["host"],
+        ("metrics", "server", "ip"): node["host"],
+        ("stats", "server", "ip"): node["host"],
     }
     if inventory["urma"]["transportMode"] == "rm":
         overlays[("storage", "server", "urma", "tpType")] = inventory["urma"]["tpType"]
