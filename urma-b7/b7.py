@@ -485,6 +485,18 @@ def provider_probe_tp_types(profile: str, requested: str | None) -> list[str]:
     return [requested]
 
 
+def provider_probe_eid_index(inventory: dict[str, Any], profile: str) -> int:
+    base = int(inventory["urma"]["eidIndex"])
+    if profile == "read" and base != 0:
+        # The RM-READ CTP lanes only exist on eid0 on the validation cluster;
+        # the other EID entries are address-only (see the read profile
+        # crossNodeProbe note and the Phase 19 import_jetty diagnosis). RM and
+        # RC keep the inventory default because their transports have separate
+        # resource bindings.
+        return 0
+    return base
+
+
 def provider_probe_argv(
     inventory: dict[str, Any],
     profile: str,
@@ -508,7 +520,7 @@ def provider_probe_argv(
         # The READ probe mirrors the archived manual evidence, which used the
         # provider auto-import path without a TP-aware get_tp_list pre-pass.
         argv.append("--tp_aware")
-    argv.extend(["--eid_idx", str(inventory["urma"]["eidIndex"])])
+    argv.extend(["--eid_idx", str(provider_probe_eid_index(inventory, profile))])
     if tp_type == "ctp":
         argv.append("--ctp")
     if profile != "read":
@@ -642,7 +654,7 @@ def build_provider_probe_plan(
         "mode": args.mode,
         "serverAddress": args.server_address,
         "device": inventory["urma"]["device"],
-        "eidIndex": inventory["urma"]["eidIndex"],
+        "eidIndex": provider_probe_eid_index(inventory, profile),
         "size": args.size,
         "iterations": args.iterations,
         "priority": args.priority,
@@ -3245,7 +3257,9 @@ def role_overlays(
         ("storage", "server", "urma", "enable"): is_urma_server,
         ("storage", "server", "urma", "port"): ports["urma"],
         ("storage", "server", "urma", "device"): inventory["urma"]["device"],
-        ("storage", "server", "urma", "eidIndex"): inventory["urma"]["eidIndex"],
+        ("storage", "server", "urma", "eidIndex"): provider_probe_eid_index(
+            inventory, inventory["selectedProfile"]
+        ),
         ("storage", "server", "urma", "fabricTag"): inventory["urma"]["fabricTag"],
         ("storage", "server", "urma", "transportMode"): inventory["urma"]["transportMode"],
         ("storage", "server", "urma", "maxRegisteredBytes"): case.get("maxRegisteredBytes", "40MiB"),

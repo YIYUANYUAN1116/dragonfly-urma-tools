@@ -34,6 +34,27 @@ class B7Tests(unittest.TestCase):
             with self.assertRaises(b7.B7Error):
                 b7.validate_cpu_affinity(value)
 
+    def test_read_profile_forces_eid0_for_ctp_lanes(self):
+        # The validation cluster binds CTP resources to eid0 only; eid1-7 are
+        # address-only and import_jetty fails there (Phase 19 diagnosis).
+        self.assertEqual(b7.provider_probe_eid_index(self.inventory, "read"), 0)
+        # RM and RC keep the inventory default for their own transports.
+        self.assertEqual(b7.provider_probe_eid_index(self.inventory, "rm"), 1)
+        self.assertEqual(b7.provider_probe_eid_index(self.inventory, "rc"), 1)
+        read_inventory = b7.select_profile(self.inventory, "read")
+        _, _, generated = b7.generated_layout(read_inventory, "dual", "run-read-eid", None)
+        for role in ("parent", "child"):
+            self.assertIn(
+                ("storage", "server", "urma", "eidIndex"),
+                b7.role_overlays(
+                    read_inventory,
+                    generated[role],
+                    role,
+                    "run-read-eid",
+                    {"name": "read-smoke-post1-pipe1", "maxInflightChunks": 16, "postListSize": 1, "pipelineDepth": 1},
+                ),
+            )
+
     def test_inventory_freezes_rm_preflight_contract(self):
         b7.validate_inventory(self.inventory)
         for node in self.inventory["nodes"].values():
