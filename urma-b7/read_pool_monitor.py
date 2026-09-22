@@ -42,6 +42,7 @@ FIELD_RE = re.compile(r"(\w+)=(\S+)")
 CHILD_MARKERS = {
     "pool_hit": "urma READ pool hit",
     "pool_miss": "urma READ pool miss; registering destination",
+    "pool_evicted": "urma READ pool evicted",
     "pool_returned": "urma READ pool returned",
     "pool_bypass": "urma READ pool bypass; unregistering destination",
     "piece_attempt": "finished dragonfly urma READ piece attempt",
@@ -90,6 +91,7 @@ def parse_log(text: str, source: str) -> dict:
     child = {
         "pool_hit": 0,
         "pool_miss": 0,
+        "pool_evicted": 0,
         "pool_returned": 0,
         "pool_bypass": 0,
         "tcp_fallback": 0,
@@ -145,6 +147,12 @@ def parse_log(text: str, source: str) -> dict:
             )
             retained = int(fields.get("retained_bytes", 0))
             child["peak_retained_bytes"] = max(child["peak_retained_bytes"], retained)
+        elif CHILD_MARKERS["pool_evicted"] in payload:
+            fields = parse_fields(payload)
+            child["pool_evicted"] += 1
+            retained = int(fields.get("retained_bytes", 0))
+            child["peak_retained_bytes"] = max(child["peak_retained_bytes"], retained)
+            child["final_retained_bytes"] = retained
         elif CHILD_MARKERS["pool_returned"] in payload:
             fields = parse_fields(payload)
             child["pool_returned"] += 1
@@ -271,6 +279,7 @@ def print_report(results):
         print(f"  register (miss)     : {child['pool_miss']}")
         print(f"  pool hit            : {child['pool_hit']}  (hit rate {hit_rate})")
         print(f"  returned to pool    : {child['pool_returned']}")
+        print(f"  evicted from pool   : {child['pool_evicted']}")
         print(f"  unregister (bypass) : {child['pool_bypass']}")
         print(f"  peak retained bytes : {fmt_len(child['peak_retained_bytes'])}")
         final = child["final_retained_bytes"]

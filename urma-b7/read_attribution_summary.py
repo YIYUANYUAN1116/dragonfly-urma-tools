@@ -115,8 +115,14 @@ def median_ns(timing, key):
 
 
 def markers(text: str) -> dict:
-    """Startup-chain timestamps in the child daemon's own clock."""
+    """Startup-chain timestamps in the child daemon's own clock.
+
+    `lane_count` is the number of lane establishment lines in this batch: a READ
+    lane is cached per parent in the daemon, so only the first batch of a run can
+    establish one and the measured batches report zero.
+    """
     first = lane = piece_start = piece_done = None
+    lane_count = 0
     for line in text.splitlines():
         match = mon.TS_RE.match(line)
         if match is None:
@@ -127,8 +133,10 @@ def markers(text: str) -> dict:
         if first is None:
             first = timestamp
         payload = line[match.end():]
-        if lane is None and "urma READ lane established" in payload:
-            lane = timestamp
+        if "urma READ lane established" in payload:
+            lane_count += 1
+            if lane is None:
+                lane = timestamp
         if piece_start is None and mon.CHILD_MARKERS["piece_attempt"] in payload:
             piece_done = timestamp
             e2e = mon.parse_fields(payload).get("child_piece_e2e_ns", "")
@@ -138,6 +146,7 @@ def markers(text: str) -> dict:
     return {
         "first_line_ts": first,
         "lane_ts": lane,
+        "lane_count": lane_count,
         "piece_start_ts": piece_start,
         "piece_done_ts": piece_done,
         "effective_max_read_size": effective.group(1) if effective else None,
@@ -287,8 +296,8 @@ def print_tables(records: list[dict]) -> None:
     print("\n== parent source data plane / child Piece E2E (samples; warmup apart) ==")
     print(
         f"{'run':<14} {'use':<7} {'n':>3} {'childE2E p50/p95':>17} {'srcE2E p50/p95':>15} "
-        f"{'register':>8} {'copy#2':>7} {'pin':>6} {'token':>6} "
-        f"{'wait':>7} {'revoke':>7} {'pool hit/miss':>13} {'fallb':>6}"
+        f"{'register':>8} {'alloc':>7} {'copy#2':>7} {'pin':>5} {'token':>6} "
+        f"{'wait':>7} {'revoke':>7} {'hit/miss/evict':>15} {'pkRet':>7} {'fallb':>6}"
     )
     for r in records:
         for label in ("samples", "warmup"):
@@ -308,7 +317,18 @@ def print_tables(records: list[dict]) -> None:
 
             child_e2e = child.get("piece_e2e_ns") or {}
             source_e2e = parent.get("source_e2e_ns") or {}
-            pool = f"{child.get('pool_hit', 0)}/{child.get('pool_miss', 0)}"
+            if child:
+                pool = "{}/{}/{}".format(
+                    child.get("pool_hit", 0),
+                    child.get("pool_miss", 0),
+                    child.get("pool_evicted", 0),
+                )
+            else:
+                pool = "-"
+            if child:
+                peak = fmt_bytes(child.get("peak_retained_bytes"))
+            else:
+                peak = "-"
             columns = [
                 f"{str(r['run']):<14}",
                 f"{label:<7}",
@@ -316,32 +336,48 @@ def print_tables(records: list[dict]) -> None:
                 f"{pair(child_e2e):>17}",
                 f"{pair(source_e2e):>15}",
                 f"{num_or_dash(p50('stage_register_ns')):>8}",
+                f"{num_or_dash(p50('stage_reg_alloc_ns')):>7}",
                 f"{num_or_dash(p50('stage_reg_copy_ns')):>7}",
-                f"{num_or_dash(p50('stage_reg_seg_ns')):>6}",
+                f"{num_or_dash(p50('stage_reg_seg_ns')):>5}",
                 f"{num_or_dash(p50('stage_reg_token_ns')):>6}",
                 f"{num_or_dash(p50('stage_wait_ns')):>7}",
                 f"{num_or_dash(p50('stage_revoke_ns')):>7}",
-                f"{pool:>13}",
+                f"{pool:>15}",
+                f"{peak:>7}",
                 f"{child.get('tcp_fallback', '-'):>6}",
             ]
             print(" ".join(columns))
 
     print("\n== startup chain per batch (child clock; first line ~= dfget launch) ==")
     print(
-        f"{'run':<14} {'batch':<24} {'effMaxRd':>9} {'line->lane':>10} "
+        f"{'run':<14} {'batch':<24} {'effMaxRd':>9} {'lanes':>5} {'line->lane':>10} "
         f"{'lane->piece':>11} {'piece ms':>9}"
     )
     for r in records:
+        run_effective = next(
+            (b["effective_max_read_size"] for b in r["batches"] if b["effective_max_read_size"]),
+            None,
+        )
         for batch in sorted(r["batches"], key=lambda b: (b["role"], b["log"])):
             if batch["role"] != "child":
                 continue
-            effective = batch["effective_max_read_size"]
+            effective = batch["effective_max_read_size"] or run_effective
+            # A batch with no lane line reused the lane the warmup established, so
+            # the line->lane gap is not measurable there and lane->piece would be
+            # meaningless.
+            if batch["lane_count"]:
+                line_to_lane = fmt_gap(gap_ms(batch["lane_ts"], batch["first_line_ts"]))
+                lane_to_piece = fmt_gap(gap_ms(batch["piece_start_ts"], batch["lane_ts"]))
+            else:
+                line_to_lane = "reused"
+                lane_to_piece = "-"
             columns = [
                 f"{str(r['run']):<14}",
                 f"{batch['log']:<24}",
                 f"{fmt_bytes(int(effective)) if effective else '?':>9}",
-                f"{fmt_gap(gap_ms(batch['lane_ts'], batch['first_line_ts'])):>10}",
-                f"{fmt_gap(gap_ms(batch['piece_start_ts'], batch['lane_ts'])):>11}",
+                f"{batch['lane_count']:>5}",
+                f"{line_to_lane:>10}",
+                f"{lane_to_piece:>11}",
                 f"{fmt_gap(gap_ms(batch['piece_done_ts'], batch['piece_start_ts'])):>9}",
             ]
             print(" ".join(columns))

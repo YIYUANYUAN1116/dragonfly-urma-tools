@@ -212,7 +212,22 @@ placement，应先固定 CPU 做可比测试，再单独增加 `numactl --membin
 `origin` 目录，或将 inventory 的 `origin.directory` 改回服务实际提供的目录；B7 不会自动修改
 nginx/HTTP 服务配置。
 
-## Performance case
+### RM READ 下一轮性能归因
+
++`read-piece32-cc16-post1-pipe2` 与 `read-piece32-cc16-read4-post1-pipe2` 是单 WR 尺寸的严格 A/B：
++两者固定 1 GiB 文件、32 MiB Piece、cc16、post1、pipe2，只把 `maxReadSize` 从 32 MiB（1 WR/Piece）
++改成 4 MiB（8 WR/Piece）。先跑既有 `tcp-piece-cc8/cc16/cc32-post1-pipe2` 定性
++`startToFirstPiece` 的 cc 依赖，再跑这组 A/B；不要用 16 MiB Piece 的结果推断 WR size。
++
++```bash
++python3 b7.py prepare --profile read --mode dual --run-id read-wr4-001 \
++  --case read-piece32-cc16-read4-post1-pipe2 --execute
++python3 b7.py run --manifest results/read-wr4-001/manifest.json --execute
++python3 read_attribution_summary.py results/read-src-009 results/read-wr4-001
++python3 b7.py cleanup --manifest results/read-wr4-001/manifest.json --execute
++```
++
++## Performance case
 
 `cases.json` 中的 performance case 会真实执行 `warmups` 和 `repetitions`，不是只记录矩阵参数。工具先在
 child 启动前完成全部唯一 task 的 parent preheat，再启动 child 并按相同顺序使用
