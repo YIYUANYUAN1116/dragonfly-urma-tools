@@ -15,6 +15,15 @@ reports the first-round verification checklist:
 Usage:
     python3 read_pool_monitor.py results/<runId>/            # walk a run dir
     python3 read_pool_monitor.py node1.log node2.log --json  # explicit logs
+
+Calibration note. `*.tasks.log` artifacts are `filter_task_scoped_log` output:
+they keep only lines whose `task_id=` matches the measured task. The pool
+markers below are emitted by `read_buffer_pool.rs` on the dedicated URMA owner
+thread (`dragonfly-urma-fabric`), where no task-scoped span is active, so they
+carry no `task_id` and are absent from every task-scoped projection by
+construction. Pool counters must therefore be read from the range logs
+(`<role>.<batch>.log`, `*.sample-*.log`, `*.warmup-*.log`); the directory walk
+skips `*.tasks.log`, whose Piece lines would also double-count the range log.
 """
 
 from __future__ import annotations
@@ -273,6 +282,10 @@ def print_report(results):
                 f"    length {fmt_len(length):>8}: register {count:4d}, hit {hits:4d}"
                 f"  (extra registers beyond first: {max(0, count - 1)})"
             )
+        if total_take == 0 and child["piece_e2e_ns"]:
+            print("  note                : Piece lines but no pool markers; this looks"
+                  " like a task-scoped log, which cannot carry owner-thread pool"
+                  " events. Read pool counters from the range log instead.")
 
         e2e = child["piece_e2e_ns"]
         if e2e:
@@ -326,12 +339,19 @@ def main() -> int:
     results = []
     for raw in args.paths:
         path = Path(raw)
+        walked = path.is_dir()
         files = (
             [p for p in path.rglob("*") if p.is_file()]
-            if path.is_dir()
+            if walked
             else [path]
         )
         for file in sorted(files):
+            # Task-scoped projections cannot carry owner-thread pool markers and
+            # duplicate the range log's Piece lines (see the calibration note), so
+            # a directory walk skips them. An explicit path is still read, and
+            # print_report explains the resulting empty pool block.
+            if walked and file.name.endswith(".tasks.log"):
+                continue
             try:
                 text = file.read_text(errors="replace")
             except OSError as error:

@@ -22,8 +22,12 @@
  *   4 stale descriptor    -- reading with the (now unregistered) descriptor must
  *                            fail closed, and must not silently return data
  *
- * It also sweeps the table capacity: how many segments one tid can hold at once.
- * That number, not a guessed pool size, decides how many tids A12 needs.
+ * It also sweeps the table capacity: how many segments one tid can hold at once,
+ * and how many bytes those segments cover. The byte figure is the one the
+ * product needs, because the shipped config bounds live source registrations by
+ * `sourceBytes / Download.PieceLength`, i.e. by covered bytes at product shape.
+ * The sweep stops at whichever comes first: the `--sweep` entry target, the
+ * `--sweep-bytes` pinned-memory budget, or the provider's first refusal.
  *
  * Lane isolation (v2). The first hardware run reported "unregister disturbed a
  * sibling" after exactly as many reads as there were segments, with every later
@@ -51,9 +55,17 @@
  *      -lurma -lurma_common -lpthread -o read_multiseg_probe
  *
  * run (parent = source side, node1; child = reader side, node2):
- *   # parent
+ *   # parent (2 GiB sweep budget = 128 x 16 MiB, i.e. 2x the shipped 1 GiB
+ *   # sourceBytes pool at product Piece shape)
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_multiseg_probe parent --dev udmac0d1e2 --eid 0 \
- *       --listen 0.0.0.0:13999 --segments 8 --seg-bytes 1048576 --sweep 512
+ *       --listen 0.0.0.0:13999 --segments 8 --seg-bytes 16777216 --sweep 128
+ *   # parent (same 2 GiB budget in entry shape: 2048 x 1 MiB). Compare the two
+ *   # P-SWEEP lines: whichever bound stopped each run is printed, so a first
+ *   # refusal at 128 x 16 MiB plus a clean run to 2048 x 1 MiB means the cap is
+ *   # byte-bound, while a first refusal near 128 entries in both shapes means it
+ *   # is entry-bound.
+ *   LD_LIBRARY_PATH=/usr/lib64 ./read_multiseg_probe parent --dev udmac0d1e2 --eid 0 \
+ *       --listen 0.0.0.0:13999 --segments 8 --seg-bytes 1048576 --sweep 2048
  *   # child
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_multiseg_probe child --dev udmac0d1e2 --eid 0 \
  *       --connect 141.61.17.196:13999
@@ -79,7 +91,11 @@
 
 #define DEFAULT_DEV "udmac0d1e2"
 #define DEFAULT_PORT 13999
-#define MAX_SEGS 512
+#define MAX_SEGS 2048
+/* Pinned-memory guard for the capacity sweep: without it a larger MAX_SEGS
+ * would let an old-style `--sweep 2048 --seg-bytes 16777216` invite a 32 GiB
+ * allocation. The sweep reports which bound stopped it. */
+#define DEFAULT_SWEEP_BYTES (2ULL * 1024ULL * 1024ULL * 1024ULL)
 #define JETTY_TOKEN 0xACE0u      /* jetty/jfr token, identical on both sides */
 #define SEG_TOKEN_BASE 0x10000000u
 #define BOGUS_SEG_TOKEN 0xDEADBEEFu
@@ -128,6 +144,7 @@ struct options {
     uint32_t segments;
     uint32_t seg_bytes;
     uint32_t sweep; /* parent: total segments to reach while sweeping, 0 = off */
+    uint64_t sweep_bytes; /* parent: pinned-byte budget for the sweep, 0 = none */
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -731,53 +748,80 @@ static int run_parent(const struct options *opt)
     printf("P-REG %u segments live        one tid, register_seg each errno=0\n", n);
 
     /* Capacity sweep: keep adding disposable segments on the SAME tid until the
-     * provider refuses. This is the number that decides how many tids A12 needs. */
+     * provider refuses or a budget is spent. The covered-byte figure is what
+     * decides whether ONE tid can hold the shipped `sourceBytes` pool; comparing
+     * it against the entry figure says whether the limit is per-grant or per-byte. */
     capacity = n;
     {
         int first_failure = -1;
         int failure_errno = 0;
-        if (opt->sweep > n) {
-            for (uint32_t i = n; i < opt->sweep && i < MAX_SEGS; i++) {
-                urma_seg_cfg_t cfg = {0};
-                if (posix_memalign(&segs[i].buf, 4096, opt->seg_bytes) != 0) {
-                    break;
-                }
-                segs[i].va = (uint64_t)(uintptr_t)segs[i].buf;
-                segs[i].len = opt->seg_bytes;
-                segs[i].token_value = SEG_TOKEN_BASE + i;
-                cfg.va = segs[i].va;
-                cfg.len = segs[i].len;
-                cfg.token_id = table_tid;
-                cfg.token_value.token = segs[i].token_value;
-                cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
-                cfg.flag.bs.access = URMA_ACCESS_READ;
-                cfg.flag.bs.cacheable = URMA_NON_CACHEABLE;
-                cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
-                errno = 0;
-                segs[i].seg = urma_register_seg(ep.context, &cfg);
-                if (segs[i].seg == NULL) {
-                    first_failure = (int)i;
-                    failure_errno = errno;
-                    free(segs[i].buf);
-                    segs[i].buf = NULL;
-                    break;
-                }
-                segs[i].live = 1;
-                capacity = i + 1;
+        int alloc_failure = 0;
+        uint32_t entry_limit =
+            opt->sweep < (uint32_t)MAX_SEGS ? opt->sweep : (uint32_t)MAX_SEGS;
+        uint64_t swept_bytes = 0;
+        for (uint32_t i = n; opt->sweep > n && i < entry_limit; i++) {
+            urma_seg_cfg_t cfg = {0};
+            if (opt->sweep_bytes != 0
+                && swept_bytes + opt->seg_bytes > opt->sweep_bytes) {
+                break;
             }
+            if (posix_memalign(&segs[i].buf, 4096, opt->seg_bytes) != 0) {
+                alloc_failure = 1;
+                break;
+            }
+            segs[i].va = (uint64_t)(uintptr_t)segs[i].buf;
+            segs[i].len = opt->seg_bytes;
+            segs[i].token_value = SEG_TOKEN_BASE + i;
+            cfg.va = segs[i].va;
+            cfg.len = segs[i].len;
+            cfg.token_id = table_tid;
+            cfg.token_value.token = segs[i].token_value;
+            cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+            cfg.flag.bs.access = URMA_ACCESS_READ;
+            cfg.flag.bs.cacheable = URMA_NON_CACHEABLE;
+            cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
+            errno = 0;
+            segs[i].seg = urma_register_seg(ep.context, &cfg);
+            if (segs[i].seg == NULL) {
+                first_failure = (int)i;
+                failure_errno = errno;
+                free(segs[i].buf);
+                segs[i].buf = NULL;
+                break;
+            }
+            segs[i].live = 1;
+            capacity = i + 1;
+            swept_bytes += opt->seg_bytes;
         }
         if (opt->sweep <= n) {
             printf("P-SWEEP capacity              sweep disabled"
-                   " (--sweep %u <= --segments %u); one tid held %u segments\n",
-                   opt->sweep, n, capacity);
-        } else if (first_failure < 0) {
-            printf("P-SWEEP capacity              one tid held %u simultaneous segments"
-                   " (sweep target %u reached with no failure; raise --sweep)\n",
-                   capacity, opt->sweep);
+                   " (--sweep %u <= --segments %u); one tid held %u segments,"
+                   " %llu bytes covered\n",
+                   opt->sweep, n, capacity,
+                   (unsigned long long)capacity * opt->seg_bytes);
+        } else if (first_failure >= 0) {
+            printf("P-SWEEP capacity              first provider refusal at %u"
+                   " segments, %llu bytes covered (index %d errno=%d)\n",
+                   capacity, (unsigned long long)capacity * opt->seg_bytes,
+                   first_failure, failure_errno);
+        } else if (alloc_failure) {
+            printf("P-SWEEP capacity              one tid held %u segments,"
+                   " %llu bytes covered; stopped by local allocation of another"
+                   " %u-byte segment\n",
+                   capacity, (unsigned long long)capacity * opt->seg_bytes,
+                   opt->seg_bytes);
+        } else if (capacity >= entry_limit) {
+            printf("P-SWEEP capacity              one tid held %u segments,"
+                   " %llu bytes covered; stopped by the entry bound"
+                   " (--sweep %u / MAX_SEGS %d), no provider refusal seen\n",
+                   capacity, (unsigned long long)capacity * opt->seg_bytes,
+                   opt->sweep, MAX_SEGS);
         } else {
-            printf("P-SWEEP capacity              one tid held %u simultaneous segments"
-                   " (first failure at index %d errno=%d)\n",
-                   capacity, first_failure, failure_errno);
+            printf("P-SWEEP capacity              one tid held %u segments,"
+                   " %llu bytes covered; stopped by --sweep-bytes %llu,"
+                   " no provider refusal seen\n",
+                   capacity, (unsigned long long)capacity * opt->seg_bytes,
+                   (unsigned long long)opt->sweep_bytes);
         }
         /* Retire the sweep-only segments; the probe segments stay live. */
         for (uint32_t i = n; i < MAX_SEGS; i++) {
@@ -1355,7 +1399,7 @@ static void usage(const char *argv0)
 {
     printf("usage:\n");
     printf("  %s parent --listen <ip:port> [--dev D] [--eid N] [--segments N]"
-           " [--seg-bytes B] [--sweep N]\n", argv0);
+           " [--seg-bytes B] [--sweep N] [--sweep-bytes B]\n", argv0);
     printf("  %s child  --connect <ip:port> [--dev D] [--eid N] [--segments N] [--seg-bytes B]\n", argv0);
 }
 
@@ -1370,6 +1414,7 @@ int main(int argc, char **argv)
         .segments = 8,
         .seg_bytes = 1u << 20,
         .sweep = 64,
+        .sweep_bytes = DEFAULT_SWEEP_BYTES,
     };
     int exit_code;
 
@@ -1393,6 +1438,8 @@ int main(int argc, char **argv)
             opt.seg_bytes = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--sweep") == 0 && i + 1 < argc) {
             opt.sweep = (uint32_t)strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--sweep-bytes") == 0 && i + 1 < argc) {
+            opt.sweep_bytes = strtoull(argv[++i], NULL, 0);
         } else {
             printf("unknown argument: %s\n", argv[i]);
             usage(argv[0]);
