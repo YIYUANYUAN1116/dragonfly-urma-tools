@@ -25,6 +25,19 @@
  * It also sweeps the table capacity: how many segments one tid can hold at once.
  * That number, not a guessed pool size, decides how many tids A12 needs.
  *
+ * Lane isolation (v2). The first hardware run reported "unregister disturbed a
+ * sibling" after exactly as many reads as there were segments, with every later
+ * read -- including ones using a correct token -- getting no completion at all.
+ * That is a stateful lane failure, not a per-request refusal, so v2 never lets a
+ * check inherit another check's lane:
+ *   - the healthy checks (C-1, C-1b, C-3) run first, all on the main lane
+ *   - C-1b keeps reading the same healthy segment to expose a lane that stops
+ *     completing after a few reads (a reuse limit, not a token effect)
+ *   - each poison check (C-4, C-2) builds a fresh lane, proves it healthy with a
+ *     control READ, and only then runs the poisoned READ -- so a refusal is
+ *     attributable to the poisoned descriptor and not to a dead lane
+ *   - "no completion" is reported as such, never silently counted as a refusal
+ *
  * The product code is untouched: this program opens its own context, speaks a
  * private TCP control protocol, and uses its own wire descriptor format.
  *
@@ -40,14 +53,14 @@
  * run (parent = source side, node1; child = reader side, node2):
  *   # parent
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_multiseg_probe parent --dev udmac0d1e2 --eid 0 \
- *       --listen 0.0.0.0:13999 --segments 8 --seg-bytes 1048576 --sweep 64
+ *       --listen 0.0.0.0:13999 --segments 8 --seg-bytes 1048576 --sweep 512
  *   # child
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_multiseg_probe child --dev udmac0d1e2 --eid 0 \
- *       --connect 141.61.17.196:13999 --segments 8 --seg-bytes 1048576
- *   (--segments/--seg-bytes must agree on both sides; the child uses the values
- *    sent by the parent for the reads, and its own only for the local buffer)
+ *       --connect 141.61.17.196:13999
+ *   (the child reads the segment count and size the parent offers; at least 2
+ *    segments are required so a poison check has a live control segment)
  *
- * exit code: 0 = all four checks PASS, 1 = any FAIL or setup error.
+ * exit code: 0 = every check PASS, 1 = any FAIL or setup error.
  */
 
 #include <arpa/inet.h>
@@ -261,14 +274,27 @@ static const char *cr_status_name(urma_cr_status_t status)
 
 /* --------------------------------------------------------------- urma glue */
 
-struct endpoint {
-    urma_context_t *context;
-    urma_device_attr_t attr;
+/* A lane is one JFS/JFR/jetty plus the CTP target it imported. Each poison
+ * check gets its own lane: a wrong-token or stale READ can suspend the JFS that
+ * carried it, and that suspension must not be allowed to masquerade as a later
+ * check's result (observed on hardware: the first refused READ left every
+ * following READ on the same jetty without a completion). */
+struct lane {
     urma_jfc_t *send_jfc;
     urma_jfc_t *recv_jfc;
     urma_jfr_t *jfr;
     urma_jetty_t *jetty;
+    urma_target_jetty_t *tjetty;
+};
+
+struct endpoint {
+    urma_context_t *context;
+    urma_device_attr_t attr;
     uint8_t tp_priority;
+    uint32_t jfc_depth;
+    uint32_t jfr_depth;
+    uint32_t jfs_depth;
+    struct lane main;
 };
 
 static uint32_t capped_depth(uint32_t depth)
@@ -291,13 +317,83 @@ static int resolve_tp_priority(urma_device_attr_t *attr, uint8_t *priority)
     return -1;
 }
 
-static int endpoint_init(struct endpoint *ep, const char *dev_name, uint32_t eid_index, uint8_t tp_type)
+static int lane_init(struct endpoint *ep, struct lane *ln)
 {
-    urma_device_t *device;
     urma_jfc_cfg_t jfc_cfg = {0};
     urma_jfr_cfg_t jfr_cfg = {0};
     urma_jfs_cfg_t jfs_cfg = {0};
     urma_jetty_cfg_t jetty_cfg = {0};
+
+    memset(ln, 0, sizeof(*ln));
+
+    jfc_cfg.depth = ep->jfc_depth;
+    jfc_cfg.jfce = NULL;
+    ln->send_jfc = urma_create_jfc(ep->context, &jfc_cfg);
+    ln->recv_jfc = urma_create_jfc(ep->context, &jfc_cfg);
+    if (ln->send_jfc == NULL || ln->recv_jfc == NULL) {
+        printf("FAIL urma_create_jfc errno=%d\n", errno);
+        return -1;
+    }
+
+    jfr_cfg.depth = ep->jfr_depth;
+    jfr_cfg.flag.value = 0;
+    jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
+    jfr_cfg.trans_mode = URMA_TM_RM;
+    jfr_cfg.max_sge = 1;
+    jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+    jfr_cfg.jfc = ln->recv_jfc;
+    jfr_cfg.token_value.token = JETTY_TOKEN;
+    ln->jfr = urma_create_jfr(ep->context, &jfr_cfg);
+    if (ln->jfr == NULL) {
+        printf("FAIL urma_create_jfr errno=%d\n", errno);
+        return -1;
+    }
+
+    jfs_cfg.depth = ep->jfs_depth;
+    jfs_cfg.trans_mode = URMA_TM_RM;
+    jfs_cfg.priority = ep->tp_priority;
+    jfs_cfg.max_sge = 1;
+    jfs_cfg.max_rsge = 1;
+    jfs_cfg.max_inline_data = 0;
+    jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
+    jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
+    jfs_cfg.jfc = ln->send_jfc;
+
+    /* Same shape as dfurma_jetty_create: shared JFR plus its own JFC, and the
+     * JFS routed to the send JFC. */
+    jetty_cfg.flag.value = 0;
+    jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
+    jetty_cfg.jfs_cfg = jfs_cfg;
+    jetty_cfg.shared.jfr = ln->jfr;
+    jetty_cfg.shared.jfc = ln->recv_jfc;
+    ln->jetty = urma_create_jetty(ep->context, &jetty_cfg);
+    if (ln->jetty == NULL) {
+        printf("FAIL urma_create_jetty errno=%d\n", errno);
+        return -1;
+    }
+    return 0;
+}
+
+static void lane_fini(struct lane *ln)
+{
+    if (ln->jetty != NULL) {
+        (void)urma_delete_jetty(ln->jetty);
+    }
+    if (ln->jfr != NULL) {
+        (void)urma_delete_jfr(ln->jfr);
+    }
+    if (ln->send_jfc != NULL) {
+        (void)urma_delete_jfc(ln->send_jfc);
+    }
+    if (ln->recv_jfc != NULL) {
+        (void)urma_delete_jfc(ln->recv_jfc);
+    }
+    memset(ln, 0, sizeof(*ln));
+}
+
+static int endpoint_init(struct endpoint *ep, const char *dev_name, uint32_t eid_index, uint8_t tp_type)
+{
+    urma_device_t *device;
 
     memset(ep, 0, sizeof(*ep));
     device = urma_get_device_by_name((char *)dev_name);
@@ -318,70 +414,33 @@ static int endpoint_init(struct endpoint *ep, const char *dev_name, uint32_t eid
         printf("FAIL no CTP priority advertised in dev_cap.priority_info\n");
         return -1;
     }
+    /* The product uses send/recv_jfc_depth = 4096 and lets the provider cap it;
+     * print both the advertised caps and the effective depths so a depth-limited
+     * probe can never be mistaken for a hardware refusal. */
+    ep->jfc_depth = capped_depth(ep->attr.dev_cap.max_jfc_depth);
+    ep->jfr_depth = capped_depth(ep->attr.dev_cap.max_jfr_depth);
+    ep->jfs_depth = capped_depth(ep->attr.dev_cap.max_jfs_depth);
 
-    jfc_cfg.depth = capped_depth(ep->attr.dev_cap.max_jfc_depth);
-    jfc_cfg.jfce = NULL;
-    ep->send_jfc = urma_create_jfc(ep->context, &jfc_cfg);
-    ep->recv_jfc = urma_create_jfc(ep->context, &jfc_cfg);
-    if (ep->send_jfc == NULL || ep->recv_jfc == NULL) {
-        printf("FAIL urma_create_jfc errno=%d\n", errno);
+    printf("endpoint caps                max_jfc=%u(max_depth %u) max_jfs=%u(depth %u) "
+           "max_jfr=%u(depth %u) max_jetty=%u max_read_size=%u\n",
+           ep->attr.dev_cap.max_jfc, ep->attr.dev_cap.max_jfc_depth,
+           ep->attr.dev_cap.max_jfs, ep->attr.dev_cap.max_jfs_depth,
+           ep->attr.dev_cap.max_jfr, ep->attr.dev_cap.max_jfr_depth,
+           ep->attr.dev_cap.max_jetty, ep->attr.dev_cap.max_read_size);
+    printf("endpoint lane depths         send_jfc=%u recv_jfc=%u jfr=%u jfs=%u\n",
+           ep->jfc_depth, ep->jfc_depth, ep->jfr_depth, ep->jfs_depth);
+
+    if (lane_init(ep, &ep->main) != 0) {
         return -1;
     }
-
-    jfr_cfg.depth = capped_depth(ep->attr.dev_cap.max_jfr_depth);
-    jfr_cfg.flag.value = 0;
-    jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-    jfr_cfg.trans_mode = URMA_TM_RM;
-    jfr_cfg.max_sge = 1;
-    jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-    jfr_cfg.jfc = ep->recv_jfc;
-    jfr_cfg.token_value.token = JETTY_TOKEN;
-    ep->jfr = urma_create_jfr(ep->context, &jfr_cfg);
-    if (ep->jfr == NULL) {
-        printf("FAIL urma_create_jfr errno=%d\n", errno);
-        return -1;
-    }
-
-    jfs_cfg.depth = capped_depth(ep->attr.dev_cap.max_jfs_depth);
-    jfs_cfg.trans_mode = URMA_TM_RM;
-    jfs_cfg.priority = ep->tp_priority;
-    jfs_cfg.max_sge = 1;
-    jfs_cfg.max_rsge = 1;
-    jfs_cfg.max_inline_data = 0;
-    jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-    jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-    jfs_cfg.jfc = ep->send_jfc;
-
-    jetty_cfg.flag.value = 0;
-    jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
-    jetty_cfg.jfs_cfg = jfs_cfg;
-    jetty_cfg.shared.jfr = ep->jfr;
-    jetty_cfg.shared.jfc = ep->recv_jfc;
-    ep->jetty = urma_create_jetty(ep->context, &jetty_cfg);
-    if (ep->jetty == NULL) {
-        printf("FAIL urma_create_jetty errno=%d\n", errno);
-        return -1;
-    }
-
     printf("endpoint ready               dev=%s eid=%u local_jetty_id=%u tp_priority=%u\n",
-           dev_name, eid_index, ep->jetty->jetty_id.id, ep->tp_priority);
+           dev_name, eid_index, ep->main.jetty->jetty_id.id, ep->tp_priority);
     return 0;
 }
 
 static void endpoint_fini(struct endpoint *ep)
 {
-    if (ep->jetty != NULL) {
-        (void)urma_delete_jetty(ep->jetty);
-    }
-    if (ep->jfr != NULL) {
-        (void)urma_delete_jfr(ep->jfr);
-    }
-    if (ep->send_jfc != NULL) {
-        (void)urma_delete_jfc(ep->send_jfc);
-    }
-    if (ep->recv_jfc != NULL) {
-        (void)urma_delete_jfc(ep->recv_jfc);
-    }
+    lane_fini(&ep->main);
     if (ep->context != NULL) {
         (void)urma_delete_context(ep->context);
     }
@@ -389,8 +448,8 @@ static void endpoint_fini(struct endpoint *ep)
 
 /* Import the peer jetty in RM+CTP, mirroring dfurma_jetty_import including its
  * "no assignable TP" fallback to the provider's automatic CTP path. */
-static urma_target_jetty_t *import_jetty_rm(struct endpoint *ep, const struct wire_header *hdr,
-                                            int *out_stage)
+static urma_target_jetty_t *import_jetty_rm(struct endpoint *ep, struct lane *ln,
+                                            const struct wire_header *hdr, int *out_stage)
 {
     urma_rjetty_t rjetty = {0};
     urma_token_t token_value = {0};
@@ -414,7 +473,7 @@ static urma_target_jetty_t *import_jetty_rm(struct endpoint *ep, const struct wi
 
     tp_cfg.flag.bs.ctp = 1;
     tp_cfg.trans_mode = URMA_TM_RM;
-    tp_cfg.local_eid = ep->jetty->jetty_id.eid;
+    tp_cfg.local_eid = ln->jetty->jetty_id.eid;
     tp_cfg.peer_eid = rjetty.jetty_id.eid;
     {
         uint32_t tp_count = 1;
@@ -437,11 +496,11 @@ static urma_target_jetty_t *import_jetty_rm(struct endpoint *ep, const struct wi
     return urma_import_jetty_ex(ep->context, &rjetty, &token_value, &active_cfg);
 }
 
-static int wait_cr(struct endpoint *ep, uint64_t user_ctx, urma_cr_t *cr)
+static int wait_cr(struct lane *ln, uint64_t user_ctx, urma_cr_t *cr)
 {
     uint64_t deadline = monotonic_ms() + POLL_TIMEOUT_MS;
     while (monotonic_ms() < deadline) {
-        int cnt = urma_poll_jfc(ep->send_jfc, 1, cr);
+        int cnt = urma_poll_jfc(ln->send_jfc, 1, cr);
         if (cnt < 0) {
             printf("FAIL urma_poll_jfc ret=%d\n", cnt);
             return -1;
@@ -464,8 +523,7 @@ struct read_outcome {
     urma_cr_status_t status;
 };
 
-static void post_read(struct endpoint *ep, urma_target_jetty_t *tjetty,
-                      urma_target_seg_t *local_tseg, void *local_buf,
+static void post_read(struct lane *ln, urma_target_seg_t *local_tseg, void *local_buf,
                       urma_target_seg_t *remote_tseg, uint64_t remote_va, uint32_t len,
                       struct read_outcome *out)
 {
@@ -495,18 +553,18 @@ static void post_read(struct endpoint *ep, urma_target_jetty_t *tjetty,
     wr.opcode = URMA_OPC_READ;
     wr.flag.value = 0;
     wr.flag.bs.complete_enable = 1;
-    wr.tjetty = tjetty;
+    wr.tjetty = ln->tjetty;
     wr.user_ctx = user_ctx;
     wr.rw.src = src_sg;
     wr.rw.dst = dst_sg;
     wr.next = NULL;
 
-    status = urma_post_jetty_send_wr(ep->jetty, &wr, &bad_wr);
+    status = urma_post_jetty_send_wr(ln->jetty, &wr, &bad_wr);
     if (status != URMA_SUCCESS || bad_wr != NULL) {
         out->post_failed = 1;
         return;
     }
-    if (wait_cr(ep, user_ctx, &cr) != 0) {
+    if (wait_cr(ln, user_ctx, &cr) != 0) {
         out->post_failed = 1;
         printf("FAIL no completion for read len=%u\n", len);
         user_ctx++;
@@ -750,9 +808,9 @@ static int run_parent(const struct options *opt)
     hdr.tp_type = (uint8_t)URMA_CTP;
     hdr.n = n;
     hdr.seg_bytes = opt->seg_bytes;
-    memcpy(hdr.eid, ep.jetty->jetty_id.eid.raw, sizeof(hdr.eid));
-    hdr.uasid = ep.jetty->jetty_id.uasid;
-    hdr.jetty_id = ep.jetty->jetty_id.id;
+    memcpy(hdr.eid, ep.main.jetty->jetty_id.eid.raw, sizeof(hdr.eid));
+    hdr.uasid = ep.main.jetty->jetty_id.uasid;
+    hdr.jetty_id = ep.main.jetty->jetty_id.id;
     hdr.table_token_id = table_tid->token_id;
     hdr.jetty_token = JETTY_TOKEN;
     if (send_all(fd, &hdr, sizeof(hdr)) != 0) {
@@ -831,7 +889,6 @@ struct reader {
     urma_target_seg_t *local_tseg;
     void *local_buf;
     uint32_t local_len;
-    urma_target_jetty_t *tjetty;
     urma_target_seg_t *remote[MAX_SEGS];
     struct source_seg desc[MAX_SEGS]; /* va/len/token_value as offered */
     uint32_t n;
@@ -861,9 +918,125 @@ static urma_target_seg_t *import_source(struct reader *r, const struct wire_head
     return urma_import_seg(r->ep.context, &seg, &token, 0, flag);
 }
 
+/* One poison check, isolated on its own lane.
+ *
+ * A refused READ can suspend the JFS that carried it; on hardware the first
+ * refused READ left every following READ on the same jetty without a
+ * completion, which made a shared-lane version of this probe report "unregister
+ * disturbed a sibling" for what was really a dead lane. Each case therefore
+ * builds a fresh lane and proves it healthy with a control READ *before* the
+ * poisoned one. That control is what makes the refusal attributable: the lane
+ * demonstrably worked, and the only thing that changes afterwards is the
+ * poisoned descriptor. */
+struct poison_result {
+    int lane_ready;    /* control-before READ succeeded on this lane */
+    int refused;       /* poisoned READ produced no data */
+    int leak;          /* poisoned READ returned the expected payload */
+    int wrong_bytes;   /* poisoned READ completed with unattributable bytes */
+    int buffer_intact; /* destination still all poison right after the READ */
+    int lane_survived; /* control-after READ still worked (informational) */
+    urma_cr_status_t status;
+    int status_valid;
+};
+
+static void poison_read_case(struct reader *r, const struct wire_header *hdr,
+                             uint32_t poison_index, urma_target_seg_t *poison_seg,
+                             uint32_t control_index, struct poison_result *out)
+{
+    struct lane lane;
+    struct read_outcome outcome;
+    int stage = -1;
+    int found = -1;
+
+    memset(out, 0, sizeof(*out));
+    memset(&lane, 0, sizeof(lane));
+
+    if (lane_init(&r->ep, &lane) != 0) {
+        printf("FAIL poison lane init\n");
+        return;
+    }
+    lane.tjetty = import_jetty_rm(&r->ep, &lane, hdr, &stage);
+    if (lane.tjetty == NULL) {
+        printf("FAIL poison lane jetty import stage=%d errno=%d (%s)\n",
+               stage, errno, strerror(errno));
+        lane_fini(&lane);
+        return;
+    }
+
+    /* Control before: valid VA plus the correct token, on this very lane. */
+    fill_poison(r->local_buf, r->local_len);
+    post_read(&lane, r->local_tseg, r->local_buf, r->remote[control_index],
+              r->desc[control_index].va, (uint32_t)r->desc[control_index].len, &outcome);
+    found = -1;
+    if (outcome.post_failed || outcome.status != URMA_CR_SUCCESS ||
+        verify_pattern(r->local_buf, r->local_len, control_index, &found) != 0) {
+        printf("FAIL poison lane control-before (post_failed=%d completed=%d found=%d)\n",
+               outcome.post_failed, outcome.completed, found);
+        lane_fini(&lane);
+        return;
+    }
+    out->lane_ready = 1;
+
+    /* The poisoned READ. */
+    fill_poison(r->local_buf, r->local_len);
+    post_read(&lane, r->local_tseg, r->local_buf, poison_seg,
+              r->desc[poison_index].va, (uint32_t)r->desc[poison_index].len, &outcome);
+    if (!outcome.post_failed) {
+        out->status_valid = 1;
+        out->status = outcome.status;
+    }
+    found = -1;
+    if (outcome.post_failed || outcome.status != URMA_CR_SUCCESS) {
+        out->refused = 1;
+        out->buffer_intact = buffer_all_poison(r->local_buf, r->local_len);
+    } else if (verify_pattern(r->local_buf, r->local_len, poison_index, &found) == 0) {
+        out->leak = 1;
+    } else {
+        out->wrong_bytes = 1;
+    }
+
+    /* Control after: informational. A failure here means the refusal suspended
+     * this lane, which is itself a product-relevant fact. */
+    fill_poison(r->local_buf, r->local_len);
+    post_read(&lane, r->local_tseg, r->local_buf, r->remote[control_index],
+              r->desc[control_index].va, (uint32_t)r->desc[control_index].len, &outcome);
+    found = -1;
+    if (!outcome.post_failed && outcome.status == URMA_CR_SUCCESS &&
+        verify_pattern(r->local_buf, r->local_len, control_index, &found) == 0) {
+        out->lane_survived = 1;
+    }
+
+    (void)urma_unimport_jetty(lane.tjetty);
+    lane_fini(&lane);
+}
+
+/* Renders one poison case as a single verdict line. */
+static void report_poison_case(const char *tag, const char *label, uint32_t index,
+                               uint32_t control_index, const struct poison_result *res)
+{
+    if (!res->lane_ready) {
+        printf("%s %-21s INCONCLUSIVE (fresh lane never served a control READ)\n", tag, label);
+        return;
+    }
+    if (res->leak) {
+        printf("%s %-21s poison seg=%u control seg=%u cr=SUCCESS and data readable"
+               " <== LEAK\n", tag, label, index, control_index);
+    } else if (res->wrong_bytes) {
+        printf("%s %-21s poison seg=%u control seg=%u cr=SUCCESS but bytes=WRONG"
+               " <== not fail-closed\n", tag, label, index, control_index);
+    } else {
+        printf("%s %-21s poison seg=%u control seg=%u refused (%s) buffer_intact=%d"
+               " lane_survived=%d -> attributable\n",
+               tag, label, index, control_index,
+               res->status_valid ? cr_status_name(res->status) : "no completion",
+               res->buffer_intact, res->lane_survived);
+    }
+}
+
 static int run_child(const struct options *opt)
 {
     struct reader r;
+    struct lane *lane0 = NULL;
     struct wire_header hdr = {0};
     struct wire_seg wire[MAX_SEGS];
     int fd = -1;
@@ -876,6 +1049,7 @@ static int run_child(const struct options *opt)
     int isolation_pass = 0;
     int unregister_pass = 0;
     int stale_pass = 0;
+    int lane0_extra_ok = 0;
     int stage = -1;
 
     memset(&r, 0, sizeof(r));
@@ -889,8 +1063,9 @@ static int run_child(const struct options *opt)
         return 1;
     }
     n = hdr.n;
-    if (n == 0 || n > MAX_SEGS) {
-        printf("FAIL parent offered n=%u\n", n);
+    if (n < 2 || n > MAX_SEGS) {
+        printf("FAIL parent offered n=%u (need at least 2 so a poison check has a live"
+               " control segment)\n", n);
         close(fd);
         return 1;
     }
@@ -935,8 +1110,9 @@ static int run_child(const struct options *opt)
         }
     }
 
-    r.tjetty = import_jetty_rm(&r.ep, &hdr, &stage);
-    if (r.tjetty == NULL) {
+    lane0 = &r.ep.main;
+    lane0->tjetty = import_jetty_rm(&r.ep, lane0, &hdr, &stage);
+    if (lane0->tjetty == NULL) {
         printf("FAIL urma_import_jetty (stage=%d) errno=%d (%s)\n", stage, errno, strerror(errno));
         goto out;
     }
@@ -973,7 +1149,7 @@ static int run_child(const struct options *opt)
         int found = -1;
         int verify;
         fill_poison(r.local_buf, r.local_len);
-        post_read(&r.ep, r.tjetty, r.local_tseg, r.local_buf, r.remote[i],
+        post_read(lane0, r.local_tseg, r.local_buf, r.remote[i],
                   r.desc[i].va, (uint32_t)r.desc[i].len, &outcome);
         if (outcome.post_failed) {
             post_failed++;
@@ -998,78 +1174,44 @@ static int run_child(const struct options *opt)
     printf("C-1 verdict correctness       ok=%u/%u wrong_pattern=%u cr_fail=%u post_fail=%u\n",
            correct_ok, n, wrong_pattern, cr_failed, post_failed);
 
-    /* Check 2: token isolation -- a foreign or bogus token_value must not read. */
+    /* The first hardware run stopped completing after exactly the n healthy
+     * C-1 reads, which is equally consistent with "a JFC that does not drain on
+     * poll" and with "the poison READ suspended the JFS". Keep reading the same
+     * healthy segment on lane0 to tell the two apart: a lane that cannot serve
+     * more healthy reads is a lane-reuse limit, not a token effect. */
     {
-        uint32_t victim = 0;
-        uint32_t foreign = n > 1 ? 1 % n : 0;
-        uint32_t cases = 0;
-        uint32_t closed = 0;
-        for (uint32_t c = 0; c < 2; c++) {
-            uint32_t bad_value;
-            const char *label;
-            urma_target_seg_t *bad;
+        uint32_t extra = 0;
+        const uint32_t extra_target = 4;
+        for (uint32_t i = 0; i < extra_target; i++) {
             struct read_outcome outcome;
             int found = -1;
-
-            if (c == 0 && n > 1) {
-                bad_value = r.desc[foreign].token_value; /* a live sibling's value */
-                label = "foreign-segment-value";
-            } else if (c == 0) {
-                bad_value = BOGUS_SEG_TOKEN;
-                label = "bogus-value";
-            } else {
-                bad_value = BOGUS_SEG_TOKEN + 0x1234u;
-                label = "bogus-value-2";
-            }
-            bad = import_source(&r, &hdr, &r.desc[victim], bad_value);
-
-            cases++;
-            if (bad == NULL) {
-                /* Import itself refused the mismatched value: fail-closed. */
-                closed++;
-                printf("C-2 %-21s value=0x%-8x import rejected errno=%d -> fail-closed\n",
-                       label, bad_value, errno);
-                continue;
-            }
             fill_poison(r.local_buf, r.local_len);
-            post_read(&r.ep, r.tjetty, r.local_tseg, r.local_buf, bad,
-                      r.desc[victim].va, (uint32_t)r.desc[victim].len, &outcome);
-            if (outcome.post_failed) {
-                printf("C-2 %-21s value=0x%-8x post/complete failed -> fail-closed\n",
-                       label, bad_value);
-                closed++;
-            } else if (outcome.status != URMA_CR_SUCCESS) {
-                printf("C-2 %-21s value=0x%-8x cr=%s -> fail-closed\n",
-                       label, bad_value, cr_status_name(outcome.status));
-                closed++;
-            } else if (verify_pattern(r.local_buf, r.local_len, victim, &found) == 0) {
-                printf("C-2 %-21s value=0x%-8x cr=SUCCESS and data readable"
-                       " <== TOKEN ISOLATION LEAK\n", label, bad_value);
-            } else {
-                printf("C-2 %-21s value=0x%-8x cr=SUCCESS but bytes=WRONG (%s)"
-                       " <== not fail-closed\n", label, bad_value, pattern_label(found));
+            post_read(lane0, r.local_tseg, r.local_buf, r.remote[0],
+                      r.desc[0].va, (uint32_t)r.desc[0].len, &outcome);
+            if (outcome.post_failed || outcome.status != URMA_CR_SUCCESS ||
+                verify_pattern(r.local_buf, r.local_len, 0, &found) != 0) {
+                break;
             }
-            (void)urma_unimport_seg(bad);
+            extra++;
         }
-        isolation_pass = (closed == cases);
-        printf("C-2 verdict token isolation   fail_closed=%u/%u\n", closed, cases);
-        if (!isolation_pass) {
-            printf("C-2 note                      a non-fail-closed case means the remote did not\n"
-                   "                              enforce token_value on the READ path, so isolation\n"
-                   "                              rests on (tid, VA, grant) only -- record this before\n"
-                   "                              using a shared tid in the product\n");
-        }
+        lane0_extra_ok = (extra == extra_target);
+        printf("C-1b lane0 extra reads       served=%u/%u %s\n", extra, extra_target,
+               lane0_extra_ok ? "-> lane keeps draining, no reuse limit seen"
+                              : "<== a lane stops completing after a few reads");
     }
 
-    /* Check 3+4: independent unregister and stale descriptor. */
+    /* Every remaining READ can poison the lane that carries it, so the healthy
+     * checks run first and each poison check gets a fresh lane of its own. */
+
+    /* Check 3: independent unregister -- a healthy READ on lane0 right after the
+     * parent ungranted one segment on the shared tid. */
     {
-        uint32_t target = 0;              /* the segment to unregister */
-        uint32_t other = (n > 1) ? (n - 1) : 0;
+        uint32_t target = 0;
+        uint32_t control = n - 1;
         struct wire_cmd cmd = {0};
         struct wire_ack ack = {0};
         struct read_outcome outcome;
         int found = -1;
-        int other_ok = (n <= 1);
 
         cmd.op = CMD_UNREGISTER;
         cmd.index = target;
@@ -1079,49 +1221,93 @@ static int run_child(const struct options *opt)
         }
         printf("C-3 parent unregistered       index=%u status=%d\n", target, ack.status);
         if (ack.status != (int32_t)URMA_SUCCESS) {
-            printf("C-3 verdict                   FAIL (parent unregister failed)\n");
-        }
-
-        if (n > 1) {
+            printf("C-3 verdict independent unregister FAIL (the parent refused to unregister)\n");
+        } else {
             fill_poison(r.local_buf, r.local_len);
-            post_read(&r.ep, r.tjetty, r.local_tseg, r.local_buf, r.remote[other],
-                      r.desc[other].va, (uint32_t)r.desc[other].len, &outcome);
+            post_read(lane0, r.local_tseg, r.local_buf, r.remote[control],
+                      r.desc[control].va, (uint32_t)r.desc[control].len, &outcome);
             if (outcome.post_failed) {
-                printf("C-3 seg=%-3u (still live) POST FAILED <== unregister disturbed a sibling\n", other);
+                printf("C-3 seg=%-3u (still live) cr=none <== FAIL\n", control);
             } else if (outcome.status != URMA_CR_SUCCESS) {
-                printf("C-3 seg=%-3u (still live) cr=%s <== unregister disturbed a sibling\n",
-                       other, cr_status_name(outcome.status));
-            } else if (verify_pattern(r.local_buf, r.local_len, other, &found) == 0) {
-                other_ok = 1;
-                printf("C-3 seg=%-3u (still live) cr=SUCCESS bytes=OK -> independent\n", other);
+                printf("C-3 seg=%-3u (still live) cr=%s <== FAIL\n",
+                       control, cr_status_name(outcome.status));
+            } else if (verify_pattern(r.local_buf, r.local_len, control, &found) == 0) {
+                unregister_pass = 1;
+                printf("C-3 seg=%-3u (still live) cr=SUCCESS bytes=OK -> independent\n", control);
             } else {
-                printf("C-3 seg=%-3u (still live) cr=SUCCESS bytes=WRONG (%s)\n",
-                       other, pattern_label(found));
+                printf("C-3 seg=%-3u (still live) cr=SUCCESS bytes=WRONG (%s) <== FAIL\n",
+                       control, pattern_label(found));
             }
         }
-        unregister_pass = other_ok;
+        printf("C-3 verdict independent unregister %s\n", unregister_pass ? "PASS" : "FAIL");
+    }
 
-        /* Stale descriptor: the parent already ungranted this VA on this tid. */
-        fill_poison(r.local_buf, r.local_len);
-        post_read(&r.ep, r.tjetty, r.local_tseg, r.local_buf, r.remote[target],
-                  r.desc[target].va, (uint32_t)r.desc[target].len, &outcome);
-        if (outcome.post_failed) {
-            stale_pass = buffer_all_poison(r.local_buf, r.local_len);
-            printf("C-4 stale seg=%-3u post/complete failed, buffer_intact=%d -> fail-closed\n",
-                   target, stale_pass);
-        } else if (outcome.status != URMA_CR_SUCCESS) {
-            stale_pass = buffer_all_poison(r.local_buf, r.local_len);
-            printf("C-4 stale seg=%-3u cr=%s buffer_intact=%d -> fail-closed\n",
-                   target, cr_status_name(outcome.status), stale_pass);
-        } else if (verify_pattern(r.local_buf, r.local_len, target, &found) == 0) {
-            stale_pass = 0;
-            printf("C-4 stale seg=%-3u cr=SUCCESS and data still readable <== STALE DESCRIPTOR LEAK\n",
-                   target);
-        } else {
-            stale_pass = 0;
-            printf("C-4 stale seg=%-3u cr=SUCCESS but bytes=WRONG <== not fail-closed\n", target);
+    /* Check 4: stale descriptor. The parent has already ungranted desc[0].va on
+     * the shared tid; the child replays the descriptor it obtained while that
+     * segment was live, on a lane that a control READ has just proven healthy. */
+    {
+        uint32_t target = 0;
+        uint32_t control = n - 1;
+        struct poison_result res;
+        printf("C-4 stale descriptor          pos=%u reuses its original token, control=%u\n",
+               target, control);
+        poison_read_case(&r, &hdr, target, r.remote[target], control, &res);
+        report_poison_case("C-4", "stale-descriptor", target, control, &res);
+        stale_pass = (res.lane_ready && res.refused && !res.leak && !res.wrong_bytes &&
+                      res.buffer_intact);
+        printf("C-4 verdict stale descriptor  %s\n", stale_pass ? "PASS" : "FAIL");
+        if (res.lane_ready && res.refused && !res.buffer_intact) {
+            printf("C-4 note                      refused, but the destination was written anyway\n");
         }
-        printf("C-4 verdict stale descriptor  fail_closed=%d\n", stale_pass);
+    }
+
+    /* Check 2: token isolation. Same live VA as the control READ, different
+     * token_value -- the token is the only variable. Runs last so that the lane
+     * suspension its refusal may cause cannot reach any other check. */
+    {
+        uint32_t control = n - 1;
+        uint32_t foreign = (control == 1) ? 0 : 1;
+        uint32_t cases = 0;
+        uint32_t attributed = 0;
+        for (uint32_t c = 0; c < 2; c++) {
+            uint32_t bad_value;
+            const char *label;
+            urma_target_seg_t *bad;
+            struct poison_result res;
+
+            if (c == 0) {
+                bad_value = r.desc[foreign].token_value; /* a live sibling's value */
+                label = "foreign-segment-value";
+            } else {
+                bad_value = BOGUS_SEG_TOKEN;
+                label = "bogus-value";
+            }
+            bad = import_source(&r, &hdr, &r.desc[control], bad_value);
+
+            cases++;
+            if (bad == NULL) {
+                printf("C-2 %-21s value=0x%-8x import rejected errno=%d -> fail-closed\n",
+                       label, bad_value, errno);
+                attributed++;
+                continue;
+            }
+            printf("C-2 %-21s value=0x%-8x pos=%u (same VA as the control)\n",
+                   label, bad_value, control);
+            poison_read_case(&r, &hdr, control, bad, control, &res);
+            report_poison_case("C-2", label, control, control, &res);
+            if (res.lane_ready && res.refused) {
+                attributed++;
+            }
+            (void)urma_unimport_seg(bad);
+        }
+        isolation_pass = (attributed == cases);
+        printf("C-2 verdict token isolation   refused_and_attributed=%u/%u\n", attributed, cases);
+        if (!isolation_pass) {
+            printf("C-2 note                      a non-attributed case means the remote either\n"
+                   "                              accepted a wrong token_value (isolation then rests\n"
+                   "                              on tid+VA+grant only) or the read path misbehaved;\n"
+                   "                              record which before using a shared tid\n");
+        }
     }
 
     {
@@ -1131,10 +1317,12 @@ static int run_child(const struct options *opt)
     }
 
     exit_code = (correct_ok == n && wrong_pattern == 0 && cr_failed == 0 && post_failed == 0 &&
-                 isolation_pass && unregister_pass && stale_pass) ? 0 : 1;
-    printf("C-VERDICT A12 %s              correctness=%s isolation=%s independent_unregister=%s stale_fail_closed=%s\n",
+                 lane0_extra_ok && isolation_pass && unregister_pass && stale_pass) ? 0 : 1;
+    printf("C-VERDICT A12 %s              correctness=%s lane_reuse=%s isolation=%s "
+           "independent_unregister=%s stale_fail_closed=%s\n",
            exit_code == 0 ? "PASS" : "FAIL",
            (correct_ok == n && wrong_pattern == 0) ? "PASS" : "FAIL",
+           lane0_extra_ok ? "PASS" : "FAIL",
            isolation_pass ? "PASS" : "FAIL",
            unregister_pass ? "PASS" : "FAIL",
            stale_pass ? "PASS" : "FAIL");
@@ -1145,8 +1333,8 @@ out:
             (void)urma_unimport_seg(r.remote[i]);
         }
     }
-    if (r.tjetty != NULL) {
-        (void)urma_unimport_jetty(r.tjetty);
+    if (lane0 != NULL && lane0->tjetty != NULL) {
+        (void)urma_unimport_jetty(lane0->tjetty);
     }
     if (r.local_tseg != NULL) {
         (void)urma_unregister_seg(r.local_tseg);
