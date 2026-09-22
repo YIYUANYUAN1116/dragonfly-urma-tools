@@ -8,7 +8,9 @@ reports the first-round verification checklist:
 - actual destination register (pool miss) and unregister (pool bypass) counts
 - retained registered bytes (peak and final) from the destination pool
 - Piece E2E p50/p95 (child_piece_e2e_ns) and aggregate throughput
-- parent source side: pieces served, source E2E p50/p95, retained warnings
+- parent source side: pieces served, source E2E p50/p95, retained warnings,
+  staged source timings (open/copy/register/wait/revoke) and the register
+  sub-phases (alloc / shim copy / token / MR pin)
 
 Usage:
     python3 read_pool_monitor.py results/<runId>/            # walk a run dir
@@ -101,6 +103,10 @@ def parse_log(text: str, source: str) -> dict:
         "stage_open_ns": [],
         "stage_copy_ns": [],
         "stage_register_ns": [],
+        "stage_reg_alloc_ns": [],
+        "stage_reg_copy_ns": [],
+        "stage_reg_token_ns": [],
+        "stage_reg_seg_ns": [],
         "stage_wait_ns": [],
         "stage_revoke_ns": [],
     }
@@ -181,6 +187,10 @@ def parse_log(text: str, source: str) -> dict:
                 ("source_open_ns", "stage_open_ns"),
                 ("source_copy_ns", "stage_copy_ns"),
                 ("register_ns", "stage_register_ns"),
+                ("register_alloc_ns", "stage_reg_alloc_ns"),
+                ("register_copy_ns", "stage_reg_copy_ns"),
+                ("register_token_ns", "stage_reg_token_ns"),
+                ("register_seg_ns", "stage_reg_seg_ns"),
                 ("wait_read_done_ns", "stage_wait_ns"),
             ):
                 try:
@@ -225,6 +235,10 @@ def parse_log(text: str, source: str) -> dict:
             "stage_open_ns": summarize_e2e(parent["stage_open_ns"]),
             "stage_copy_ns": summarize_e2e(parent["stage_copy_ns"]),
             "stage_register_ns": summarize_e2e(parent["stage_register_ns"]),
+            "stage_reg_alloc_ns": summarize_e2e(parent["stage_reg_alloc_ns"]),
+            "stage_reg_copy_ns": summarize_e2e(parent["stage_reg_copy_ns"]),
+            "stage_reg_token_ns": summarize_e2e(parent["stage_reg_token_ns"]),
+            "stage_reg_seg_ns": summarize_e2e(parent["stage_reg_seg_ns"]),
             "stage_wait_ns": summarize_e2e(parent["stage_wait_ns"]),
             "stage_revoke_ns": summarize_e2e(parent["stage_revoke_ns"]),
         },
@@ -289,6 +303,18 @@ def print_report(results):
                 if stage:
                     print(f"  stage {label:<18}: p50 {stage['p50_ms']:>8} ms, "
                           f"p95 {stage['p95_ms']:>8} ms (n={stage['count']})")
+            sub = [
+                ("alloc (memalign)", "stage_reg_alloc_ns"),
+                ("copy #2 (shim)", "stage_reg_copy_ns"),
+                ("token id", "stage_reg_token_ns"),
+                ("MR pin/register", "stage_reg_seg_ns"),
+            ]
+            if any(parent[key] for _, key in sub):
+                for label, key in sub:
+                    stage = parent[key]
+                    if stage:
+                        print(f"    register sub {label:<14}: p50 {stage['p50_ms']:>8} ms, "
+                              f"p95 {stage['p95_ms']:>8} ms (n={stage['count']})")
 
 
 def main() -> int:
