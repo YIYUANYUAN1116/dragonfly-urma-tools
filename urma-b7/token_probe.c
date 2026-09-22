@@ -10,6 +10,12 @@
  *       the bottleneck)?
  *   0d  does a concurrent token-alloc storm perturb register/unregister_seg
  *       (shared driver lock), and is reusing a tid after unregister legal?
+ *   0e  (added after the first real run: 0c showed the alloc is serialized, so
+ *       A7 prefill is dead and the token-id-table path became the leading
+ *       candidate) can one table-mode tid hold N simultaneously granted
+ *       segments, and what is the amortized per-piece register cost with a
+ *       pre-allocated tid? Local legality only -- remote correctness still
+ *       needs a child-side import+read test.
  *
  * Read-only with respect to the product code: it opens its own context, does
  * not talk to any peer, and frees everything before exit.
@@ -42,8 +48,10 @@
 #include <urma_api.h>
 
 #define MAX_SAMPLES 4096
-#define MAX_LIVE_TOKENS 64
+#define MAX_LIVE_TOKENS 128
 #define SEG_BYTES (16u * 1024u * 1024u)
+#define MULTI_SEG_PER_TID 4
+#define MULTI_SEG_BYTES (4u * 1024u * 1024u)
 
 struct samples {
     uint64_t ns[MAX_SAMPLES];
@@ -194,7 +202,14 @@ static void probe_register_seg(urma_context_t *ctx, void *buf, struct samples *o
                                int reuse_same_tid)
 {
     urma_token_id_t *reused = NULL;
+    int first_errno = 0;
     size_t i;
+
+    /* Each run needs up to 64 live tids. Free the previous run's first: keep_token()
+     * frees a tid when the budget is full and lets the caller continue, which would
+     * hand register_seg a tid that was already freed (that is what made the first
+     * real 0d storm run fail all 64 registers). */
+    free_live_tokens();
 
     for (i = 0; i < 64; i++) {
         urma_seg_cfg_t cfg = {0};
@@ -235,13 +250,95 @@ static void probe_register_seg(urma_context_t *ctx, void *buf, struct samples *o
         if (seg == NULL) {
             record(out, monotonic_ns() - start);
             out->failed++;
+            if (first_errno == 0) {
+                first_errno = errno;
+            }
             continue;
         }
         record(out, monotonic_ns() - start);
         if (urma_unregister_seg(seg) != URMA_SUCCESS) {
             out->failed++;
+            if (first_errno == 0) {
+                first_errno = errno;
+            }
         }
     }
+    if (first_errno != 0) {
+        printf("   register_seg first failure errno=%d (%s)\n", first_errno, strerror(first_errno));
+    }
+    if (reused != NULL) {
+        (void)urma_free_token_id(reused); /* leaking it made urma_delete_context fail */
+    }
+}
+
+/* 0e: can one table-mode tid hold MULTI_SEG_PER_TID simultaneously granted segments,
+ * and what does a piece cost when the tid is already allocated?
+ * Local legality only -- remote correctness still needs a child import+read test. */
+static void probe_multi_seg_per_tid(urma_context_t *ctx, urma_token_id_t *tid, const char *label)
+{
+    urma_target_seg_t *segs[MULTI_SEG_PER_TID] = {0};
+    void *bufs[MULTI_SEG_PER_TID] = {0};
+    uint64_t reg_ns = 0, unreg_ns, start;
+    size_t ok = 0, failed = 0, unreg_failed = 0;
+    int first_errno = 0;
+    size_t i;
+
+    if (tid == NULL) {
+        printf("0e %-24s SKIPPED (no tid)\n", label);
+        return;
+    }
+
+    for (i = 0; i < MULTI_SEG_PER_TID; i++) {
+        urma_seg_cfg_t cfg = {0};
+
+        if (posix_memalign(&bufs[i], 4096, MULTI_SEG_BYTES) != 0) {
+            bufs[i] = NULL;
+            failed++;
+            continue;
+        }
+        memset(bufs[i], 0x5a, MULTI_SEG_BYTES);
+        cfg.va = (uint64_t)(uintptr_t)bufs[i];
+        cfg.len = MULTI_SEG_BYTES;
+        cfg.token_id = tid;
+        cfg.token_value.token = (uint32_t)(0x7e570000u + i);
+        cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+        cfg.flag.bs.access = URMA_ACCESS_READ;
+        cfg.flag.bs.cacheable = URMA_NON_CACHEABLE;
+        cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
+
+        errno = 0;
+        start = monotonic_ns();
+        segs[i] = urma_register_seg(ctx, &cfg);
+        reg_ns += monotonic_ns() - start;
+        if (segs[i] == NULL) {
+            failed++;
+            if (first_errno == 0) {
+                first_errno = errno;
+            }
+        } else {
+            ok++;
+        }
+    }
+
+    start = monotonic_ns();
+    for (i = 0; i < MULTI_SEG_PER_TID; i++) {
+        if (segs[i] != NULL && urma_unregister_seg(segs[i]) != URMA_SUCCESS) {
+            unreg_failed++;
+        }
+    }
+    unreg_ns = monotonic_ns() - start;
+
+    for (i = 0; i < MULTI_SEG_PER_TID; i++) {
+        free(bufs[i]);
+    }
+
+    printf("0e %-24s live_ok=%zu/%d failed=%zu unreg_failed=%zu first_errno=%d\n",
+           label, ok, MULTI_SEG_PER_TID, failed, unreg_failed, first_errno);
+    printf("0e %-24s per-seg register=%7.3fms unregister=%7.3fms%s\n", "",
+           ok ? (double)reg_ns / (double)ok / 1e6 : 0.0,
+           ok ? (double)unreg_ns / (double)ok / 1e6 : 0.0,
+           ok == MULTI_SEG_PER_TID ? "  (all N simultaneously live on one tid)"
+                                   : "  (not all N accepted -> one tid cannot hold them)");
 }
 
 int main(int argc, char **argv)
@@ -382,6 +479,29 @@ int main(int argc, char **argv)
     report("0d register_seg (tid reused)", &reg_reuse);
     printf("0d verdict                   tid-reuse errors=%zu (%s)\n", reg_reuse.failed,
            reg_reuse.failed == 0 ? "API-legal sequentially" : "rejected by provider");
+
+    /* 0e: N simultaneously live segments on one pre-allocated tid.
+     * udma_u_ops.c maps alloc_token_id -> udma_u_alloc_tid (MAPT_MODE_TABLE) and
+     * alloc_token_id_ex(multi_seg=0) -> MAPT_MODE_ENTRY, so both modes are probed. */
+    free_live_tokens();
+    {
+        urma_token_id_flag_t entry_flag = {0};
+        urma_token_id_t *table_tid = urma_alloc_token_id(ctx);
+        urma_token_id_t *entry_tid = urma_alloc_token_id_ex(ctx, entry_flag);
+
+        probe_multi_seg_per_tid(ctx, table_tid, "table(multi_seg=1) x4");
+        probe_multi_seg_per_tid(ctx, entry_tid, "entry(multi_seg=0) x4");
+        printf("0e verdict                   udma ops: alloc_token_id=MAPT_MODE_TABLE, "
+               "_ex(multi_seg=0)=MAPT_MODE_ENTRY\n");
+        printf("0e verdict                   local accept is necessary but NOT sufficient: "
+               "remote correctness needs a child import+read test\n");
+        if (table_tid != NULL) {
+            (void)urma_free_token_id(table_tid);
+        }
+        if (entry_tid != NULL) {
+            (void)urma_free_token_id(entry_tid);
+        }
+    }
 
     free(buf);
     free_live_tokens();
