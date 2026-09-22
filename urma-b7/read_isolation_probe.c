@@ -19,7 +19,9 @@
  *   B-2 an old value cannot authorize a VA that was unregistered and re-registered
  *   B-3 a read is bounded by the grant it starts in, not just by its base VA
  *       (a shared tid puts many Pieces' grants in one table, so a read that
- *        runs off the end of its own grant could land on a sibling's bytes)
+ *        runs off the end of its own grant could land on a sibling's bytes).
+ *        C-B3a crosses into a SAME-key sibling, C-B3c into a DIFFERENT-key one,
+ *        which separates "per-grant key check" from "starting grant only"
  *   B-4 key 0 is a key, not a bypass (URMA_TOKEN_NONE == 0 is a *policy*)
  *
  * Layout. The parent allocates ONE contiguous arena and registers equal slices
@@ -91,6 +93,7 @@
 #define JETTY_TOKEN 0xACE0u    /* jetty/jfr token, identical on both sides */
 #define BOGUS_KEY 0xDEADBEEFu
 #define POISON_BYTE 0xEE
+#define POISON_WORD 0xEEEEEEEEEEEEEEEEULL
 #define POLL_TIMEOUT_MS 3000
 
 /* Values the parent registers with. V0 is used by TWO slices on purpose: that
@@ -297,6 +300,49 @@ static int dominant_pattern(const void *buf, size_t len, uint32_t n_patterns,
     best = best_index;
     *out_words = best_words;
     return (int)best;
+}
+
+/* Word provenance of the destination: how many 8-byte words match each slice's
+ * pattern, how many are still poison, and how many are neither. dominant_pattern
+ * alone cannot separate the interesting cases -- a read that began in its own
+ * grant and ran into a sibling splits the buffer evenly, and a tie is reported as
+ * the lower index -- so this is what actually attributes the bytes:
+ *   slice K != own, poison == 0   -> the sibling's bytes were served (a real leak)
+ *   poison > 0, other == 0        -> a short transfer: the untouched tail is intact
+ *   other > 0                     -> unclassified bytes (partial write / zero fill)
+ * The refused-but-written case is measured the same way, because a refusal is not
+ * a guarantee that the destination was left alone. */
+static void byte_provenance(const void *buf, size_t len, uint32_t n_patterns,
+                            uint32_t counts[], uint32_t *poison, uint32_t *other,
+                            uint32_t *total)
+{
+    const uint64_t *words = buf;
+    size_t count = len / sizeof(uint64_t);
+
+    *total = (uint32_t)count;
+    *poison = 0;
+    *other = 0;
+    for (uint32_t k = 0; k < n_patterns; k++) {
+        counts[k] = 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        int matched = 0;
+        for (uint32_t k = 0; k < n_patterns; k++) {
+            if (words[i] == pattern_word(k)) {
+                counts[k]++;
+                matched = 1;
+                break;
+            }
+        }
+        if (matched) {
+            continue;
+        }
+        if (words[i] == POISON_WORD) {
+            (*poison)++;
+        } else {
+            (*other)++;
+        }
+    }
 }
 
 static const char *cr_status_name(urma_cr_status_t status)
@@ -1026,6 +1072,10 @@ struct case_result {
     int dominant;      /* dominant pattern when the bytes are not the target's */
     uint32_t dominant_words;
     uint32_t total_words;
+    uint32_t pattern_count;                 /* patterns compared (== slice count) */
+    uint32_t pattern_words[MAX_SLICES];     /* words matching each slice pattern */
+    uint32_t poison_words;                  /* words still untouched */
+    uint32_t other_words;                   /* words matching nothing known */
     int lane_survived;
 };
 
@@ -1096,6 +1146,15 @@ static void run_case(struct reader *r, const struct wire_header *hdr,
                                         &out->dominant_words, &out->total_words);
     }
 
+    /* The bytes are the evidence in exactly these two branches: a read that was
+     * allowed but did not serve its own slice, and a refusal that still wrote.
+     * Measuring both the same way is what keeps them comparable. */
+    if ((out->allowed && !out->served_own) || (out->refused && !out->buffer_intact)) {
+        out->pattern_count = r->n;
+        byte_provenance(r->local_buf, spec->poison_len, r->n, out->pattern_words,
+                        &out->poison_words, &out->other_words, &out->total_words);
+    }
+
     /* control after: does this refusal class also kill the lane? */
     fill_poison(r->local_buf, r->local_len);
     post_read(&lane, r->local_tseg, r->local_buf, spec->control_seg,
@@ -1108,6 +1167,17 @@ static void run_case(struct reader *r, const struct wire_header *hdr,
 
     (void)urma_unimport_jetty(lane.tjetty);
     lane_fini(&lane);
+}
+
+/* One line that attributes the destination bytes, pattern by pattern. */
+static void print_provenance(const char *tag, const struct case_result *res)
+{
+    printf("%s provenance                ", tag);
+    for (uint32_t k = 0; k < res->pattern_count; k++) {
+        printf("slice%u=%u ", k, res->pattern_words[k]);
+    }
+    printf("poison=%u other=%u total=%u words\n",
+           res->poison_words, res->other_words, res->total_words);
 }
 
 /* Renders one case as the observation line plus its verdict line. Returns 1 when
@@ -1127,6 +1197,9 @@ static int report_case(const struct case_spec *spec, const struct case_result *r
         printf("%s %-22s -> refused (%s) buffer_intact=%d lane_survived=%d%s\n",
                spec->tag, spec->label, mechanism, res->buffer_intact, res->lane_survived,
                res->buffer_intact ? "" : " <== refused but the destination was written");
+        if (!res->buffer_intact) {
+            print_provenance(spec->tag, res);
+        }
         if (spec->expect_allow) {
             printf("%s %-22s NOTE refusal was not predicted for this case (see verdict note)\n",
                    spec->tag, " ");
@@ -1143,6 +1216,7 @@ static int report_case(const struct case_spec *spec, const struct case_result *r
                " dominant=%s (%u/%u words) lane_survived=%d <== cross-slice read\n",
                spec->tag, spec->label, pattern_label(res->dominant),
                res->dominant_words, res->total_words, res->lane_survived);
+        print_provenance(spec->tag, res);
     }
     return spec->expect_allow ? 1 : 0;
 }
@@ -1189,6 +1263,8 @@ static int run_child(const struct options *opt)
     int v2_pass = 0;                /* old key on a re-registered VA refused */
     int b3a_pass = 0;               /* read past the grant end refused, nothing written */
     int b3b_pass = 0;               /* read past a shortened grant refused */
+    int b3c_pass = 0;               /* crossing into a differently-keyed grant refused */
+    int cross_key_checked = -1;     /* B-3c: 1 checked, 0 only the starting grant, -1 unknown */
     int old_key_reused = 0;         /* an old key still authorized a re-registered VA */
     int guessed_allowed = 0;        /* X-1: a guessed key authorized the live grant */
     const char *guess_verdict = "n/a";
@@ -1497,6 +1573,36 @@ static int run_child(const struct options *opt)
         b3a_pass = report_case(&spec, &res);
         printf("C-B3a mechanism                %s\n", refusal_mechanism(&res));
 
+        /* B-3c: the same crossing, but into a sibling with a DIFFERENT key.
+         * B-3a crossed from slice0's tail into slice1, and slice1 deliberately
+         * shares slice0's key, so it cannot tell whether the provider verified the
+         * key of the grant it crossed into or only the one the read started in.
+         * This read starts in slice1 (key V0) and runs into slice2 (key 0):
+         *   refused  -> the key is checked per covered grant (B-3a's leak is
+         *               limited to same-key siblings)
+         *   allowed  -> only the starting grant's key is checked, which is the
+         *               strictly worse property
+         * Runs before B3b, which shrinks slice1. */
+        memset(&spec, 0, sizeof(spec));
+        spec.tag = "C-B3c";
+        spec.label = "cross-into-other-key";
+        spec.poison_va = r.desc[1].va + r.desc[1].len - 65536;
+        spec.poison_len = 131072;
+        spec.poison_pattern = 1;
+        spec.poison_seg = r.remote[1];
+        spec.control_va = r.desc[1].va;
+        spec.control_len = (uint32_t)r.desc[1].len;
+        spec.control_pattern = 1;
+        spec.control_seg = r.remote[1];
+        spec.expect_allow = 0;
+        run_case(&r, &hdr, &spec, &res);
+        b3c_pass = report_case(&spec, &res);
+        cross_key_checked = res.lane_ready ? (res.refused ? 1 : 0) : -1;
+        printf("C-B3c mechanism                %s\n", refusal_mechanism(&res));
+        printf("C-B3c verdict crossed-grant-key %s\n",
+               cross_key_checked == 1 ? "checked"
+               : (cross_key_checked == 0 ? "NOT checked" : "unknown"));
+
         /* B-2/S-1: unregister slice0, then replay the descriptor the child got
          * while it was live. This is v2's stale-descriptor case, kept as the
          * regression that the re-register case below must not weaken. */
@@ -1682,7 +1788,7 @@ static int run_child(const struct options *opt)
 
     b1 = b1_case_pass && (collision_served == 1 || collision_local_refusal);
     b2 = s1_pass && v2_pass && !old_key_reused;
-    b3 = b3a_pass && b3b_pass;
+    b3 = b3a_pass && b3b_pass && b3c_pass;
 
     exit_code = (own_ok == n && own_bad == 0 && extra_ok == 4 && b1 && b2 && b3 && b4) ? 0 : 1;
 
@@ -1690,11 +1796,14 @@ static int run_child(const struct options *opt)
            " b4_no_zero_bypass=%s\n",
            exit_code == 0 ? "PASS" : "FAIL", b1 ? "PASS" : "FAIL", b2 ? "PASS" : "FAIL",
            b3 ? "PASS" : "FAIL", b4 ? "PASS" : "FAIL");
-    printf("P0-CONCLUSION barrier=%s replay_old_key=%s guessed_key=%s\n",
+    printf("P0-CONCLUSION barrier=%s replay_old_key=%s guessed_key=%s across_grant_key=%s\n",
            collision_local_refusal ? "tseg-range(local)"
            : (collision_served == 1 ? "key-equality(remote)" : "unknown"),
            old_key_reused ? "ALLOWED <== premise broken" : "refused",
-           guess_verdict);
+           guess_verdict,
+           cross_key_checked == 1 ? "checked"
+           : (cross_key_checked == 0 ? "NOT-checked(only the starting grant)"
+                                     : "unknown"));
     printf("P0-CALIBRATION pre_a12_secrets=tid+key(post-A12 the tid is gone, see the parent's"
            " P-CALIB) post_a12_secrets=key\n");
     if (!b1) {
