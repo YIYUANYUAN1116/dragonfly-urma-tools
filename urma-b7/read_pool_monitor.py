@@ -40,6 +40,7 @@ CHILD_MARKERS = {
 PARENT_MARKERS = {
     "source_start": "start READ upload piece content",
     "source_done": "urma READ source fully read; revoking export",
+    "source_revoke": "urma READ source revoke finished",
     "source_retained": "urma READ source owner retained for cleanup",
 }
 
@@ -97,6 +98,11 @@ def parse_log(text: str, source: str) -> dict:
         "source_e2e_ns": [],
         "source_retained": 0,
         "source_start_times": {},
+        "stage_open_ns": [],
+        "stage_copy_ns": [],
+        "stage_register_ns": [],
+        "stage_wait_ns": [],
+        "stage_revoke_ns": [],
     }
 
     for line in text.splitlines():
@@ -171,6 +177,22 @@ def parse_log(text: str, source: str) -> dict:
                     e2e = int((ts - start).total_seconds() * 1e9)
             if e2e is not None:
                 parent["source_e2e_ns"].append(e2e)
+            for field, key in (
+                ("source_open_ns", "stage_open_ns"),
+                ("source_copy_ns", "stage_copy_ns"),
+                ("register_ns", "stage_register_ns"),
+                ("wait_read_done_ns", "stage_wait_ns"),
+            ):
+                try:
+                    parent[key].append(int(fields.get(field, "")))
+                except ValueError:
+                    pass
+        elif PARENT_MARKERS["source_revoke"] in payload:
+            fields = parse_fields(payload)
+            try:
+                parent["stage_revoke_ns"].append(int(fields.get("revoke_ns", "")))
+            except ValueError:
+                pass
         elif PARENT_MARKERS["source_retained"] in payload:
             parent["source_retained"] += 1
 
@@ -200,6 +222,11 @@ def parse_log(text: str, source: str) -> dict:
             **parent,
             "source_e2e_ns": summarize_e2e(parent["source_e2e_ns"]),
             "source_start_times": None,
+            "stage_open_ns": summarize_e2e(parent["stage_open_ns"]),
+            "stage_copy_ns": summarize_e2e(parent["stage_copy_ns"]),
+            "stage_register_ns": summarize_e2e(parent["stage_register_ns"]),
+            "stage_wait_ns": summarize_e2e(parent["stage_wait_ns"]),
+            "stage_revoke_ns": summarize_e2e(parent["stage_revoke_ns"]),
         },
     }
 
@@ -250,6 +277,18 @@ def print_report(results):
             e2e = parent["source_e2e_ns"]
             if e2e:
                 print(f"  source E2E p50/p95  : {e2e['p50_ms']} / {e2e['p95_ms']} ms")
+            stages = [
+                ("open (content)", "stage_open_ns"),
+                ("copy (Bytes only)", "stage_copy_ns"),
+                ("register", "stage_register_ns"),
+                ("wait ReadDone", "stage_wait_ns"),
+                ("revoke/unregister", "stage_revoke_ns"),
+            ]
+            for label, key in stages:
+                stage = parent[key]
+                if stage:
+                    print(f"  stage {label:<18}: p50 {stage['p50_ms']:>8} ms, "
+                          f"p95 {stage['p95_ms']:>8} ms (n={stage['count']})")
 
 
 def main() -> int:
