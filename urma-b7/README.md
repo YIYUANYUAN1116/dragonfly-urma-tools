@@ -550,6 +550,10 @@ lane 0、同 batch task 复用 lane 或同一 role 跨 batch 换 lane都会记�
 lane 校验失败不会再中断第一个 batch。runner 会完成剩余 batch、全量日志/metrics 采集和有序 shutdown，
 最后统一返回失败。`fanoutDiagnostics` 分开保存 TX required/optional budget pressure、
 BufferUnavailable、BUSY/reject、session retirement 和 TCP fallback；因此失败 manifest 也可用于归因。
+其中 `sendCompletion` 汇总 Parent 每个 PeerTarget 的 `urma SEND completion summary`，
+用 `sendsPerCqe` 验证 TX CQ moderation 是否按 `sendCompletionInterval` 收敛；
+`storageConsumer` 汇总 Child 每个 Piece 的 `digest_ns`/`pwrite_ns`/`rx_window_wait_ns`/`recycle_ns`
+相对 `storage_total_ns` 的占比，并保留 transport-only 的 `transport_only_ns` 作为去存储基线。
 `taskScopedEvidence` 分别记录 Parent 和每个 Child 的证据文件。
 
 当前 fan-out runner 要求所有 Child 位于同一节点，以便使用单一远端 barrier；这正好覆盖当前

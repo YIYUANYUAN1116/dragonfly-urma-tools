@@ -62,6 +62,23 @@ TX_OPTIONAL_ACQUIRE_ATTEMPTS_RE = re.compile(
     r"\btx_optional_acquire_attempts=(\d+)"
 )
 TX_OPTIONAL_POOL_ACQUIRE_NS_RE = re.compile(r"\btx_optional_pool_acquire_ns=(\d+)")
+SEND_COMPLETION_POSTED_RE = re.compile(r"\bsend_posted=(\d+)")
+SEND_COMPLETION_SIGNALED_RE = re.compile(r"\bsend_signaled=(\d+)")
+SEND_COMPLETION_RETIRED_RE = re.compile(r"\bsend_retired=(\d+)")
+SEND_COMPLETION_CQE_RE = re.compile(r"\bsend_cqe=(\d+)")
+SEND_COMPLETION_PER_CQE_RE = re.compile(r"\bsends_per_cqe=([0-9.]+)")
+STORAGE_WINDOW_COUNT_RE = re.compile(r"\brx_windows=(\d+)")
+STORAGE_FILE_OPEN_NS_RE = re.compile(r"\bfile_open_ns=(\d+)")
+STORAGE_RX_WAIT_NS_RE = re.compile(r"\brx_window_wait_ns=(\d+)")
+STORAGE_DIGEST_NS_RE = re.compile(r"\bdigest_ns=(\d+)")
+STORAGE_PWRITE_NS_RE = re.compile(r"\bpwrite_ns=(\d+)")
+STORAGE_PWRITE_CALLS_RE = re.compile(r"\bpwrite_calls=(\d+)")
+STORAGE_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
+STORAGE_TOTAL_NS_RE = re.compile(r"\bstorage_total_ns=(\d+)")
+TRANSPORT_ONLY_WINDOW_COUNT_RE = re.compile(r"\bwindows=(\d+)")
+TRANSPORT_ONLY_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
+TRANSPORT_ONLY_TOTAL_NS_RE = re.compile(r"\btransport_only_ns=(\d+)")
+PIECE_EXPECTED_LENGTH_RE = re.compile(r"\bexpected_length=(\d+)")
 SAFE_REMOTE_ROOTS = (
     PurePosixPath("/tmp/dragonfly-urma-b7"),
     PurePosixPath("/var/lib/dragonfly-b7"),
@@ -2079,6 +2096,180 @@ def tx_window_acquire_summary(evidence: str) -> dict[str, Any]:
     }
 
 
+def send_completion_summary(parent: str) -> dict[str, Any]:
+    """Summarize the per-peer TX SEND completion frontier from a Parent log.
+
+    The RM engine emits one line per PeerTarget when it is unregistered. This is
+    the runtime evidence that CQ moderation converged: `sendsPerCqe` must track
+    the configured sendCompletionInterval, bounded below by one CQE per
+    registered Window because the Window tail is always signaled.
+    """
+    peer_lines = [
+        line for line in parent.splitlines() if "urma SEND completion summary" in line
+    ]
+    peers: list[dict[str, Any]] = []
+    malformed_lines = 0
+    for line in peer_lines:
+        peer_id = last_lane_id(line)
+        values = (
+            last_int_match(SEND_COMPLETION_POSTED_RE, line),
+            last_int_match(SEND_COMPLETION_SIGNALED_RE, line),
+            last_int_match(SEND_COMPLETION_RETIRED_RE, line),
+            last_int_match(SEND_COMPLETION_CQE_RE, line),
+        )
+        if peer_id is None or any(value is None for value in values):
+            malformed_lines += 1
+            continue
+        posted, signaled, retired, cqes = values
+        peers.append(
+            {
+                "peerId": peer_id,
+                "posted": posted,
+                "signaled": signaled,
+                "retired": retired,
+                "cqes": cqes,
+                "sendsPerCqe": (retired / cqes) if cqes else 0.0,
+            }
+        )
+
+    posted = sum(peer["posted"] for peer in peers)
+    signaled = sum(peer["signaled"] for peer in peers)
+    retired = sum(peer["retired"] for peer in peers)
+    cqes = sum(peer["cqes"] for peer in peers)
+    return {
+        "observed": bool(peer_lines),
+        "peerCount": len(peers),
+        "posted": posted,
+        "signaled": signaled,
+        "retired": retired,
+        "cqes": cqes,
+        "sendsPerCqe": (retired / cqes) if cqes else 0.0,
+        "peers": peers,
+        "malformedLines": malformed_lines,
+    }
+
+
+def urma_storage_consumer_summary(child: str) -> dict[str, Any]:
+    """Attribute the Child URMA receive consumer cost from per-Piece logs.
+
+    The consumer runs CRC32 and the vectored pwrite concurrently per Window, so
+    the per-Piece `digest_ns`, `pwrite_ns`, `rx_window_wait_ns`, and `recycle_ns`
+    sums can be compared against `storage_total_ns` without a separate validation
+    profile. The transport-only profile stays available as the storage-free
+    baseline through `transport_only_ns`.
+    """
+    storage_lines = [
+        line
+        for line in child.splitlines()
+        if "finished writing urma piece from registered receive windows" in line
+    ]
+    transport_lines = [
+        line
+        for line in child.splitlines()
+        if "finished URMA transport-only validation Piece" in line
+    ]
+
+    storage_samples: list[tuple[int, int, int, int, int, int, int, int, int]] = []
+    malformed_lines = 0
+    for line in storage_lines:
+        values = (
+            last_int_match(STORAGE_WINDOW_COUNT_RE, line),
+            last_int_match(STORAGE_FILE_OPEN_NS_RE, line),
+            last_int_match(STORAGE_RX_WAIT_NS_RE, line),
+            last_int_match(STORAGE_DIGEST_NS_RE, line),
+            last_int_match(STORAGE_PWRITE_NS_RE, line),
+            last_int_match(STORAGE_PWRITE_CALLS_RE, line),
+            last_int_match(STORAGE_RECYCLE_NS_RE, line),
+            last_int_match(STORAGE_TOTAL_NS_RE, line),
+            last_int_match(PIECE_EXPECTED_LENGTH_RE, line),
+        )
+        if any(value is None for value in values):
+            malformed_lines += 1
+            continue
+        storage_samples.append(values)
+
+    windows = [sample[0] for sample in storage_samples]
+    file_open_ns = [sample[1] for sample in storage_samples]
+    rx_wait_ns = [sample[2] for sample in storage_samples]
+    digest_ns = [sample[3] for sample in storage_samples]
+    pwrite_ns = [sample[4] for sample in storage_samples]
+    pwrite_calls = [sample[5] for sample in storage_samples]
+    recycle_ns = [sample[6] for sample in storage_samples]
+    total_ns = [sample[7] for sample in storage_samples]
+    piece_bytes = [sample[8] for sample in storage_samples]
+
+    transport_samples: list[tuple[int, int, int, int]] = []
+    transport_malformed_lines = 0
+    for line in transport_lines:
+        values = (
+            last_int_match(TRANSPORT_ONLY_WINDOW_COUNT_RE, line),
+            last_int_match(TRANSPORT_ONLY_RECYCLE_NS_RE, line),
+            last_int_match(TRANSPORT_ONLY_TOTAL_NS_RE, line),
+            last_int_match(PIECE_EXPECTED_LENGTH_RE, line),
+        )
+        if any(value is None for value in values):
+            transport_malformed_lines += 1
+            continue
+        transport_samples.append(values)
+
+    storage_total_ns = sum(total_ns)
+    transport_total_ns = sum(sample[2] for sample in transport_samples)
+    storage_bytes = sum(piece_bytes)
+    transport_bytes = sum(sample[3] for sample in transport_samples)
+    return {
+        "observed": bool(storage_lines or transport_lines),
+        "normal": {
+            "pieceCount": len(storage_samples),
+            "totalBytes": storage_bytes,
+            "windowCount": sum(windows),
+            "pwriteCalls": sum(pwrite_calls),
+            "fileOpenNs": integer_ns_summary(file_open_ns),
+            "rxWindowWaitNs": integer_ns_summary(rx_wait_ns),
+            "digestNs": integer_ns_summary(digest_ns),
+            "pwriteNs": integer_ns_summary(pwrite_ns),
+            "recycleNs": integer_ns_summary(recycle_ns),
+            "storageTotalNs": integer_ns_summary(total_ns),
+            # CRC32 and the pwrite overlap, so each share is reported against the
+            # wall-clock Piece total instead of a sum of the components.
+            "digestShareOfStorage": (
+                sum(digest_ns) / storage_total_ns if storage_total_ns else 0.0
+            ),
+            "pwriteShareOfStorage": (
+                sum(pwrite_ns) / storage_total_ns if storage_total_ns else 0.0
+            ),
+            "rxWaitShareOfStorage": (
+                sum(rx_wait_ns) / storage_total_ns if storage_total_ns else 0.0
+            ),
+            "recycleShareOfStorage": (
+                sum(recycle_ns) / storage_total_ns if storage_total_ns else 0.0
+            ),
+            "effectiveMiBps": (
+                storage_bytes * 1_000_000_000 / storage_total_ns / (1024 * 1024)
+                if storage_total_ns
+                else 0.0
+            ),
+        },
+        "transportOnly": {
+            "pieceCount": len(transport_samples),
+            "totalBytes": transport_bytes,
+            "windowCount": sum(sample[0] for sample in transport_samples),
+            "recycleNs": integer_ns_summary(
+                [sample[1] for sample in transport_samples]
+            ),
+            "transportOnlyNs": integer_ns_summary(
+                [sample[2] for sample in transport_samples]
+            ),
+            "effectiveMiBps": (
+                transport_bytes * 1_000_000_000 / transport_total_ns / (1024 * 1024)
+                if transport_total_ns
+                else 0.0
+            ),
+        },
+        "malformedLines": malformed_lines,
+        "transportMalformedLines": transport_malformed_lines,
+    }
+
+
 def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any]:
     combined = parent + "\n" + children
     lower_parent = parent.lower()
@@ -2113,6 +2304,8 @@ def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any
             "urma tx second lease unavailable"
         ),
         "txWindowAcquire": tx_window_acquire_summary(parent),
+        "sendCompletion": send_completion_summary(parent),
+        "storageConsumer": urma_storage_consumer_summary(children),
         "processAdmissionWait": process_admission_wait_summary(parent),
         "busyOrRejectLines": sum(
             any(

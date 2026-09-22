@@ -2324,6 +2324,8 @@ storage:
         self.assertEqual(summary["tcpFallbackLines"], 2)
         self.assertFalse(summary["txWindowAcquire"]["observed"])
         self.assertEqual(summary["txWindowAcquire"]["malformedLines"], 0)
+        self.assertFalse(summary["sendCompletion"]["observed"])
+        self.assertFalse(summary["storageConsumer"]["observed"])
 
     def test_fanout_transport_health_recognizes_current_busy_fallback_logs(self):
         parent = "urma connection admission full remote_address=127.0.0.1:1234\n"
@@ -2390,6 +2392,97 @@ storage:
         self.assertEqual(summary["optional"]["poolDurationNs"]["totalNs"], 10)
         self.assertEqual(summary["optional"]["nonPoolDurationNs"]["totalNs"], 30)
         self.assertEqual(summary["malformedLines"], 0)
+
+    def test_send_completion_summary_reports_cq_moderation_convergence(self):
+        parent = "\n".join(
+            (
+                "peer_id=1 send_posted=1024 send_signaled=64 send_retired=1024 "
+                "send_cqe=64 sends_per_cqe=16.0 urma SEND completion summary",
+                "peer_id=2 send_posted=160 send_signaled=10 send_retired=160 "
+                "send_cqe=10 sends_per_cqe=16.0 urma SEND completion summary",
+                "send_posted=1 urma SEND completion summary",
+            )
+        )
+
+        summary = b7.send_completion_summary(parent)
+
+        self.assertTrue(summary["observed"])
+        self.assertEqual(summary["peerCount"], 2)
+        self.assertEqual(summary["posted"], 1184)
+        self.assertEqual(summary["signaled"], 74)
+        self.assertEqual(summary["retired"], 1184)
+        self.assertEqual(summary["cqes"], 74)
+        self.assertEqual(summary["sendsPerCqe"], 16.0)
+        self.assertEqual(summary["peers"][0]["peerId"], 1)
+        self.assertEqual(summary["peers"][0]["sendsPerCqe"], 16.0)
+        self.assertEqual(summary["malformedLines"], 1)
+
+    def test_send_completion_summary_absent_in_tcp_or_pre_moderation_logs(self):
+        summary = b7.send_completion_summary("finished uploading piece content\n")
+        self.assertFalse(summary["observed"])
+        self.assertEqual(summary["peerCount"], 0)
+        self.assertEqual(summary["sendsPerCqe"], 0.0)
+
+    def test_storage_consumer_summary_attributes_digest_and_pwrite(self):
+        child = "\n".join(
+            (
+                "piece_id=aaa expected_length=16777216 rx_windows=8 file_open_ns=100 "
+                "rx_window_wait_ns=200 digest_ns=300 pwrite_ns=400 pwrite_calls=8 "
+                "recycle_ns=50 storage_total_ns=1000 "
+                "finished writing urma piece from registered receive windows",
+                "piece_id=bbb expected_length=16777216 rx_windows=8 file_open_ns=100 "
+                "rx_window_wait_ns=200 digest_ns=500 pwrite_ns=200 pwrite_calls=8 "
+                "recycle_ns=50 storage_total_ns=1000 "
+                "finished writing urma piece from registered receive windows",
+            )
+        )
+
+        summary = b7.urma_storage_consumer_summary(child)
+        normal = summary["normal"]
+
+        self.assertTrue(summary["observed"])
+        self.assertEqual(normal["pieceCount"], 2)
+        self.assertEqual(normal["totalBytes"], 33554432)
+        self.assertEqual(normal["windowCount"], 16)
+        self.assertEqual(normal["pwriteCalls"], 16)
+        self.assertEqual(normal["digestNs"]["totalNs"], 800)
+        self.assertEqual(normal["pwriteNs"]["totalNs"], 600)
+        self.assertEqual(normal["rxWindowWaitNs"]["totalNs"], 400)
+        self.assertEqual(normal["recycleNs"]["totalNs"], 100)
+        self.assertEqual(normal["storageTotalNs"]["medianNs"], 1000)
+        self.assertEqual(normal["digestShareOfStorage"], 0.4)
+        self.assertEqual(normal["pwriteShareOfStorage"], 0.3)
+        self.assertEqual(normal["rxWaitShareOfStorage"], 0.2)
+        self.assertEqual(normal["recycleShareOfStorage"], 0.05)
+        self.assertEqual(
+            normal["effectiveMiBps"],
+            33554432 * 1_000_000_000 / 2000 / (1024 * 1024),
+        )
+        self.assertEqual(summary["malformedLines"], 0)
+
+    def test_storage_consumer_summary_keeps_transport_only_baseline(self):
+        child = "\n".join(
+            (
+                "piece_id=aaa expected_length=16777216 windows=8 recycle_ns=50 "
+                "transport_only_ns=800 finished URMA transport-only validation Piece",
+                "expected_length=16777216 finished URMA transport-only validation Piece",
+            )
+        )
+
+        summary = b7.urma_storage_consumer_summary(child)
+        baseline = summary["transportOnly"]
+
+        self.assertEqual(baseline["pieceCount"], 1)
+        self.assertEqual(baseline["totalBytes"], 16777216)
+        self.assertEqual(baseline["windowCount"], 8)
+        self.assertEqual(baseline["recycleNs"]["totalNs"], 50)
+        self.assertEqual(baseline["transportOnlyNs"]["totalNs"], 800)
+        self.assertEqual(
+            baseline["effectiveMiBps"],
+            16777216 * 1_000_000_000 / 800 / (1024 * 1024),
+        )
+        self.assertEqual(summary["transportMalformedLines"], 1)
+        self.assertFalse(summary["normal"]["pieceCount"])
 
     def test_urma_queue_transport_health_includes_child_rx_admission(self):
         parent = """
