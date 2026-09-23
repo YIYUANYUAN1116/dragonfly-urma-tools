@@ -40,6 +40,34 @@ class B7Tests(unittest.TestCase):
             record = read_attribution.summarize_run(run_dir, {})
             self.assertEqual(record["read_timeline"], timeline)
 
+    def test_read_attribution_recomputes_occupancy_from_archived_logs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"runId": "occupancy-test", "result": {"transfer": {}}}),
+                encoding="utf-8",
+            )
+            evidence = run_dir / "evidence"
+            evidence.mkdir()
+            (evidence / "child.sample-001.log").write_text(
+                "\n".join(
+                    (
+                        "2026-09-23T01:00:00.010000000Z read_completion_ns=10000000 "
+                        "urma READ child completed data transfer",
+                        "2026-09-23T01:00:00.030000000Z read_completion_ns=10000000 "
+                        "urma READ child completed data transfer",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            record = read_attribution.summarize_run(run_dir, {})
+
+            timeline = record["read_timeline"]
+            self.assertEqual(timeline["duration"]["readIdleNs"]["medianNs"], 10_000_000)
+            self.assertEqual(timeline["averageReadActiveMilli"]["median"], 667)
+            self.assertEqual(timeline["peakReadActive"]["median"], 1)
+
     def setUp(self):
         self.inventory = json.loads((TOOL_DIR / "inventory.json").read_text(encoding="utf-8"))
         # Existing executor tests exercise remote orchestration rather than the
@@ -2571,6 +2599,12 @@ storage:
         self.assertTrue(timeline["complete"])
         self.assertEqual(timeline["readBatchEnvelopeNs"], 30_000_000)
         self.assertEqual(timeline["readCqeSpanNs"], 10_000_000)
+        self.assertEqual(timeline["readActiveAreaNs"], 40_000_000)
+        self.assertEqual(timeline["readBusyUnionNs"], 30_000_000)
+        self.assertEqual(timeline["readIdleNs"], 0)
+        self.assertEqual(timeline["averageReadActiveMilli"], 1333)
+        self.assertEqual(timeline["readBusyPermille"], 1000)
+        self.assertEqual(timeline["peakReadActive"], 2)
         self.assertEqual(timeline["pwriteEnvelopeNs"], 35_000_000)
         self.assertEqual(timeline["firstReadCqeToFirstPwriteStartNs"], 5_000_000)
         self.assertEqual(timeline["lastReadCqeToLastPwriteEndNs"], 30_000_000)
@@ -2583,6 +2617,29 @@ storage:
         self.assertEqual(
             summary["duration"]["readBatchEnvelopeNs"]["medianNs"], 30_000_000
         )
+        self.assertEqual(summary["averageReadActiveMilli"]["median"], 1333)
+        self.assertEqual(summary["readBusyPermille"]["median"], 1000)
+        self.assertEqual(summary["peakReadActive"]["median"], 2)
+
+    def test_read_batch_timeline_reports_read_idle_gap(self):
+        log = "\n".join(
+            (
+                "2026-09-23T01:00:00.010000000Z read_completion_ns=10000000 "
+                "urma READ child completed data transfer",
+                "2026-09-23T01:00:00.030000000Z read_completion_ns=10000000 "
+                "urma READ child completed data transfer",
+            )
+        )
+
+        timeline = b7.urma_read_batch_timeline(log)
+
+        self.assertEqual(timeline["readBatchEnvelopeNs"], 30_000_000)
+        self.assertEqual(timeline["readActiveAreaNs"], 20_000_000)
+        self.assertEqual(timeline["readBusyUnionNs"], 20_000_000)
+        self.assertEqual(timeline["readIdleNs"], 10_000_000)
+        self.assertEqual(timeline["averageReadActiveMilli"], 667)
+        self.assertEqual(timeline["readBusyPermille"], 667)
+        self.assertEqual(timeline["peakReadActive"], 1)
 
     def test_storage_consumer_summary_attributes_digest_and_pwrite(self):
         child = "\n".join(

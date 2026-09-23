@@ -2429,6 +2429,9 @@ READ_TIMELINE_DURATION_FIELDS = (
     "readStartSpanNs",
     "readCqeSpanNs",
     "readBatchEnvelopeNs",
+    "readActiveAreaNs",
+    "readBusyUnionNs",
+    "readIdleNs",
     "pwriteStartSpanNs",
     "pwriteEndSpanNs",
     "pwriteEnvelopeNs",
@@ -2501,6 +2504,41 @@ def urma_read_batch_timeline(child: str) -> dict[str, Any]:
 
     if starts:
         result["readStartSpanNs"] = max(starts) - min(starts)
+    if read_events:
+        envelope_ns = max(cqes) - min(starts)
+        active_area_ns = sum(end - start for start, end in read_events)
+
+        merged: list[list[int]] = []
+        for start, end in sorted(read_events):
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        busy_union_ns = sum(end - start for start, end in merged)
+
+        active = 0
+        peak_active = 0
+        for _timestamp, delta in sorted(
+            (
+                event
+                for start, end in read_events
+                for event in ((start, 1), (end, -1))
+            ),
+            key=lambda event: (event[0], event[1]),
+        ):
+            active += delta
+            peak_active = max(peak_active, active)
+
+        result["readActiveAreaNs"] = active_area_ns
+        result["readBusyUnionNs"] = busy_union_ns
+        result["readIdleNs"] = envelope_ns - busy_union_ns
+        result["averageReadActiveMilli"] = (
+            round(active_area_ns * 1000 / envelope_ns) if envelope_ns else 0
+        )
+        result["readBusyPermille"] = (
+            round(busy_union_ns * 1000 / envelope_ns) if envelope_ns else 0
+        )
+        result["peakReadActive"] = peak_active
     if cqes:
         result["readCqeSpanNs"] = max(cqes) - min(cqes)
     if starts and cqes:
@@ -2542,6 +2580,15 @@ def urma_read_timeline_summary(timelines: list[dict[str, Any]]) -> dict[str, Any
         "observed": bool(observed),
         "batchCount": len(observed),
         "completeBatchCount": sum(bool(timeline.get("complete")) for timeline in observed),
+        "peakReadActive": integer_value_summary(
+            [int(timeline.get("peakReadActive", 0)) for timeline in observed]
+        ),
+        "averageReadActiveMilli": integer_value_summary(
+            [int(timeline.get("averageReadActiveMilli", 0)) for timeline in observed]
+        ),
+        "readBusyPermille": integer_value_summary(
+            [int(timeline.get("readBusyPermille", 0)) for timeline in observed]
+        ),
         "peakPwriteActive": integer_value_summary(
             [int(timeline.get("peakPwriteActive", 0)) for timeline in observed]
         ),

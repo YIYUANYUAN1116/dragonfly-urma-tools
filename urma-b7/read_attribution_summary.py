@@ -38,6 +38,7 @@ from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import b7  # noqa: E402
 import read_pool_monitor as mon  # noqa: E402
 
 FIELD_RE = re.compile(r"effective_max_read_size=(\d+)")
@@ -233,6 +234,23 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
             batch["batch"] = "warmup" if ".warmup-" in log.name else "sample"
             record["batches"].append(batch)
 
+    if (
+        not (record["read_timeline"] or {}).get("peakReadActive")
+        and logs_by_role["child"]
+    ):
+        measured_timelines = [
+            b7.urma_read_batch_timeline(log.read_text(errors="replace"))
+            for log in logs_by_role["child"]
+            if ".sample-" in log.name
+        ]
+        measured_timelines = [
+            timeline for timeline in measured_timelines if timeline.get("observed")
+        ]
+        if measured_timelines:
+            record["read_timeline"] = b7.urma_read_timeline_summary(
+                measured_timelines
+            )
+
     for label, warmup in (("samples", False), ("warmup", True)):
         entry = {}
         for role in ("child", "parent"):
@@ -338,6 +356,7 @@ def print_tables(records: list[dict]) -> None:
     print("\n== child RM READ batch envelopes (measured samples, p50 ms) ==")
     print(
         f"{'run':<14} {'batches':>7} {'complete':>8} {'READenv':>8} {'CQEspan':>8} "
+        f"{'startSp':>8} {'idle':>7} {'busy%':>6} {'avgRd':>6} {'peakRd':>6} "
         f"{'pwrEnv':>8} {'1CQE->pwr':>10} {'lastCQE->end':>12} {'overlap':>8} "
         f"{'peakPwr':>8} {'earlyPwr':>8}"
     )
@@ -350,6 +369,11 @@ def print_tables(records: list[dict]) -> None:
         def timeline_ms(field):
             return ns_to_ms((durations.get(field) or {}).get("medianNs"))
 
+        peak_read = (timeline.get("peakReadActive") or {}).get("median", float("nan"))
+        average_read = (timeline.get("averageReadActiveMilli") or {}).get(
+            "median", float("nan")
+        )
+        busy = (timeline.get("readBusyPermille") or {}).get("median", float("nan"))
         peak = (timeline.get("peakPwriteActive") or {}).get("median", float("nan"))
         early = (timeline.get("pwriteStartedBeforeLastReadCqe") or {}).get(
             "median", float("nan")
@@ -360,6 +384,11 @@ def print_tables(records: list[dict]) -> None:
             f"{timeline.get('completeBatchCount', 0):>8} "
             f"{timeline_ms('readBatchEnvelopeNs'):>8.2f} "
             f"{timeline_ms('readCqeSpanNs'):>8.2f} "
+            f"{timeline_ms('readStartSpanNs'):>8.2f} "
+            f"{timeline_ms('readIdleNs'):>7.2f} "
+            f"{busy / 10:>6.1f} "
+            f"{average_read / 1000:>6.2f} "
+            f"{peak_read:>6.1f} "
             f"{timeline_ms('pwriteEnvelopeNs'):>8.2f} "
             f"{timeline_ms('firstReadCqeToFirstPwriteStartNs'):>10.2f} "
             f"{timeline_ms('lastReadCqeToLastPwriteEndNs'):>12.2f} "
