@@ -93,6 +93,40 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(
                 overlays[("storage", "server", "urma", "read", "maxOutstandingPerPeer")], 256
             )
+            self.assertEqual(
+                overlays[
+                    (
+                        "storage",
+                        "server",
+                        "urma",
+                        "read",
+                        "maxConcurrentStorageWrites",
+                    )
+                ],
+                1024,
+            )
+
+        limited = dict(case)
+        limited["urmaRead"] = {
+            **case.get("urmaRead", {}),
+            "maxConcurrentStorageWrites": 8,
+        }
+        overlays = b7.role_overlays(
+            inventory, generated["child"], "child", "run-read-credits", limited
+        )
+        self.assertEqual(
+            overlays[
+                (
+                    "storage",
+                    "server",
+                    "urma",
+                    "read",
+                    "maxConcurrentStorageWrites",
+                )
+            ],
+            8,
+        )
+
         cases_path = TOOL_DIR / "cases-negative-credits.json"
         cases_path.write_text(json.dumps({
             "schemaVersion": 1,
@@ -2465,8 +2499,8 @@ storage:
                 "done_wait_ns=9 done_round_trip_ns=17 "
                 "session_run_ns=33 read_transfer_total_ns=36 "
                 "urma READ child finished transfer",
-                "file_open_ns=10 pwrite_ns=20 digest_ns=30 storage_total_ns=65 "
-                "finished writing piece from RM-READ lease",
+                "file_open_ns=10 pwrite_admission_ns=15 pwrite_ns=20 "
+                "digest_ns=30 storage_total_ns=65 finished writing piece from RM-READ lease",
                 "storage_write_ns=65 recycle_ns=5 metadata_commit_notify_ns=7 "
                 "finish_total_ns=77 finished committing urma READ piece to storage",
                 "read_download_ns=36 read_finish_ns=77 child_piece_e2e_ns=115 "
@@ -2482,6 +2516,7 @@ storage:
         self.assertEqual(summary["transport"]["readCompletionNs"]["totalNs"], 6)
         self.assertEqual(summary["transport"]["readDoneSendNs"]["totalNs"], 8)
         self.assertEqual(summary["transport"]["doneWaitNs"]["totalNs"], 9)
+        self.assertEqual(summary["storage"]["pwriteAdmissionNs"]["totalNs"], 15)
         self.assertEqual(summary["storage"]["pwriteNs"]["totalNs"], 20)
         self.assertEqual(summary["storage"]["digestNs"]["totalNs"], 30)
         self.assertEqual(summary["finish"]["recycleNs"]["totalNs"], 5)

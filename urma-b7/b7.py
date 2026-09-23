@@ -72,6 +72,7 @@ STORAGE_FILE_OPEN_NS_RE = re.compile(r"\bfile_open_ns=(\d+)")
 STORAGE_RX_WAIT_NS_RE = re.compile(r"\brx_window_wait_ns=(\d+)")
 STORAGE_DIGEST_NS_RE = re.compile(r"\bdigest_ns=(\d+)")
 STORAGE_PWRITE_NS_RE = re.compile(r"\bpwrite_ns=(\d+)")
+STORAGE_PWRITE_ADMISSION_NS_RE = re.compile(r"\bpwrite_admission_ns=(\d+)")
 STORAGE_PWRITE_CALLS_RE = re.compile(r"\bpwrite_calls=(\d+)")
 READ_PWRITE_ACTIVE_RE = re.compile(r"\bpwrite_active_at_start=(\d+)")
 STORAGE_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
@@ -2364,6 +2365,7 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
     )
     storage_fields = (
         ("fileOpenNs", STORAGE_FILE_OPEN_NS_RE),
+        ("pwriteAdmissionNs", STORAGE_PWRITE_ADMISSION_NS_RE),
         ("pwriteNs", STORAGE_PWRITE_NS_RE),
         ("digestNs", STORAGE_DIGEST_NS_RE),
         ("storageTotalNs", STORAGE_TOTAL_NS_RE),
@@ -2387,7 +2389,10 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         optional_indexes=frozenset((7, 8)),
     )
     storage, storage_bad = samples(
-        "finished writing piece from RM-READ lease", tuple(pattern for _, pattern in storage_fields)
+        "finished writing piece from RM-READ lease",
+        tuple(pattern for _, pattern in storage_fields),
+        # Logs written before pwrite admission control have no wait field.
+        optional_indexes=frozenset((1,)),
     )
     finish, finish_bad = samples(
         "finished committing urma READ piece to storage", tuple(pattern for _, pattern in finish_fields)
@@ -3573,6 +3578,7 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 "quarantineBytes",
                 "maxOutstandingPerPeer",
                 "maxReadSize",
+                "maxConcurrentStorageWrites",
             }
             if unknown:
                 raise B7Error(
@@ -3591,13 +3597,14 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                     raise B7Error(
                         f"case {case['name']} urmaRead.{key} must be a human-readable byte size"
                     )
-            if "maxOutstandingPerPeer" in urma_read and not (
-                isinstance(urma_read["maxOutstandingPerPeer"], int)
-                and 1 <= urma_read["maxOutstandingPerPeer"] <= 1024
-            ):
-                raise B7Error(
-                    f"case {case['name']} urmaRead.maxOutstandingPerPeer must be an int in 1..=1024"
-                )
+            for key in ("maxOutstandingPerPeer", "maxConcurrentStorageWrites"):
+                if key in urma_read and not (
+                    isinstance(urma_read[key], int)
+                    and 1 <= urma_read[key] <= 1024
+                ):
+                    raise B7Error(
+                        f"case {case['name']} urmaRead.{key} must be an int in 1..=1024"
+                    )
         if protocol == "tcp" and topology != "queue":
             raise B7Error(
                 f"case {case['name']} protocol tcp only supports queue topology"
@@ -3838,6 +3845,9 @@ def role_overlays(
         )
         overlays[("storage", "server", "urma", "read", "maxReadSize")] = read.get(
             "maxReadSize", "1MiB"
+        )
+        overlays[("storage", "server", "urma", "read", "maxConcurrentStorageWrites")] = read.get(
+            "maxConcurrentStorageWrites", 1024
         )
     return overlays
 

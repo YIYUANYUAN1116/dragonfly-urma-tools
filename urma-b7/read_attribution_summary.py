@@ -206,6 +206,7 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
         "piece_bytes": piece_bytes,
         "max_read_size": read_size,
         "chunks_per_piece": -(-piece_bytes // read_size) if piece_bytes and read_size else None,
+        "max_concurrent_storage_writes": read.get("maxConcurrentStorageWrites"),
         "file_bytes": FILE_CLASS_BYTES.get(case.get("fileClass", ""), 0),
         "throughput": views["throughput"],
         "timing": views["timing"],
@@ -263,7 +264,7 @@ def print_tables(records: list[dict]) -> None:
     print("\n== per run ==")
     print(
         f"{'run':<14} {'case':<32} {'cc':>3} {'piece':>6} {'maxRd':>6} {'chk':>3} "
-        f"{'aggMiB/s':>8} {'dfget ms':>8} {'toREAD':>7} {'READ->1':>7} "
+        f"{'pwrCap':>6} {'aggMiB/s':>8} {'dfget ms':>8} {'toREAD':>7} {'READ->1':>7} "
         f"{'READspan':>8} {'piece ms':>8} {'tail ms':>7} "
         f"{'rate':>7} {'effMaxRd':>9} {'fallb':>5} {'ok/att':>9} {'n':>2}"
     )
@@ -285,6 +286,7 @@ def print_tables(records: list[dict]) -> None:
             f"{fmt_bytes(r['piece_bytes']):>6}",
             f"{fmt_bytes(r['max_read_size']):>6}",
             f"{str(r['chunks_per_piece'] or '-'):>3}",
+            f"{str(r['max_concurrent_storage_writes'] or '-'):>6}",
             f"{nan_or(r['throughput'], 8, 1)}",
             f"{ns_to_ms(dfget):>8.2f}",
             f"{ns_to_ms(median_ns(timing, 'dfgetToFirstReadStartNs')):>7.2f}",
@@ -303,7 +305,8 @@ def print_tables(records: list[dict]) -> None:
     print("\n== child RM READ stages (measured samples, p50 ms) ==")
     print(
         f"{'run':<14} {'lane':>7} {'offer':>7} {'dstAdm':>7} {'READ':>7} "
-        f"{'lease':>7} {'doneTx':>7} {'doneWait':>8} {'pwrite':>7} {'crc':>7} {'recycle':>7} "
+        f"{'lease':>7} {'doneTx':>7} {'doneWait':>8} {'pwrWait':>8} {'pwrite':>7} "
+        f"{'crc':>7} {'recycle':>7} "
         f"{'meta':>7} {'pieceE2E':>9}"
     )
     for r in records:
@@ -324,6 +327,7 @@ def print_tables(records: list[dict]) -> None:
             f"{stage_ms('transport', 'leasePublishNs'):>7.2f} "
             f"{stage_ms('transport', 'readDoneSendNs'):>7.2f} "
             f"{stage_ms('transport', 'doneWaitNs'):>8.2f} "
+            f"{stage_ms('storage', 'pwriteAdmissionNs'):>8.2f} "
             f"{stage_ms('storage', 'pwriteNs'):>7.2f} "
             f"{stage_ms('storage', 'digestNs'):>7.2f} "
             f"{stage_ms('finish', 'recycleNs'):>7.2f} "
