@@ -103,6 +103,7 @@ def manifest_views(manifest: dict) -> dict:
         "run": manifest.get("runId"),
         "state": manifest.get("state"),
         "timing": timing,
+        "read_stages": transfer.get("urmaReadStageSummary") or {},
         "throughput": rate,
         "samples": summary.get("samples"),
         "evidence": manifest.get("evidence") or result.get("evidence") or {},
@@ -207,6 +208,7 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
         "file_bytes": FILE_CLASS_BYTES.get(case.get("fileClass", ""), 0),
         "throughput": views["throughput"],
         "timing": views["timing"],
+        "read_stages": views["read_stages"],
         "evidence": views["evidence"],
         "sample_count": views["samples"],
         "logs": {},
@@ -259,7 +261,8 @@ def print_tables(records: list[dict]) -> None:
     print("\n== per run ==")
     print(
         f"{'run':<14} {'case':<32} {'cc':>3} {'piece':>6} {'maxRd':>6} {'chk':>3} "
-        f"{'aggMiB/s':>8} {'dfget ms':>8} {'start ms':>8} {'piece ms':>8} {'tail ms':>7} "
+        f"{'aggMiB/s':>8} {'dfget ms':>8} {'toREAD':>7} {'READ->1':>7} "
+        f"{'READspan':>8} {'piece ms':>8} {'tail ms':>7} "
         f"{'rate':>7} {'effMaxRd':>9} {'fallb':>5} {'ok/att':>9} {'n':>2}"
     )
     for r in records:
@@ -282,7 +285,9 @@ def print_tables(records: list[dict]) -> None:
             f"{str(r['chunks_per_piece'] or '-'):>3}",
             f"{nan_or(r['throughput'], 8, 1)}",
             f"{ns_to_ms(dfget):>8.2f}",
-            f"{ns_to_ms(median_ns(timing, 'startToFirstPieceNs')):>8.2f}",
+            f"{ns_to_ms(median_ns(timing, 'dfgetToFirstReadStartNs')):>7.2f}",
+            f"{ns_to_ms(median_ns(timing, 'firstReadStartToFirstPieceNs')):>7.2f}",
+            f"{ns_to_ms(median_ns(timing, 'firstReadStartToLastPieceNs')):>8.2f}",
             f"{ns_to_ms(piece_span):>8.2f}",
             f"{ns_to_ms(median_ns(timing, 'lastPieceToDfgetEndNs')):>7.2f}",
             f"{nan_or(rate, 7, 1)}",
@@ -292,6 +297,36 @@ def print_tables(records: list[dict]) -> None:
             f"{str(r['sample_count'] or '-'):>2}",
         ]
         print(" ".join(cells))
+
+    print("\n== child RM READ stages (measured samples, p50 ms) ==")
+    print(
+        f"{'run':<14} {'lane':>7} {'offer':>7} {'dstAdm':>7} {'READ':>7} "
+        f"{'lease':>7} {'done':>7} {'pwrite':>7} {'crc':>7} {'recycle':>7} "
+        f"{'meta':>7} {'pieceE2E':>9}"
+    )
+    for r in records:
+        stages = r.get("read_stages") or {}
+
+        def stage_ms(group, field):
+            value = (((stages.get(group) or {}).get(field) or {}).get("medianNs"))
+            return ns_to_ms(value)
+
+        if not stages.get("observed"):
+            continue
+        print(
+            f"{str(r['run']):<14} "
+            f"{stage_ms('transport', 'laneAcquireNs'):>7.2f} "
+            f"{stage_ms('transport', 'segmentOfferWaitNs'):>7.2f} "
+            f"{stage_ms('transport', 'destinationAdmissionNs'):>7.2f} "
+            f"{stage_ms('transport', 'readCompletionNs'):>7.2f} "
+            f"{stage_ms('transport', 'leasePublishNs'):>7.2f} "
+            f"{stage_ms('transport', 'doneRoundTripNs'):>7.2f} "
+            f"{stage_ms('storage', 'pwriteNs'):>7.2f} "
+            f"{stage_ms('storage', 'digestNs'):>7.2f} "
+            f"{stage_ms('finish', 'recycleNs'):>7.2f} "
+            f"{stage_ms('finish', 'metadataCommitNs'):>7.2f} "
+            f"{stage_ms('attempt', 'pieceE2eNs'):>9.2f}"
+        )
 
     print("\n== parent source data plane / child Piece E2E (samples; warmup apart) ==")
     print(

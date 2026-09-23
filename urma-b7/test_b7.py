@@ -2007,6 +2007,11 @@ storage:
             '2026-08-31T10:41:35.600000000Z DEBUG finished piece task-255 '
             'from parent Some("parent") using protocol urma task_id="task-id"'
         )
+        read_start_line = (
+            '2026-08-31T10:41:35.050000000Z INFO '
+            'task_id="task-id" piece_id="piece-0" '
+            'starting dragonfly urma READ piece attempt'
+        )
         started = b7.parse_log_timestamp_ns(first_line) - 100_000_000
         finished = b7.parse_log_timestamp_ns(last_line) + 200_000_000
         timing = b7.analyze_task_timing(
@@ -2015,9 +2020,13 @@ storage:
                 "finishedAtUnixNs": finished,
                 "elapsedNs": finished - started,
             },
-            first_line + "\n" + last_line + "\n",
+            read_start_line + "\n" + first_line + "\n" + last_line + "\n",
         )
         self.assertEqual(timing["pieceCompletions"], 2)
+        self.assertEqual(timing["readPieceStarts"], 1)
+        self.assertEqual(timing["dfgetToFirstReadStartNs"], 50_000_000)
+        self.assertEqual(timing["firstReadStartToFirstPieceNs"], 50_000_000)
+        self.assertEqual(timing["firstReadStartToLastPieceNs"], 550_000_000)
         self.assertEqual(timing["startToFirstPieceNs"], 100_000_000)
         self.assertEqual(timing["firstToLastPieceNs"], 500_000_000)
         self.assertEqual(timing["lastPieceToDfgetEndNs"], 200_000_000)
@@ -2422,6 +2431,35 @@ storage:
         self.assertFalse(summary["observed"])
         self.assertEqual(summary["peerCount"], 0)
         self.assertEqual(summary["sendsPerCqe"], 0.0)
+
+    def test_read_stage_summary_splits_transport_storage_and_commit(self):
+        child = "\n".join(
+            (
+                "retained_cleanup_ns=1 lane_acquire_ns=2 buffer_ready_send_ns=3 "
+                "segment_offer_wait_ns=4 destination_admission_ns=5 "
+                "read_completion_ns=6 lease_publish_ns=7 done_round_trip_ns=8 "
+                "session_run_ns=33 read_transfer_total_ns=36 "
+                "urma READ child finished transfer",
+                "file_open_ns=10 pwrite_ns=20 digest_ns=30 storage_total_ns=65 "
+                "finished writing piece from RM-READ lease",
+                "storage_write_ns=65 recycle_ns=5 metadata_commit_notify_ns=7 "
+                "finish_total_ns=77 finished committing urma READ piece to storage",
+                "read_download_ns=36 read_finish_ns=77 child_piece_e2e_ns=115 "
+                "finished dragonfly urma READ piece attempt",
+            )
+        )
+
+        summary = b7.urma_read_stage_summary(child)
+
+        self.assertTrue(summary["observed"])
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertEqual(summary["transport"]["pieceCount"], 1)
+        self.assertEqual(summary["transport"]["readCompletionNs"]["totalNs"], 6)
+        self.assertEqual(summary["storage"]["pwriteNs"]["totalNs"], 20)
+        self.assertEqual(summary["storage"]["digestNs"]["totalNs"], 30)
+        self.assertEqual(summary["finish"]["recycleNs"]["totalNs"], 5)
+        self.assertEqual(summary["finish"]["metadataCommitNs"]["totalNs"], 7)
+        self.assertEqual(summary["attempt"]["pieceE2eNs"]["totalNs"], 115)
 
     def test_storage_consumer_summary_attributes_digest_and_pwrite(self):
         child = "\n".join(

@@ -75,6 +75,22 @@ STORAGE_PWRITE_NS_RE = re.compile(r"\bpwrite_ns=(\d+)")
 STORAGE_PWRITE_CALLS_RE = re.compile(r"\bpwrite_calls=(\d+)")
 STORAGE_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
 STORAGE_TOTAL_NS_RE = re.compile(r"\bstorage_total_ns=(\d+)")
+READ_RETAINED_CLEANUP_NS_RE = re.compile(r"\bretained_cleanup_ns=(\d+)")
+READ_LANE_ACQUIRE_NS_RE = re.compile(r"\blane_acquire_ns=(\d+)")
+READ_BUFFER_READY_SEND_NS_RE = re.compile(r"\bbuffer_ready_send_ns=(\d+)")
+READ_SEGMENT_OFFER_WAIT_NS_RE = re.compile(r"\bsegment_offer_wait_ns=(\d+)")
+READ_DESTINATION_ADMISSION_NS_RE = re.compile(r"\bdestination_admission_ns=(\d+)")
+READ_COMPLETION_NS_RE = re.compile(r"\bread_completion_ns=(\d+)")
+READ_LEASE_PUBLISH_NS_RE = re.compile(r"\blease_publish_ns=(\d+)")
+READ_DONE_ROUND_TRIP_NS_RE = re.compile(r"\bdone_round_trip_ns=(\d+)")
+READ_SESSION_RUN_NS_RE = re.compile(r"\bsession_run_ns=(\d+)")
+READ_TRANSFER_TOTAL_NS_RE = re.compile(r"\bread_transfer_total_ns=(\d+)")
+READ_DOWNLOAD_NS_RE = re.compile(r"\bread_download_ns=(\d+)")
+READ_FINISH_NS_RE = re.compile(r"\bread_finish_ns=(\d+)")
+READ_CHILD_PIECE_E2E_NS_RE = re.compile(r"\bchild_piece_e2e_ns=(\d+)")
+READ_STORAGE_WRITE_NS_RE = re.compile(r"\bstorage_write_ns=(\d+)")
+READ_METADATA_COMMIT_NS_RE = re.compile(r"\bmetadata_commit_notify_ns=(\d+)")
+READ_FINISH_TOTAL_NS_RE = re.compile(r"\bfinish_total_ns=(\d+)")
 TRANSPORT_ONLY_WINDOW_COUNT_RE = re.compile(r"\bwindows=(\d+)")
 TRANSPORT_ONLY_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
 TRANSPORT_ONLY_TOTAL_NS_RE = re.compile(r"\btransport_only_ns=(\d+)")
@@ -1525,7 +1541,7 @@ def analyze_task_timing(
         raise B7Error("dfget wall-clock timestamps do not match elapsedNs")
     if not started <= first_piece <= last_piece <= finished:
         raise B7Error("Piece completion timestamps are outside the dfget interval")
-    return {
+    result = {
         "taskId": next(iter(task_ids)),
         "pieceCompletions": len(completion_lines),
         "firstPieceAtUnixNs": first_piece,
@@ -1535,6 +1551,29 @@ def analyze_task_timing(
         "lastPieceToDfgetEndNs": finished - last_piece,
         "dfgetElapsedNs": elapsed,
     }
+    read_start_lines = [
+        line
+        for line in task_log.splitlines()
+        if "starting dragonfly urma READ piece attempt" in line
+        and last_task_id(line) == result["taskId"]
+    ]
+    if read_start_lines:
+        read_starts = [parse_log_timestamp_ns(line) for line in read_start_lines]
+        first_read_start = min(read_starts)
+        last_read_start = max(read_starts)
+        if not started <= first_read_start <= last_read_start <= last_piece:
+            raise B7Error("READ Piece start timestamps are outside the dfget interval")
+        result.update(
+            {
+                "readPieceStarts": len(read_starts),
+                "firstReadStartAtUnixNs": first_read_start,
+                "lastReadStartAtUnixNs": last_read_start,
+                "dfgetToFirstReadStartNs": first_read_start - started,
+                "firstReadStartToFirstPieceNs": first_piece - first_read_start,
+                "firstReadStartToLastPieceNs": last_piece - first_read_start,
+            }
+        )
+    return result
 
 
 def analyze_urma_server_transport_span(
@@ -2270,6 +2309,83 @@ def urma_storage_consumer_summary(child: str) -> dict[str, Any]:
     }
 
 
+def urma_read_stage_summary(child: str) -> dict[str, Any]:
+    """Attribute successful RM-READ Piece time without mixing SEND/RECV logs."""
+
+    def samples(marker: str, patterns: tuple[re.Pattern[str], ...]) -> tuple[list[tuple[int, ...]], int]:
+        parsed: list[tuple[int, ...]] = []
+        malformed = 0
+        for line in child.splitlines():
+            if marker not in line:
+                continue
+            values = tuple(last_int_match(pattern, line) for pattern in patterns)
+            if any(value is None for value in values):
+                malformed += 1
+                continue
+            parsed.append(tuple(int(value) for value in values))
+        return parsed, malformed
+
+    transport_fields = (
+        ("retainedCleanupNs", READ_RETAINED_CLEANUP_NS_RE),
+        ("laneAcquireNs", READ_LANE_ACQUIRE_NS_RE),
+        ("bufferReadySendNs", READ_BUFFER_READY_SEND_NS_RE),
+        ("segmentOfferWaitNs", READ_SEGMENT_OFFER_WAIT_NS_RE),
+        ("destinationAdmissionNs", READ_DESTINATION_ADMISSION_NS_RE),
+        ("readCompletionNs", READ_COMPLETION_NS_RE),
+        ("leasePublishNs", READ_LEASE_PUBLISH_NS_RE),
+        ("doneRoundTripNs", READ_DONE_ROUND_TRIP_NS_RE),
+        ("sessionRunNs", READ_SESSION_RUN_NS_RE),
+        ("transferTotalNs", READ_TRANSFER_TOTAL_NS_RE),
+    )
+    storage_fields = (
+        ("fileOpenNs", STORAGE_FILE_OPEN_NS_RE),
+        ("pwriteNs", STORAGE_PWRITE_NS_RE),
+        ("digestNs", STORAGE_DIGEST_NS_RE),
+        ("storageTotalNs", STORAGE_TOTAL_NS_RE),
+    )
+    finish_fields = (
+        ("storageWriteNs", READ_STORAGE_WRITE_NS_RE),
+        ("recycleNs", STORAGE_RECYCLE_NS_RE),
+        ("metadataCommitNs", READ_METADATA_COMMIT_NS_RE),
+        ("finishTotalNs", READ_FINISH_TOTAL_NS_RE),
+    )
+    attempt_fields = (
+        ("downloadNs", READ_DOWNLOAD_NS_RE),
+        ("finishNs", READ_FINISH_NS_RE),
+        ("pieceE2eNs", READ_CHILD_PIECE_E2E_NS_RE),
+    )
+    transport, transport_bad = samples(
+        "urma READ child finished transfer", tuple(pattern for _, pattern in transport_fields)
+    )
+    storage, storage_bad = samples(
+        "finished writing piece from RM-READ lease", tuple(pattern for _, pattern in storage_fields)
+    )
+    finish, finish_bad = samples(
+        "finished committing urma READ piece to storage", tuple(pattern for _, pattern in finish_fields)
+    )
+    attempt, attempt_bad = samples(
+        "finished dragonfly urma READ piece attempt", tuple(pattern for _, pattern in attempt_fields)
+    )
+
+    def summarize(rows: list[tuple[int, ...]], fields: tuple[tuple[str, re.Pattern[str]], ...]) -> dict[str, Any]:
+        return {
+            "pieceCount": len(rows),
+            **{
+                name: integer_ns_summary([row[index] for row in rows])
+                for index, (name, _pattern) in enumerate(fields)
+            },
+        }
+
+    return {
+        "observed": bool(transport or storage or finish or attempt),
+        "transport": summarize(transport, transport_fields),
+        "storage": summarize(storage, storage_fields),
+        "finish": summarize(finish, finish_fields),
+        "attempt": summarize(attempt, attempt_fields),
+        "malformedLines": transport_bad + storage_bad + finish_bad + attempt_bad,
+    }
+
+
 def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any]:
     combined = parent + "\n" + children
     lower_parent = parent.lower()
@@ -2886,11 +3002,21 @@ def urma_server_transport_spans_summary(
 def task_timing_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if not samples:
         raise B7Error("at least one measured task timing sample is required")
-    fields = (
+    required_fields = (
         "startToFirstPieceNs",
         "firstToLastPieceNs",
         "lastPieceToDfgetEndNs",
         "dfgetElapsedNs",
+    )
+    optional_fields = (
+        "dfgetToFirstReadStartNs",
+        "firstReadStartToFirstPieceNs",
+        "firstReadStartToLastPieceNs",
+    )
+    fields = required_fields + tuple(
+        field
+        for field in optional_fields
+        if all(field in sample["child"]["taskTiming"] for sample in samples)
     )
 
     def distribution(values: list[int]) -> dict[str, float | int]:
@@ -4917,6 +5043,10 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 child_transfer["taskTiming"] = analyze_task_timing(
                     child_transfer, task_log, expected_task_id, protocol
                 )
+                scoped_task_log = filter_task_scoped_log(task_log, {expected_task_id})
+                read_stages = urma_read_stage_summary(scoped_task_log)
+                if read_stages["observed"]:
+                    child_transfer["urmaReadStages"] = read_stages
                 if case.get("urmaPerformanceProfile") == "transport-only":
                     completed_pieces = filter_task_scoped_log(
                         task_log, {expected_task_id}
@@ -5048,6 +5178,13 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         result["transfer"]["taskTimingSummary"] = task_timing_summary(
             result["transfer"]["samples"]
         )
+        sample_read_logs = [
+            (evidence_dir / batch["taskScopedEvidence"]["child"]).read_text(encoding="utf-8")
+            for batch in result["transfer"]["batches"]["samples"]
+        ]
+        read_stage_summary = urma_read_stage_summary("\n".join(sample_read_logs))
+        if read_stage_summary["observed"]:
+            result["transfer"]["urmaReadStageSummary"] = read_stage_summary
         result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
             result["transfer"]["batches"]["samples"]
         )
