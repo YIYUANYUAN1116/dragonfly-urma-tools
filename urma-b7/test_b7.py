@@ -2492,6 +2492,40 @@ storage:
         self.assertEqual(parsed["parent"]["source_direct"], 1)
         self.assertEqual(parsed["parent"]["source_copied"], 1)
 
+    def test_read_batch_timeline_measures_transport_storage_overlap(self):
+        log = "\n".join(
+            (
+                "2026-09-23T01:00:00.020000000Z task_id=t piece_number=0 "
+                "read_completion_ns=20000000 "
+                "urma READ child completed data transfer",
+                "2026-09-23T01:00:00.030000000Z task_id=t piece_number=1 "
+                "read_completion_ns=20000000 "
+                "urma READ child completed data transfer",
+                "2026-09-23T01:00:00.045000000Z task_id=t piece_id=p0 "
+                "pwrite_ns=20000000 pwrite_active_at_start=1 "
+                "finished pwrite for RM-READ lease",
+                "2026-09-23T01:00:00.060000000Z task_id=t piece_id=p1 "
+                "pwrite_ns=25000000 pwrite_active_at_start=2 "
+                "finished pwrite for RM-READ lease",
+            )
+        )
+        timeline = b7.urma_read_batch_timeline(log)
+        self.assertTrue(timeline["complete"])
+        self.assertEqual(timeline["readBatchEnvelopeNs"], 30_000_000)
+        self.assertEqual(timeline["readCqeSpanNs"], 10_000_000)
+        self.assertEqual(timeline["pwriteEnvelopeNs"], 35_000_000)
+        self.assertEqual(timeline["firstReadCqeToFirstPwriteStartNs"], 5_000_000)
+        self.assertEqual(timeline["lastReadCqeToLastPwriteEndNs"], 30_000_000)
+        self.assertEqual(timeline["readPwriteEnvelopeOverlapNs"], 5_000_000)
+        self.assertEqual(timeline["peakPwriteActive"], 2)
+        self.assertEqual(timeline["pwriteStartedBeforeLastReadCqe"], 1)
+
+        summary = b7.urma_read_timeline_summary([timeline])
+        self.assertEqual(summary["completeBatchCount"], 1)
+        self.assertEqual(
+            summary["duration"]["readBatchEnvelopeNs"]["medianNs"], 30_000_000
+        )
+
     def test_storage_consumer_summary_attributes_digest_and_pwrite(self):
         child = "\n".join(
             (

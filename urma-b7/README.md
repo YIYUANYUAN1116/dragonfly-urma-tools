@@ -233,7 +233,9 @@ python3 b7.py cleanup --manifest results/read-src-011/manifest.json --execute
 `result.transfer.urmaReadStageSummary`：传输侧含 lane/Offer/destination admission/READ CQE/ReadDone send/Done wait，
 Storage 侧含 file open/pwrite/CRC/recycle/metadata commit。`taskTimingSummary` 另含
 `dfgetToFirstReadStartNs`、`firstReadStartToFirstPieceNs` 和 `firstReadStartToLastPieceNs`。
-`read_attribution_summary.py` 会直接打印这些字段的 p50。
+`urmaReadTimelineSummary` 使用正常路径事件汇总每个 measured batch 的首末 READ 数据区间、首末
+pwrite 区间、两者 envelope overlap、最后 CQE 到最后 pwrite 的距离，以及实际 pwrite 峰值并发；
+不需要启用 transport-only profile。`read_attribution_summary.py` 会直接打印这些字段的 p50。
 
 ## Performance case
 

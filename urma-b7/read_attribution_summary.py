@@ -104,6 +104,7 @@ def manifest_views(manifest: dict) -> dict:
         "state": manifest.get("state"),
         "timing": timing,
         "read_stages": transfer.get("urmaReadStageSummary") or {},
+        "read_timeline": transfer.get("urmaReadTimelineSummary") or {},
         "throughput": rate,
         "samples": summary.get("samples"),
         "evidence": manifest.get("evidence") or result.get("evidence") or {},
@@ -327,6 +328,39 @@ def print_tables(records: list[dict]) -> None:
             f"{stage_ms('finish', 'recycleNs'):>7.2f} "
             f"{stage_ms('finish', 'metadataCommitNs'):>7.2f} "
             f"{stage_ms('attempt', 'pieceE2eNs'):>9.2f}"
+        )
+
+    print("\n== child RM READ batch envelopes (measured samples, p50 ms) ==")
+    print(
+        f"{'run':<14} {'batches':>7} {'complete':>8} {'READenv':>8} {'CQEspan':>8} "
+        f"{'pwrEnv':>8} {'1CQE->pwr':>10} {'lastCQE->end':>12} {'overlap':>8} "
+        f"{'peakPwr':>8} {'earlyPwr':>8}"
+    )
+    for r in records:
+        timeline = r.get("read_timeline") or {}
+        if not timeline.get("observed"):
+            continue
+        durations = timeline.get("duration") or {}
+
+        def timeline_ms(field):
+            return ns_to_ms((durations.get(field) or {}).get("medianNs"))
+
+        peak = (timeline.get("peakPwriteActive") or {}).get("median", float("nan"))
+        early = (timeline.get("pwriteStartedBeforeLastReadCqe") or {}).get(
+            "median", float("nan")
+        )
+        print(
+            f"{str(r['run']):<14} "
+            f"{timeline.get('batchCount', 0):>7} "
+            f"{timeline.get('completeBatchCount', 0):>8} "
+            f"{timeline_ms('readBatchEnvelopeNs'):>8.2f} "
+            f"{timeline_ms('readCqeSpanNs'):>8.2f} "
+            f"{timeline_ms('pwriteEnvelopeNs'):>8.2f} "
+            f"{timeline_ms('firstReadCqeToFirstPwriteStartNs'):>10.2f} "
+            f"{timeline_ms('lastReadCqeToLastPwriteEndNs'):>12.2f} "
+            f"{timeline_ms('readPwriteEnvelopeOverlapNs'):>8.2f} "
+            f"{peak:>8.1f} "
+            f"{early:>8.1f}"
         )
 
     print("\n== parent source data plane / child Piece E2E (samples; warmup apart) ==")

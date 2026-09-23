@@ -73,6 +73,7 @@ STORAGE_RX_WAIT_NS_RE = re.compile(r"\brx_window_wait_ns=(\d+)")
 STORAGE_DIGEST_NS_RE = re.compile(r"\bdigest_ns=(\d+)")
 STORAGE_PWRITE_NS_RE = re.compile(r"\bpwrite_ns=(\d+)")
 STORAGE_PWRITE_CALLS_RE = re.compile(r"\bpwrite_calls=(\d+)")
+READ_PWRITE_ACTIVE_RE = re.compile(r"\bpwrite_active_at_start=(\d+)")
 STORAGE_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
 STORAGE_TOTAL_NS_RE = re.compile(r"\bstorage_total_ns=(\d+)")
 READ_RETAINED_CLEANUP_NS_RE = re.compile(r"\bretained_cleanup_ns=(\d+)")
@@ -2061,6 +2062,19 @@ def integer_ns_summary(values: list[int]) -> dict[str, int | float]:
     }
 
 
+def integer_value_summary(values: list[int]) -> dict[str, int | float]:
+    summary = integer_ns_summary(values)
+    return {
+        "count": summary["count"],
+        "total": summary["totalNs"],
+        "mean": summary["meanNs"],
+        "median": summary["medianNs"],
+        "p95": summary["p95Ns"],
+        "p99": summary["p99Ns"],
+        "max": summary["maxNs"],
+    }
+
+
 def tx_window_acquire_summary(evidence: str) -> dict[str, Any]:
     piece_lines = [
         line
@@ -2403,6 +2417,139 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         "finish": summarize(finish, finish_fields),
         "attempt": summarize(attempt, attempt_fields),
         "malformedLines": transport_bad + storage_bad + finish_bad + attempt_bad,
+    }
+
+
+READ_TIMELINE_DURATION_FIELDS = (
+    "readStartSpanNs",
+    "readCqeSpanNs",
+    "readBatchEnvelopeNs",
+    "pwriteStartSpanNs",
+    "pwriteEndSpanNs",
+    "pwriteEnvelopeNs",
+    "firstReadCqeToFirstPwriteStartNs",
+    "lastReadCqeToLastPwriteEndNs",
+    "firstReadStartToLastPwriteEndNs",
+    "readPwriteEnvelopeOverlapNs",
+)
+
+
+def urma_read_batch_timeline(child: str) -> dict[str, Any]:
+    """Build one batch's normal-path READ/pwrite envelope from daemon events.
+
+    Start timestamps are reconstructed from the completion event and its
+    monotonic duration so instrumentation adds only two log lines per Piece.
+    """
+
+    read_events: list[tuple[int, int]] = []
+    pwrite_events: list[tuple[int, int, str | None, int | None]] = []
+    malformed = 0
+    for line in child.splitlines():
+        if "urma READ child completed data transfer" in line:
+            try:
+                finished = parse_log_timestamp_ns(line)
+            except B7Error:
+                malformed += 1
+                continue
+            duration = last_int_match(READ_COMPLETION_NS_RE, line)
+            if duration is None or duration > finished:
+                malformed += 1
+                continue
+            read_events.append((finished - duration, finished))
+        elif "finished pwrite for RM-READ lease" in line:
+            try:
+                finished = parse_log_timestamp_ns(line)
+            except B7Error:
+                malformed += 1
+                continue
+            duration = last_int_match(STORAGE_PWRITE_NS_RE, line)
+            if duration is None or duration > finished:
+                malformed += 1
+                continue
+            task_id = last_task_id(line)
+            piece_id = last_piece_id(line)
+            key = f"{task_id}:{piece_id}" if task_id and piece_id else None
+            active = last_int_match(READ_PWRITE_ACTIVE_RE, line)
+            pwrite_events.append((finished - duration, finished, key, active))
+
+    observed = bool(read_events or pwrite_events)
+    result: dict[str, Any] = {
+        "observed": observed,
+        "complete": False,
+        "readStartCount": len(read_events),
+        "readCqeCount": len(read_events),
+        "pwriteStartCount": len(pwrite_events),
+        "pwriteEndCount": len(pwrite_events),
+        "malformedLines": malformed,
+    }
+    if not observed:
+        return result
+
+    starts = [event[0] for event in read_events]
+    cqes = [event[1] for event in read_events]
+    pwrite_starts = [event[0] for event in pwrite_events]
+    pwrite_ends = [event[1] for event in pwrite_events]
+    peak_active = [event[3] for event in pwrite_events]
+    result["peakPwriteActive"] = max(
+        (value for value in peak_active if value is not None), default=0
+    )
+
+    if starts:
+        result["readStartSpanNs"] = max(starts) - min(starts)
+    if cqes:
+        result["readCqeSpanNs"] = max(cqes) - min(cqes)
+    if starts and cqes:
+        result["readBatchEnvelopeNs"] = max(cqes) - min(starts)
+    if pwrite_starts:
+        result["pwriteStartSpanNs"] = max(pwrite_starts) - min(pwrite_starts)
+    if pwrite_ends:
+        result["pwriteEndSpanNs"] = max(pwrite_ends) - min(pwrite_ends)
+    if pwrite_starts and pwrite_ends:
+        result["pwriteEnvelopeNs"] = max(pwrite_ends) - min(pwrite_starts)
+    if cqes and pwrite_starts:
+        result["firstReadCqeToFirstPwriteStartNs"] = min(pwrite_starts) - min(cqes)
+        result["pwriteStartedBeforeLastReadCqe"] = sum(
+            timestamp < max(cqes) for timestamp in pwrite_starts
+        )
+    if cqes and pwrite_ends:
+        result["lastReadCqeToLastPwriteEndNs"] = max(pwrite_ends) - max(cqes)
+    if starts and pwrite_ends:
+        result["firstReadStartToLastPwriteEndNs"] = max(pwrite_ends) - min(starts)
+    if starts and cqes and pwrite_starts and pwrite_ends:
+        overlap_start = max(min(starts), min(pwrite_starts))
+        overlap_end = min(max(cqes), max(pwrite_ends))
+        result["readPwriteEnvelopeOverlapNs"] = max(0, overlap_end - overlap_start)
+
+    pwrite_keys = {event[2] for event in pwrite_events if event[2]}
+    result["complete"] = (
+        bool(read_events)
+        and len(read_events) == len(pwrite_events)
+        and len(pwrite_keys) == len(pwrite_events)
+        and all(event[3] is not None for event in pwrite_events)
+        and malformed == 0
+    )
+    return result
+
+
+def urma_read_timeline_summary(timelines: list[dict[str, Any]]) -> dict[str, Any]:
+    observed = [timeline for timeline in timelines if timeline.get("observed")]
+    return {
+        "observed": bool(observed),
+        "batchCount": len(observed),
+        "completeBatchCount": sum(bool(timeline.get("complete")) for timeline in observed),
+        "peakPwriteActive": integer_value_summary(
+            [int(timeline.get("peakPwriteActive", 0)) for timeline in observed]
+        ),
+        "pwriteStartedBeforeLastReadCqe": integer_value_summary(
+            [int(timeline.get("pwriteStartedBeforeLastReadCqe", 0)) for timeline in observed]
+        ),
+        "duration": {
+            field: integer_ns_summary(
+                [int(timeline[field]) for timeline in observed if field in timeline]
+            )
+            for field in READ_TIMELINE_DURATION_FIELDS
+        },
+        "malformedLines": sum(int(timeline.get("malformedLines", 0)) for timeline in observed),
     }
 
 
@@ -5067,6 +5214,9 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 read_stages = urma_read_stage_summary(scoped_task_log)
                 if read_stages["observed"]:
                     child_transfer["urmaReadStages"] = read_stages
+                read_timeline = urma_read_batch_timeline(scoped_task_log)
+                if read_timeline["observed"]:
+                    child_transfer["urmaReadTimeline"] = read_timeline
                 if case.get("urmaPerformanceProfile") == "transport-only":
                     completed_pieces = filter_task_scoped_log(
                         task_log, {expected_task_id}
@@ -5168,6 +5318,11 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 "transfers": batch_transfers,
                 "summary": concurrent_batch_summary(batch_transfers),
             }
+            batch_read_timeline = urma_read_batch_timeline(
+                filter_task_scoped_log(task_log, task_ids)
+            )
+            if batch_read_timeline["observed"]:
+                batch_result["urmaReadTimeline"] = batch_read_timeline
             if case.get("urmaPerformanceProfile") == "transport-only":
                 batch_result["urmaServerTransportSpan"] = (
                     analyze_urma_server_transport_span(
@@ -5205,6 +5360,14 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         read_stage_summary = urma_read_stage_summary("\n".join(sample_read_logs))
         if read_stage_summary["observed"]:
             result["transfer"]["urmaReadStageSummary"] = read_stage_summary
+        read_timeline_summary = urma_read_timeline_summary(
+            [
+                batch.get("urmaReadTimeline", {})
+                for batch in result["transfer"]["batches"]["samples"]
+            ]
+        )
+        if read_timeline_summary["observed"]:
+            result["transfer"]["urmaReadTimelineSummary"] = read_timeline_summary
         result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
             result["transfer"]["batches"]["samples"]
         )
