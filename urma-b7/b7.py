@@ -82,6 +82,8 @@ READ_SEGMENT_OFFER_WAIT_NS_RE = re.compile(r"\bsegment_offer_wait_ns=(\d+)")
 READ_DESTINATION_ADMISSION_NS_RE = re.compile(r"\bdestination_admission_ns=(\d+)")
 READ_COMPLETION_NS_RE = re.compile(r"\bread_completion_ns=(\d+)")
 READ_LEASE_PUBLISH_NS_RE = re.compile(r"\blease_publish_ns=(\d+)")
+READ_DONE_SEND_NS_RE = re.compile(r"\bread_done_send_ns=(\d+)")
+READ_DONE_WAIT_NS_RE = re.compile(r"\bdone_wait_ns=(\d+)")
 READ_DONE_ROUND_TRIP_NS_RE = re.compile(r"\bdone_round_trip_ns=(\d+)")
 READ_SESSION_RUN_NS_RE = re.compile(r"\bsession_run_ns=(\d+)")
 READ_TRANSFER_TOTAL_NS_RE = re.compile(r"\bread_transfer_total_ns=(\d+)")
@@ -2312,17 +2314,24 @@ def urma_storage_consumer_summary(child: str) -> dict[str, Any]:
 def urma_read_stage_summary(child: str) -> dict[str, Any]:
     """Attribute successful RM-READ Piece time without mixing SEND/RECV logs."""
 
-    def samples(marker: str, patterns: tuple[re.Pattern[str], ...]) -> tuple[list[tuple[int, ...]], int]:
-        parsed: list[tuple[int, ...]] = []
+    def samples(
+        marker: str,
+        patterns: tuple[re.Pattern[str], ...],
+        optional_indexes: frozenset[int] = frozenset(),
+    ) -> tuple[list[tuple[int | None, ...]], int]:
+        parsed: list[tuple[int | None, ...]] = []
         malformed = 0
         for line in child.splitlines():
             if marker not in line:
                 continue
             values = tuple(last_int_match(pattern, line) for pattern in patterns)
-            if any(value is None for value in values):
+            if any(
+                value is None and index not in optional_indexes
+                for index, value in enumerate(values)
+            ):
                 malformed += 1
                 continue
-            parsed.append(tuple(int(value) for value in values))
+            parsed.append(tuple(int(value) if value is not None else None for value in values))
         return parsed, malformed
 
     transport_fields = (
@@ -2333,6 +2342,8 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         ("destinationAdmissionNs", READ_DESTINATION_ADMISSION_NS_RE),
         ("readCompletionNs", READ_COMPLETION_NS_RE),
         ("leasePublishNs", READ_LEASE_PUBLISH_NS_RE),
+        ("readDoneSendNs", READ_DONE_SEND_NS_RE),
+        ("doneWaitNs", READ_DONE_WAIT_NS_RE),
         ("doneRoundTripNs", READ_DONE_ROUND_TRIP_NS_RE),
         ("sessionRunNs", READ_SESSION_RUN_NS_RE),
         ("transferTotalNs", READ_TRANSFER_TOTAL_NS_RE),
@@ -2355,7 +2366,11 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         ("pieceE2eNs", READ_CHILD_PIECE_E2E_NS_RE),
     )
     transport, transport_bad = samples(
-        "urma READ child finished transfer", tuple(pattern for _, pattern in transport_fields)
+        "urma READ child finished transfer",
+        tuple(pattern for _, pattern in transport_fields),
+        # Logs before the direct-source optimization only contain the combined
+        # Done round trip. Keep their other transport stages comparable.
+        optional_indexes=frozenset((7, 8)),
     )
     storage, storage_bad = samples(
         "finished writing piece from RM-READ lease", tuple(pattern for _, pattern in storage_fields)
@@ -2367,11 +2382,16 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         "finished dragonfly urma READ piece attempt", tuple(pattern for _, pattern in attempt_fields)
     )
 
-    def summarize(rows: list[tuple[int, ...]], fields: tuple[tuple[str, re.Pattern[str]], ...]) -> dict[str, Any]:
+    def summarize(
+        rows: list[tuple[int | None, ...]],
+        fields: tuple[tuple[str, re.Pattern[str]], ...],
+    ) -> dict[str, Any]:
         return {
             "pieceCount": len(rows),
             **{
-                name: integer_ns_summary([row[index] for row in rows])
+                name: integer_ns_summary(
+                    [row[index] for row in rows if row[index] is not None]
+                )
                 for index, (name, _pattern) in enumerate(fields)
             },
         }

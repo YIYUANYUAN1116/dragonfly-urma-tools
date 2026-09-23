@@ -110,6 +110,8 @@ def parse_log(text: str, source: str) -> dict:
         "source_done": 0,
         "source_e2e_ns": [],
         "source_retained": 0,
+        "source_direct": 0,
+        "source_copied": 0,
         "source_start_times": {},
         "stage_open_ns": [],
         "stage_copy_ns": [],
@@ -200,6 +202,10 @@ def parse_log(text: str, source: str) -> dict:
                     e2e = int((ts - start).total_seconds() * 1e9)
             if e2e is not None:
                 parent["source_e2e_ns"].append(e2e)
+            if fields.get("register_direct") == "true":
+                parent["source_direct"] += 1
+            elif fields.get("register_direct") == "false":
+                parent["source_copied"] += 1
             for field, key in (
                 ("source_open_ns", "stage_open_ns"),
                 ("source_copy_ns", "stage_copy_ns"),
@@ -310,6 +316,7 @@ def print_report(results):
             print("parent source:")
             print(f"  pieces served       : {parent['source_pieces']} "
                   f"(done {parent['source_done']}, retained warnings {parent['source_retained']})")
+            print(f"  direct / copied     : {parent['source_direct']} / {parent['source_copied']}")
             e2e = parent["source_e2e_ns"]
             if e2e:
                 print(f"  source E2E p50/p95  : {e2e['p50_ms']} / {e2e['p95_ms']} ms")

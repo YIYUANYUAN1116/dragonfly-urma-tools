@@ -13,6 +13,7 @@ SPEC = importlib.util.spec_from_file_location("b7", TOOL_DIR / "b7.py")
 b7 = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(b7)
+import read_pool_monitor as b7_read_pool_monitor
 
 
 class B7Tests(unittest.TestCase):
@@ -2437,7 +2438,8 @@ storage:
             (
                 "retained_cleanup_ns=1 lane_acquire_ns=2 buffer_ready_send_ns=3 "
                 "segment_offer_wait_ns=4 destination_admission_ns=5 "
-                "read_completion_ns=6 lease_publish_ns=7 done_round_trip_ns=8 "
+                "read_completion_ns=6 lease_publish_ns=7 read_done_send_ns=8 "
+                "done_wait_ns=9 done_round_trip_ns=17 "
                 "session_run_ns=33 read_transfer_total_ns=36 "
                 "urma READ child finished transfer",
                 "file_open_ns=10 pwrite_ns=20 digest_ns=30 storage_total_ns=65 "
@@ -2455,11 +2457,40 @@ storage:
         self.assertEqual(summary["malformedLines"], 0)
         self.assertEqual(summary["transport"]["pieceCount"], 1)
         self.assertEqual(summary["transport"]["readCompletionNs"]["totalNs"], 6)
+        self.assertEqual(summary["transport"]["readDoneSendNs"]["totalNs"], 8)
+        self.assertEqual(summary["transport"]["doneWaitNs"]["totalNs"], 9)
         self.assertEqual(summary["storage"]["pwriteNs"]["totalNs"], 20)
         self.assertEqual(summary["storage"]["digestNs"]["totalNs"], 30)
         self.assertEqual(summary["finish"]["recycleNs"]["totalNs"], 5)
         self.assertEqual(summary["finish"]["metadataCommitNs"]["totalNs"], 7)
         self.assertEqual(summary["attempt"]["pieceE2eNs"]["totalNs"], 115)
+
+    def test_read_stage_summary_keeps_legacy_combined_done_logs(self):
+        summary = b7.urma_read_stage_summary(
+            "retained_cleanup_ns=1 lane_acquire_ns=2 buffer_ready_send_ns=3 "
+            "segment_offer_wait_ns=4 destination_admission_ns=5 "
+            "read_completion_ns=6 lease_publish_ns=7 done_round_trip_ns=8 "
+            "session_run_ns=33 read_transfer_total_ns=36 "
+            "urma READ child finished transfer"
+        )
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertEqual(summary["transport"]["pieceCount"], 1)
+        self.assertEqual(summary["transport"]["doneRoundTripNs"]["totalNs"], 8)
+        self.assertEqual(summary["transport"]["readDoneSendNs"]["count"], 0)
+        self.assertEqual(summary["transport"]["doneWaitNs"]["count"], 0)
+
+    def test_read_pool_monitor_counts_direct_and_copied_sources(self):
+        parsed = b7_read_pool_monitor.parse_log(
+            "\n".join(
+                (
+                    "register_direct=true source_e2e_ns=10 urma READ source fully read; revoking export",
+                    "register_direct=false source_e2e_ns=20 urma READ source fully read; revoking export",
+                )
+            ),
+            "test",
+        )
+        self.assertEqual(parsed["parent"]["source_direct"], 1)
+        self.assertEqual(parsed["parent"]["source_copied"], 1)
 
     def test_storage_consumer_summary_attributes_digest_and_pwrite(self):
         child = "\n".join(

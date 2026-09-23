@@ -301,7 +301,7 @@ def print_tables(records: list[dict]) -> None:
     print("\n== child RM READ stages (measured samples, p50 ms) ==")
     print(
         f"{'run':<14} {'lane':>7} {'offer':>7} {'dstAdm':>7} {'READ':>7} "
-        f"{'lease':>7} {'done':>7} {'pwrite':>7} {'crc':>7} {'recycle':>7} "
+        f"{'lease':>7} {'doneTx':>7} {'doneWait':>8} {'pwrite':>7} {'crc':>7} {'recycle':>7} "
         f"{'meta':>7} {'pieceE2E':>9}"
     )
     for r in records:
@@ -320,7 +320,8 @@ def print_tables(records: list[dict]) -> None:
             f"{stage_ms('transport', 'destinationAdmissionNs'):>7.2f} "
             f"{stage_ms('transport', 'readCompletionNs'):>7.2f} "
             f"{stage_ms('transport', 'leasePublishNs'):>7.2f} "
-            f"{stage_ms('transport', 'doneRoundTripNs'):>7.2f} "
+            f"{stage_ms('transport', 'readDoneSendNs'):>7.2f} "
+            f"{stage_ms('transport', 'doneWaitNs'):>8.2f} "
             f"{stage_ms('storage', 'pwriteNs'):>7.2f} "
             f"{stage_ms('storage', 'digestNs'):>7.2f} "
             f"{stage_ms('finish', 'recycleNs'):>7.2f} "
@@ -332,7 +333,7 @@ def print_tables(records: list[dict]) -> None:
     print(
         f"{'run':<14} {'use':<7} {'n':>3} {'childE2E p50/p95':>17} {'srcE2E p50/p95':>15} "
         f"{'register':>8} {'alloc':>7} {'copy#2':>7} {'pin':>5} {'token':>6} "
-        f"{'wait':>7} {'revoke':>7} {'hit/miss/evict':>15} {'pkRet':>7} {'fallb':>6}"
+        f"{'wait':>7} {'revoke':>7} {'direct':>7} {'hit/miss/evict':>15} {'pkRet':>7} {'fallb':>6}"
     )
     for r in records:
         for label in ("samples", "warmup"):
@@ -377,6 +378,7 @@ def print_tables(records: list[dict]) -> None:
                 f"{num_or_dash(p50('stage_reg_token_ns')):>6}",
                 f"{num_or_dash(p50('stage_wait_ns')):>7}",
                 f"{num_or_dash(p50('stage_revoke_ns')):>7}",
+                f"{(str(parent.get('source_direct', 0)) + '/' + str(parent.get('source_copied', 0))):>7}",
                 f"{pool:>15}",
                 f"{peak:>7}",
                 f"{child.get('tcp_fallback', '-'):>6}",

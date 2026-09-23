@@ -212,24 +212,25 @@ placement，应先固定 CPU 做可比测试，再单独增加 `numactl --membin
 `origin` 目录，或将 inventory 的 `origin.directory` 改回服务实际提供的目录；B7 不会自动修改
 nginx/HTTP 服务配置。
 
-### RM READ 下一轮性能归因
+### RM READ direct source 验证
 
-`read-piece32-cc16-post1-pipe2` 与 `read-piece32-cc16-read4-post1-pipe2` 是单 WR 尺寸的严格 A/B：
-两者固定 1 GiB 文件、32 MiB Piece、cc16、post1、pipe2，只把 `maxReadSize` 从 32 MiB（1 WR/Piece）
-改成 4 MiB（8 WR/Piece），用于隔离单 WR 尺寸；不要用 16 MiB Piece 的结果推断 WR size。
+`read-src-010` 与 `read-wr4-001` 已证明 32 MiB Piece 使用 1 个 32 MiB WR 优于 8 个 4 MiB WR。
+下一轮只复跑 `read-piece32-cc16-post1-pipe2`，验证 page-aligned `MappedPiece` direct registration。
 调度层不在本轮范围内，性能归因只使用 RM READ 的 source、READ WR/CQE、CRC、pwrite、recycle 与 metadata 阶段。
 
 ```bash
-python3 b7.py prepare --profile read --mode dual --run-id read-wr4-001 \
-  --case read-piece32-cc16-read4-post1-pipe2 --execute
-python3 b7.py run --manifest results/read-wr4-001/manifest.json --execute
-python3 read_attribution_summary.py results/read-src-009 results/read-wr4-001
-python3 b7.py cleanup --manifest results/read-wr4-001/manifest.json --execute
+python3 b7.py prepare --profile read --mode dual --run-id read-src-011 \
+  --case read-piece32-cc16-post1-pipe2 --execute
+python3 b7.py run --manifest results/read-src-011/manifest.json --execute
+python3 read_attribution_summary.py results/read-src-010 results/read-src-011
+python3 b7.py cleanup --manifest results/read-src-011/manifest.json --execute
 ```
 
+新 run 的 Parent sample 行应显示 `direct = 96/0`，warmup 应为 `32/0`，且 `alloc`、`copy#2`
+均为 0。若 direct 注册失败，保留结果目录和 Parent provider 错误，不要自动改用复制注册重跑。
 
 新构建会把 measured samples 的细分结果写入
-`result.transfer.urmaReadStageSummary`：传输侧含 lane/Offer/destination admission/READ CQE/Done，
+`result.transfer.urmaReadStageSummary`：传输侧含 lane/Offer/destination admission/READ CQE/ReadDone send/Done wait，
 Storage 侧含 file open/pwrite/CRC/recycle/metadata commit。`taskTimingSummary` 另含
 `dfgetToFirstReadStartNs`、`firstReadStartToFirstPieceNs` 和 `firstReadStartToLastPieceNs`。
 `read_attribution_summary.py` 会直接打印这些字段的 p50。
