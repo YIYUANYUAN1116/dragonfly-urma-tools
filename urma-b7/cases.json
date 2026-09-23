@@ -1353,6 +1353,38 @@
       "category": "urma-read-giant-piece"
     },
     {
+      "name": "read-piece32-cc4-post1-pipe2",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 4,
+      "postListSize": 1,
+      "pipelineDepth": 2,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "quarantineBytes": "512MiB",
+        "maxReadSize": "32MiB"
+      },
+      "category": "urma-read-concurrency"
+    },
+    {
+      "name": "read-piece32-cc8-post1-pipe2",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 8,
+      "postListSize": 1,
+      "pipelineDepth": 2,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "quarantineBytes": "512MiB",
+        "maxReadSize": "32MiB"
+      },
+      "category": "urma-read-concurrency"
+    },
+    {
       "name": "read-piece32-cc16-post1-pipe2",
       "fileClass": "1g",
       "pieceLength": "32mib",
@@ -1366,7 +1398,7 @@
         "quarantineBytes": "512MiB",
         "maxReadSize": "32MiB"
       },
-      "category": "urma-read-wr-size"
+      "category": "urma-read-concurrency"
     },
     {
       "name": "read-piece32-cc16-read4-post1-pipe2",
