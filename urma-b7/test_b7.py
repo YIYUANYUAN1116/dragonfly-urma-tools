@@ -2582,10 +2582,10 @@ storage:
         log = "\n".join(
             (
                 "2026-09-23T01:00:00.020000000Z task_id=t piece_number=0 "
-                "read_completion_ns=20000000 "
+                "read_completion_ns=20000000 read_wr_count=8 read_post_batch_count=1 "
                 "urma READ child completed data transfer",
                 "2026-09-23T01:00:00.030000000Z task_id=t piece_number=1 "
-                "read_completion_ns=20000000 "
+                "read_completion_ns=20000000 read_wr_count=8 read_post_batch_count=1 "
                 "urma READ child completed data transfer",
                 "2026-09-23T01:00:00.045000000Z task_id=t piece_id=p0 "
                 "pwrite_ns=20000000 pwrite_active_at_start=1 "
@@ -2605,6 +2605,9 @@ storage:
         self.assertEqual(timeline["averageReadActiveMilli"], 1333)
         self.assertEqual(timeline["readBusyPermille"], 1000)
         self.assertEqual(timeline["peakReadActive"], 2)
+        self.assertEqual(timeline["readWrCount"], 16)
+        self.assertEqual(timeline["readPostBatchCount"], 2)
+        self.assertEqual(timeline["readWrPerPostBatchMilli"], 8000)
         self.assertEqual(timeline["pwriteEnvelopeNs"], 35_000_000)
         self.assertEqual(timeline["firstReadCqeToFirstPwriteStartNs"], 5_000_000)
         self.assertEqual(timeline["lastReadCqeToLastPwriteEndNs"], 30_000_000)
@@ -2620,6 +2623,9 @@ storage:
         self.assertEqual(summary["averageReadActiveMilli"]["median"], 1333)
         self.assertEqual(summary["readBusyPermille"]["median"], 1000)
         self.assertEqual(summary["peakReadActive"]["median"], 2)
+        self.assertEqual(summary["readWrCount"]["median"], 16)
+        self.assertEqual(summary["readPostBatchCount"]["median"], 2)
+        self.assertEqual(summary["readWrPerPostBatchMilli"]["median"], 8000)
 
     def test_read_batch_timeline_reports_read_idle_gap(self):
         log = "\n".join(

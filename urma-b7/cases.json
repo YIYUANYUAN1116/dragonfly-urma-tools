@@ -1401,6 +1401,22 @@
       "category": "urma-read-concurrency"
     },
     {
+      "name": "read-piece32-cc16-read8-post1-pipe2",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 2,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "quarantineBytes": "512MiB",
+        "maxReadSize": "8MiB"
+      },
+      "category": "urma-read-wr-size"
+    },
+    {
       "name": "read-piece32-cc16-pwrite4-post1-pipe2",
       "fileClass": "1g",
       "pieceLength": "32mib",

@@ -83,6 +83,8 @@ READ_BUFFER_READY_SEND_NS_RE = re.compile(r"\bbuffer_ready_send_ns=(\d+)")
 READ_SEGMENT_OFFER_WAIT_NS_RE = re.compile(r"\bsegment_offer_wait_ns=(\d+)")
 READ_DESTINATION_ADMISSION_NS_RE = re.compile(r"\bdestination_admission_ns=(\d+)")
 READ_COMPLETION_NS_RE = re.compile(r"\bread_completion_ns=(\d+)")
+READ_WR_COUNT_RE = re.compile(r"\bread_wr_count=(\d+)")
+READ_POST_BATCH_COUNT_RE = re.compile(r"\bread_post_batch_count=(\d+)")
 READ_LEASE_PUBLISH_NS_RE = re.compile(r"\blease_publish_ns=(\d+)")
 READ_DONE_SEND_NS_RE = re.compile(r"\bread_done_send_ns=(\d+)")
 READ_DONE_WAIT_NS_RE = re.compile(r"\bdone_wait_ns=(\d+)")
@@ -2450,6 +2452,8 @@ def urma_read_batch_timeline(child: str) -> dict[str, Any]:
     """
 
     read_events: list[tuple[int, int]] = []
+    read_wr_counts: list[int] = []
+    read_post_batch_counts: list[int] = []
     pwrite_events: list[tuple[int, int, str | None, int | None]] = []
     malformed = 0
     for line in child.splitlines():
@@ -2464,6 +2468,12 @@ def urma_read_batch_timeline(child: str) -> dict[str, Any]:
                 malformed += 1
                 continue
             read_events.append((finished - duration, finished))
+            read_wr_count = last_int_match(READ_WR_COUNT_RE, line)
+            read_post_batch_count = last_int_match(READ_POST_BATCH_COUNT_RE, line)
+            if read_wr_count is not None:
+                read_wr_counts.append(read_wr_count)
+            if read_post_batch_count is not None:
+                read_post_batch_counts.append(read_post_batch_count)
         elif "finished pwrite for RM-READ lease" in line:
             try:
                 finished = parse_log_timestamp_ns(line)
@@ -2492,6 +2502,15 @@ def urma_read_batch_timeline(child: str) -> dict[str, Any]:
     }
     if not observed:
         return result
+
+    if read_wr_counts:
+        result["readWrCount"] = sum(read_wr_counts)
+    if read_post_batch_counts:
+        result["readPostBatchCount"] = sum(read_post_batch_counts)
+    if read_wr_counts and read_post_batch_counts and sum(read_post_batch_counts):
+        result["readWrPerPostBatchMilli"] = round(
+            sum(read_wr_counts) * 1000 / sum(read_post_batch_counts)
+        )
 
     starts = [event[0] for event in read_events]
     cqes = [event[1] for event in read_events]
@@ -2588,6 +2607,23 @@ def urma_read_timeline_summary(timelines: list[dict[str, Any]]) -> dict[str, Any
         ),
         "readBusyPermille": integer_value_summary(
             [int(timeline.get("readBusyPermille", 0)) for timeline in observed]
+        ),
+        "readWrCount": integer_value_summary(
+            [int(timeline["readWrCount"]) for timeline in observed if "readWrCount" in timeline]
+        ),
+        "readPostBatchCount": integer_value_summary(
+            [
+                int(timeline["readPostBatchCount"])
+                for timeline in observed
+                if "readPostBatchCount" in timeline
+            ]
+        ),
+        "readWrPerPostBatchMilli": integer_value_summary(
+            [
+                int(timeline["readWrPerPostBatchMilli"])
+                for timeline in observed
+                if "readWrPerPostBatchMilli" in timeline
+            ]
         ),
         "peakPwriteActive": integer_value_summary(
             [int(timeline.get("peakPwriteActive", 0)) for timeline in observed]

@@ -357,7 +357,7 @@ def print_tables(records: list[dict]) -> None:
     print(
         f"{'run':<14} {'batches':>7} {'complete':>8} {'READenv':>8} {'CQEspan':>8} "
         f"{'startSp':>8} {'idle':>7} {'busy%':>6} {'avgRd':>6} {'peakRd':>6} "
-        f"{'pwrEnv':>8} {'1CQE->pwr':>10} {'lastCQE->end':>12} {'overlap':>8} "
+        f"{'WRs':>5} {'postB':>5} {'WR/post':>7} {'pwrEnv':>8} {'1CQE->pwr':>10} {'lastCQE->end':>12} {'overlap':>8} "
         f"{'peakPwr':>8} {'earlyPwr':>8}"
     )
     for r in records:
@@ -374,6 +374,13 @@ def print_tables(records: list[dict]) -> None:
             "median", float("nan")
         )
         busy = (timeline.get("readBusyPermille") or {}).get("median", float("nan"))
+        wrs = (timeline.get("readWrCount") or {}).get("median", float("nan"))
+        post_batches = (timeline.get("readPostBatchCount") or {}).get(
+            "median", float("nan")
+        )
+        wr_per_post = (timeline.get("readWrPerPostBatchMilli") or {}).get(
+            "median", float("nan")
+        )
         peak = (timeline.get("peakPwriteActive") or {}).get("median", float("nan"))
         early = (timeline.get("pwriteStartedBeforeLastReadCqe") or {}).get(
             "median", float("nan")
@@ -389,6 +396,9 @@ def print_tables(records: list[dict]) -> None:
             f"{busy / 10:>6.1f} "
             f"{average_read / 1000:>6.2f} "
             f"{peak_read:>6.1f} "
+            f"{wrs:>5.0f} "
+            f"{post_batches:>5.0f} "
+            f"{wr_per_post / 1000:>7.2f} "
             f"{timeline_ms('pwriteEnvelopeNs'):>8.2f} "
             f"{timeline_ms('firstReadCqeToFirstPwriteStartNs'):>10.2f} "
             f"{timeline_ms('lastReadCqeToLastPwriteEndNs'):>12.2f} "
