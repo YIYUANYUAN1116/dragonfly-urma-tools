@@ -14,9 +14,32 @@ b7 = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(b7)
 import read_pool_monitor as b7_read_pool_monitor
+import read_attribution_summary as read_attribution
 
 
 class B7Tests(unittest.TestCase):
+    def test_read_attribution_keeps_manifest_timeline_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            timeline = {
+                "observed": True,
+                "batchCount": 3,
+                "completeBatchCount": 3,
+            }
+            (run_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "runId": "timeline-test",
+                        "result": {
+                            "transfer": {"urmaReadTimelineSummary": timeline}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            record = read_attribution.summarize_run(run_dir, {})
+            self.assertEqual(record["read_timeline"], timeline)
+
     def setUp(self):
         self.inventory = json.loads((TOOL_DIR / "inventory.json").read_text(encoding="utf-8"))
         # Existing executor tests exercise remote orchestration rather than the

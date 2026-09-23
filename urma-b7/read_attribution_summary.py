@@ -210,6 +210,7 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
         "throughput": views["throughput"],
         "timing": views["timing"],
         "read_stages": views["read_stages"],
+        "read_timeline": views["read_timeline"],
         "evidence": views["evidence"],
         "sample_count": views["samples"],
         "logs": {},
