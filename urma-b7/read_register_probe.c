@@ -33,6 +33,11 @@
  *                    split extrapolated to a 32 MiB window
  *   R4 unregister    the same sweep for urma_unregister_seg, because revoke ->
  *                    unregister is the second term on that critical path
+ *   R5 concurrency   --threads 1,2,4,8 drives the same file-backed path from T
+ *                    threads and reports wall-clock throughput scaling, so a
+ *                    provider/driver lock that serializes registration is
+ *                    separable from a per-node per-byte rate that scales with T.
+ *                    R1-R4 are skipped in this mode.
  *
  * The register call mirrors the product's direct path exactly (see
  * dragonfly-client-storage/src/urma/ffi/shim.c,
@@ -76,13 +81,20 @@
  *   # control: keep re-registering the same window (offset 0) instead of the
  *   # distinct consecutive windows the product actually registers
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --same
+ *   # concurrency: does source registration scale across threads on this node, or
+ *   # does the provider serialize it? R1-R4 are skipped in this mode.
+ *   LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --device udmac0d1e2 \
+ *     --file /path/to/content.bin --remap --threads 1,2,4,8
  *
  * argv: [--device NAME] [--eid N] [--max-bytes N] [--file PATH] [--remap] [--same]
+ *       [--threads LIST] [--iters N] [--len N]
  * exit code: 0 = sweep completed, 1 = setup or provider error.
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,9 +107,13 @@
 #include <urma_api.h>
 
 #define MAX_SAMPLES 4096
+#define MAX_THREADS 8
 #define PAGE_BYTES (4096ULL)
 #define MI_BYTES (1024ULL * 1024ULL)
 #define DEFAULT_MAX_BYTES (1024ULL * MI_BYTES)
+#define DEFAULT_ITERS 32
+/* Product Piece length. Every shape question in this file is asked at 32 MiB. */
+#define CONC_LEN_BYTES (32ULL * MI_BYTES)
 
 /* Product Piece shapes plus the coarser candidates (k=2,4,8,32 windows). */
 static const uint64_t LENGTHS[] = {
@@ -215,9 +231,86 @@ struct sweep_result {
     /* --remap only: fresh mmap + MADV_SEQUENTIAL + MADV_WILLNEED per call. Zero
      * when the probe re-registers one long-lived mapping. */
     struct stats map;
+    size_t count; /* recorded register samples in this set */
     size_t failed;
     int first_errno;
 };
+
+/* One iteration of the product's per-Piece source sequence:
+ *   [fresh mmap + MADV_SEQUENTIAL + MADV_WILLNEED]   (Storage map_path_range)
+ *   urma_register_seg
+ *   urma_unregister_seg
+ *   [munmap]
+ * The length sweep and the concurrency sweep both call this, so the two modes
+ * measure one and the same operation sequence. Returns -1 only when the window
+ * itself cannot be mapped. */
+struct once {
+    uint64_t reg_ns;
+    uint64_t unreg_ns;
+    uint64_t map_ns;
+    int reg_failed;
+    int unreg_failed;
+    int first_errno;
+};
+
+static int register_once(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *window,
+                         uint64_t len, int remap, int fd, uint64_t off, uint32_t token,
+                         struct once *out)
+{
+    uint8_t *va = window;
+    void *mapped = NULL;
+    urma_seg_cfg_t cfg;
+    urma_target_seg_t *seg;
+    uint64_t t0;
+    uint64_t t1;
+
+    memset(out, 0, sizeof(*out));
+    if (remap) {
+        /* Mirrors Storage map_path_range: map exactly [off, off+len) of the
+         * content file, then advise it, so the provider sees a fresh VMA with a
+         * possibly non-resident PTE set, exactly as in the product. */
+        uint64_t a0 = monotonic_ns();
+
+        mapped = mmap(NULL, (size_t)len, PROT_READ, MAP_SHARED, fd, (off_t)off);
+        if (mapped == MAP_FAILED) {
+            printf("FAIL mmap(offset=%llu len=%llu) errno=%d (%s)\n",
+                   (unsigned long long)off, (unsigned long long)len, errno,
+                   strerror(errno));
+            return -1;
+        }
+        (void)madvise(mapped, (size_t)len, MADV_SEQUENTIAL);
+        (void)madvise(mapped, (size_t)len, MADV_WILLNEED);
+        out->map_ns = monotonic_ns() - a0;
+        va = mapped;
+    }
+
+    cfg = make_cfg((uint64_t)(uintptr_t)va, len, tid, token);
+    errno = 0;
+    t0 = monotonic_ns();
+    seg = urma_register_seg(ctx, &cfg);
+    t1 = monotonic_ns();
+    out->reg_ns = t1 - t0;
+    if (seg == NULL) {
+        out->reg_failed = 1;
+        out->first_errno = errno;
+        if (mapped != NULL) {
+            (void)munmap(mapped, (size_t)len);
+        }
+        return 0;
+    }
+
+    errno = 0;
+    t0 = monotonic_ns();
+    if (urma_unregister_seg(seg) != URMA_SUCCESS) {
+        out->unreg_failed = 1;
+        out->first_errno = errno;
+    }
+    out->unreg_ns = monotonic_ns() - t0;
+    if (mapped != NULL) {
+        (void)munmap(mapped, (size_t)len);
+    }
+    return 0;
+}
 
 static int sweep_length(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *base,
                         uint64_t max_len, uint64_t len, int reps, int distinct,
@@ -234,66 +327,34 @@ static int sweep_length(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *base
     }
     for (i = 0; i < reps; i++) {
         uint64_t off = distinct ? (uint64_t)(i % (int)windows) * len : 0;
-        uint8_t *window = base + off;
-        void *mapped = NULL;
-        urma_seg_cfg_t cfg;
-        urma_target_seg_t *seg;
-        uint64_t t0;
-        uint64_t t1;
+        struct once o;
 
-        if (remap) {
-            /* Mirrors Storage map_path_range: map exactly [off, off+len) of the
-             * content file, then advise it, so the provider sees a fresh VMA
-             * with a possibly non-resident PTE set, exactly as in the product. */
-            uint64_t a0 = monotonic_ns();
-
-            mapped = mmap(NULL, (size_t)len, PROT_READ, MAP_SHARED, fd, (off_t)off);
-            if (mapped == MAP_FAILED) {
-                printf("FAIL mmap(offset=%llu len=%llu) errno=%d (%s)\n",
-                       (unsigned long long)off, (unsigned long long)len, errno,
-                       strerror(errno));
-                return -1;
-            }
-            (void)madvise(mapped, (size_t)len, MADV_SEQUENTIAL);
-            (void)madvise(mapped, (size_t)len, MADV_WILLNEED);
-            record(&map, monotonic_ns() - a0);
-            window = mapped;
+        if (register_once(ctx, tid, base + off, len, remap, fd, off,
+                          (uint32_t)(0x9ee70000u + (uint32_t)i), &o) != 0) {
+            return -1;
         }
-
-        cfg = make_cfg((uint64_t)(uintptr_t)window, len, tid,
-                       (uint32_t)(0x9ee70000u + (uint32_t)i));
-        errno = 0;
-        t0 = monotonic_ns();
-        seg = urma_register_seg(ctx, &cfg);
-        t1 = monotonic_ns();
-        if (seg == NULL) {
-            record(&reg, t1 - t0);
+        if (remap) {
+            record(&map, o.map_ns);
+        }
+        record(&reg, o.reg_ns);
+        if (o.reg_failed) {
             reg.failed++;
             if (reg.first_errno == 0) {
-                reg.first_errno = errno;
-            }
-            if (mapped != NULL) {
-                (void)munmap(mapped, (size_t)len);
+                reg.first_errno = o.first_errno;
             }
             continue;
         }
-        record(&reg, t1 - t0);
-
-        errno = 0;
-        t0 = monotonic_ns();
-        if (urma_unregister_seg(seg) != URMA_SUCCESS) {
+        if (o.unreg_failed) {
             unreg.failed++;
             if (unreg.first_errno == 0) {
-                unreg.first_errno = errno;
+                unreg.first_errno = o.first_errno;
             }
         }
-        record(&unreg, monotonic_ns() - t0);
-        if (mapped != NULL) {
-            (void)munmap(mapped, (size_t)len);
-        }
+        record(&unreg, o.unreg_ns);
     }
 
     memset(out, 0, sizeof(*out));
+    out->count = reg.count;
     out->failed = reg.failed;
     out->first_errno = reg.first_errno;
     if (summarize(&reg, &out->reg) != 0) {
@@ -452,12 +513,324 @@ static void report_head_to_head(const struct sweep_result *by_len, int remap)
 
 /* ------------------------------------------------------------------- backing */
 
+/* Declared up here because the R5 runner takes it; its open/close helpers live in
+ * the backing section below. */
 struct backing {
     uint8_t *base;
     uint64_t len;
     int fd;
     int mapped;
 };
+
+/* ------------------------------------------------------------- R5: concurrency */
+
+/* Single-use-safe barrier. A hand-rolled one keeps the file free of feature-test
+ * macro dependencies (pthread_barrier_t sits behind _POSIX_C_SOURCE). */
+struct barrier {
+    unsigned arrived;
+    unsigned generation;
+    unsigned total;
+};
+
+static void barrier_wait(struct barrier *b)
+{
+    unsigned gen = __atomic_load_n(&b->generation, __ATOMIC_ACQUIRE);
+
+    if (__atomic_add_fetch(&b->arrived, 1, __ATOMIC_ACQ_REL) == b->total) {
+        __atomic_store_n(&b->arrived, 0, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&b->generation, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    while (__atomic_load_n(&b->generation, __ATOMIC_ACQUIRE) == gen) {
+        sched_yield();
+    }
+}
+
+struct conc_ctx {
+    urma_context_t *ctx;
+    urma_token_id_t *tid;
+    uint8_t *base;
+    uint64_t total_len;
+    uint64_t len;
+    int iters;
+    int remap;
+    int distinct;
+    int fd;
+    uint32_t index;
+    uint32_t threads;
+    struct barrier *bar;
+    struct sweep_result *res;
+};
+
+/* Each thread owns a private sample set and walks its own windows, so nothing is
+ * shared in the timed path except the context, the one TABLE-mode token id (as in
+ * the product) and the file fd. Thread t starts at window t and advances by
+ * `threads`, so at any instant the T threads hold T distinct 32 MiB windows --
+ * the product's shape, where concurrent Pieces are different file ranges. */
+static void *conc_worker(void *argp)
+{
+    struct conc_ctx *c = argp;
+    struct samples reg = {0};
+    struct samples unreg = {0};
+    struct samples map = {0};
+    uint64_t windows = c->total_len / c->len;
+    int k;
+
+    if (windows == 0) {
+        windows = 1;
+    }
+    barrier_wait(c->bar);
+
+    for (k = 0; k < c->iters; k++) {
+        uint64_t widx = c->distinct
+                            ? (uint64_t)((c->index + (uint32_t)k * c->threads) %
+                                         (uint32_t)windows)
+                            : 0ULL;
+        uint64_t off = widx * c->len;
+        uint32_t token = (uint32_t)(0x9ee70000u + c->index * 4096u + (uint32_t)k);
+        struct once o;
+
+        if (register_once(c->ctx, c->tid, c->base + off, c->len, c->remap, c->fd, off,
+                          token, &o) != 0) {
+            reg.failed++;
+            break;
+        }
+        if (c->remap) {
+            record(&map, o.map_ns);
+        }
+        record(&reg, o.reg_ns);
+        if (o.reg_failed) {
+            reg.failed++;
+            if (reg.first_errno == 0) {
+                reg.first_errno = o.first_errno;
+            }
+            continue;
+        }
+        if (o.unreg_failed) {
+            unreg.failed++;
+            if (unreg.first_errno == 0) {
+                unreg.first_errno = o.first_errno;
+            }
+        }
+        record(&unreg, o.unreg_ns);
+    }
+
+    memset(c->res, 0, sizeof(*c->res));
+    c->res->count = reg.count;
+    c->res->failed = reg.failed;
+    c->res->first_errno = reg.first_errno;
+    (void)summarize(&reg, &c->res->reg);
+    (void)summarize(&unreg, &c->res->unreg);
+    (void)summarize(&map, &c->res->map);
+    return NULL;
+}
+
+static double conc_agg_mib(size_t ok, uint64_t len, uint64_t wall_ns)
+{
+    if (wall_ns == 0) {
+        return 0.0;
+    }
+    return ((double)ok * (double)len / (double)MI_BYTES) / ((double)wall_ns / 1e9);
+}
+
+/* One line per thread count. "worst" is the slowest thread's percentile: under
+ * contention the per-call cost rises, and a rising worst p50 with flat aggregate
+ * throughput is the signature of a serializing lock.
+ *
+ * scaling is wall(ref)/wall(T). Every thread runs its own `iters` registrations,
+ * so total work grows with T and the per-thread wall is the discriminator:
+ *   wall(T) ~ wall(ref)      -> registration is concurrent, agg grows ~T-fold
+ *   wall(T) ~ (T/ref)*wall(ref) -> a provider/driver lock serializes it, agg flat
+ * (Comparing agg(T) against agg(ref) says the same thing; both are reported.) */
+static void conc_line(const char *tag, uint32_t n, const struct sweep_result *res,
+                      size_t ok, size_t attempted, size_t err, uint64_t wall_ns,
+                      uint64_t len, uint64_t ref_wall_ns, uint32_t ref_n)
+{
+    uint64_t reg_p50 = 0, reg_p95 = 0, unreg_p50 = 0, map_p50 = 0;
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        if (res[i].reg.p50 > reg_p50) {
+            reg_p50 = res[i].reg.p50;
+        }
+        if (res[i].reg.p95 > reg_p95) {
+            reg_p95 = res[i].reg.p95;
+        }
+        if (res[i].unreg.p50 > unreg_p50) {
+            unreg_p50 = res[i].unreg.p50;
+        }
+        if (res[i].map.p50 > map_p50) {
+            map_p50 = res[i].map.p50;
+        }
+    }
+    printf("R5 %-6s T=%-2u          wall=%8.2fms ok=%4zu/%4zu agg=%7.0fMiB/s "
+           "reg p50=%7.3fms p95=%7.3fms | unreg p50=%7.3fms | map p50=%7.3fms err=%zu",
+           tag, n, to_ms(wall_ns), ok, attempted, conc_agg_mib(ok, len, wall_ns),
+           to_ms(reg_p50), to_ms(reg_p95), to_ms(unreg_p50), to_ms(map_p50), err);
+    if (ref_wall_ns != 0 && wall_ns != 0) {
+        printf(" scaling(vs T=%u)=%5.2fx", ref_n, (double)ref_wall_ns / (double)wall_ns);
+    }
+    printf("\n");
+}
+
+static int run_concurrency(urma_context_t *ctx, urma_token_id_t *tid, struct backing *b,
+                           uint64_t len, int iters, int distinct, int remap,
+                           const uint32_t *thread_list, size_t thread_count)
+{
+    struct conc_ctx *args;
+    struct sweep_result *res;
+    pthread_t *th;
+    uint64_t wall[2][MAX_THREADS];
+    size_t ok[2][MAX_THREADS];
+    size_t err[2][MAX_THREADS];
+    size_t li;
+    int pass;
+
+    printf("R5 concurrency           len=%lluMiB iters=%d windows=%llu backing=%s remap=%d "
+           "token=shared(table) passes=2\n",
+           (unsigned long long)(len / MI_BYTES), iters,
+           (unsigned long long)(b->len / len),
+           b->mapped ? "file-backed" : "anonymous pre-touched", remap);
+
+    args = calloc(MAX_THREADS, sizeof(*args));
+    res = calloc(MAX_THREADS, sizeof(*res));
+    th = calloc(MAX_THREADS, sizeof(*th));
+    if (args == NULL || res == NULL || th == NULL) {
+        printf("FAIL calloc for the thread tables\n");
+        free(args);
+        free(res);
+        free(th);
+        return 1;
+    }
+    memset(wall, 0, sizeof(wall));
+    memset(ok, 0, sizeof(ok));
+    memset(err, 0, sizeof(err));
+
+    for (pass = 0; pass < 2; pass++) {
+        for (li = 0; li < thread_count; li++) {
+            uint32_t n = thread_list[li];
+            struct barrier bar = {0, 0, 0};
+            uint32_t started = 0;
+            uint32_t ti;
+            uint64_t t0;
+            uint64_t t1;
+            size_t sum_reg = 0;
+            size_t sum_err = 0;
+            size_t sum_ok;
+            char tag[16];
+
+            bar.total = n + 1;
+            for (ti = 0; ti < n; ti++) {
+                args[ti].ctx = ctx;
+                args[ti].tid = tid;
+                args[ti].base = b->base;
+                args[ti].total_len = b->len;
+                args[ti].len = len;
+                args[ti].iters = iters;
+                args[ti].remap = remap;
+                args[ti].distinct = distinct;
+                args[ti].fd = b->fd;
+                args[ti].index = ti;
+                args[ti].threads = n;
+                args[ti].bar = &bar;
+                args[ti].res = &res[ti];
+                if (pthread_create(&th[ti], NULL, conc_worker, &args[ti]) != 0) {
+                    printf("FAIL pthread_create(thread %u of %u) errno=%d (%s)\n", ti, n,
+                           errno, strerror(errno));
+                    /* Keep the barrier reachable for the threads that did start;
+                     * main still arrives, so the release still happens. */
+                    bar.total = ti + 1;
+                    break;
+                }
+                started++;
+            }
+            /* Timed window: everything after this instant is concurrent work. */
+            barrier_wait(&bar);
+            t0 = monotonic_ns();
+            for (ti = 0; ti < started; ti++) {
+                (void)pthread_join(th[ti], NULL);
+            }
+            t1 = monotonic_ns();
+
+            for (ti = 0; ti < started; ti++) {
+                sum_reg += res[ti].count;
+                sum_err += res[ti].failed;
+            }
+            sum_ok = sum_reg > sum_err ? sum_reg - sum_err : 0;
+            wall[pass][li] = t1 - t0;
+            ok[pass][li] = sum_ok;
+            err[pass][li] = sum_err;
+            snprintf(tag, sizeof(tag), "pass%d", pass + 1);
+            conc_line(tag, started, res, sum_ok, (size_t)started * (size_t)iters, sum_err,
+                      wall[pass][li], len, pass == 1 ? wall[1][0] : 0,
+                      pass == 1 ? thread_list[0] : 0);
+            if (pass == 1) {
+                printf("R5 pass2 T=%-2u            reg p50 per thread =", started);
+                for (ti = 0; ti < started; ti++) {
+                    printf(" %7.3f", to_ms(res[ti].reg.p50));
+                }
+                printf(" ms\n");
+            }
+            if (sum_err != 0) {
+                for (ti = 0; ti < started; ti++) {
+                    if (res[ti].first_errno != 0) {
+                        printf("R5 %-6s T=%-2u          first register errno=%d (%s)\n", tag,
+                               started, res[ti].first_errno,
+                               strerror(res[ti].first_errno));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("R5 pass1/pass2 delta     (pass1 pays first-touch; the scaling verdict uses"
+           " pass2)\n");
+    for (li = 0; li < thread_count; li++) {
+        printf("R5 delta    T=%-2u          pass1=%8.2fms pass2=%8.2fms delta=%+8.2fms\n",
+               thread_list[li], to_ms(wall[0][li]), to_ms(wall[1][li]),
+               to_ms(wall[0][li]) - to_ms(wall[1][li]));
+    }
+    {
+        uint32_t ref_n = thread_list[0];
+        uint32_t last_n = thread_list[thread_count - 1];
+        uint64_t ref_wall = wall[1][0];
+        uint64_t last_wall = wall[1][thread_count - 1];
+
+        if (ref_wall != 0 && last_wall != 0) {
+            /* Every thread runs a fixed `iters` registrations, so total work
+             * grows with T. A concurrent provider keeps the wall clock nearly
+             * flat (scaling -> 1.00); a provider/driver lock queues the calls,
+             * so the wall clock grows with T (scaling -> ref_n/last_n, the
+             * theoretical floor; a real lock lands slightly above it because
+             * per-call cost also inflates under contention, so accept within 2x
+             * of the floor). Speedup is not the discriminator -- scaling is. */
+            double scaling = (double)ref_wall / (double)last_wall;
+            double serial = (double)ref_n / (double)last_n;
+
+            printf("R5 verdict               ref T=%u wall=%8.2fms agg=%7.0fMiB/s -> T=%u"
+                   " wall=%8.2fms agg=%7.0fMiB/s | scaling=%5.2fx (serial floor=%4.2fx)"
+                   " -> %s\n",
+                   ref_n, to_ms(ref_wall), conc_agg_mib(ok[1][0], len, ref_wall), last_n,
+                   to_ms(last_wall), conc_agg_mib(ok[1][thread_count - 1], len, last_wall),
+                   scaling, serial,
+                   scaling >= 0.85
+                       ? "SCALES (registration is concurrent; no provider-level lock)"
+                       : (scaling <= serial * 2.0
+                              ? "SERIALIZED (threads queue; a provider/driver lock)"
+                              : "PARTIAL scaling (some serialized resource)"));
+        } else {
+            printf("R5 verdict               SKIPPED (no timed pass completed)\n");
+        }
+    }
+
+    free(args);
+    free(res);
+    free(th);
+    return err[0][0] != 0 && ok[0][0] == 0 && ok[1][0] == 0 ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------- backing */
 
 static int open_backing(struct backing *b, const char *path, uint64_t max_bytes)
 {
@@ -527,6 +900,30 @@ static void close_backing(struct backing *b)
 
 /* ---------------------------------------------------------------------- main */
 
+/* "1,2,4,8" -> {1,2,4,8}. The list is run in the order given. */
+static int parse_threads(const char *s, uint32_t *out, size_t *count)
+{
+    const char *p = s;
+
+    *count = 0;
+    while (*p != '\0') {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+
+        if (end == p || v < 1 || v > 1024 || *count >= MAX_THREADS) {
+            return -1;
+        }
+        out[(*count)++] = (uint32_t)v;
+        p = end;
+        if (*p == ',') {
+            p++;
+        } else if (*p != '\0') {
+            return -1;
+        }
+    }
+    return *count > 0 ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     const char *device_name = "udmac0d1e2";
@@ -535,6 +932,10 @@ int main(int argc, char **argv)
     const char *file_path = NULL;
     int distinct = 1;
     int remap = 0;
+    uint32_t thread_list[MAX_THREADS];
+    size_t thread_count = 0;
+    int iters = DEFAULT_ITERS;
+    uint64_t conc_len = CONC_LEN_BYTES;
     struct backing backing;
     struct sweep_result by_len[LENGTH_COUNT];
     struct sweep_result pass1[LENGTH_COUNT];
@@ -561,9 +962,19 @@ int main(int argc, char **argv)
             remap = 1;
         } else if (strcmp(argv[i], "--same") == 0) {
             distinct = 0;
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < (size_t)argc) {
+            if (parse_threads(argv[++i], thread_list, &thread_count) != 0) {
+                printf("FAIL --threads expects a comma list of at most %d counts, like 1,2,4,8\n",
+                       MAX_THREADS);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < (size_t)argc) {
+            iters = (int)strtol(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--len") == 0 && i + 1 < (size_t)argc) {
+            conc_len = strtoull(argv[++i], NULL, 0);
         } else {
             printf("usage: %s [--device NAME] [--eid N] [--max-bytes N] [--file PATH] "
-                   "[--remap] [--same]\n", argv[0]);
+                   "[--remap] [--same] [--threads LIST] [--iters N] [--len N]\n", argv[0]);
             return 1;
         }
     }
@@ -613,6 +1024,29 @@ int main(int argc, char **argv)
             active++;
         }
     }
+    if (thread_count > 0) {
+        if (iters < 1) {
+            iters = 1;
+        }
+        if (iters > MAX_SAMPLES) {
+            iters = MAX_SAMPLES;
+        }
+        if (conc_len == 0 || conc_len % PAGE_BYTES != 0 || conc_len > backing.len ||
+            backing.len / conc_len == 0) {
+            printf("FAIL --len=%llu is not a usable window of the %llu-byte backing "
+                   "(needs a non-zero multiple of %llu with at least one window)\n",
+                   (unsigned long long)conc_len, (unsigned long long)backing.len,
+                   (unsigned long long)PAGE_BYTES);
+            close_backing(&backing);
+            (void)urma_delete_context(ctx);
+            (void)urma_uninit();
+            return 1;
+        }
+        if (remap == 0) {
+            printf("WARN --threads without --remap: every thread re-registers windows of one"
+                   " resident mapping; the product's source path is --remap\n");
+        }
+    }
     printf("       env                 device=%s eid=%u max_bytes=%llu (%llu MiB) "
            "lengths=%zu mode=%s offset=%s mapping=%s\n",
            device_name, eid_index, (unsigned long long)backing.len,
@@ -636,6 +1070,14 @@ int main(int argc, char **argv)
 
     memset(by_len, 0, sizeof(by_len));
     memset(pass1, 0, sizeof(pass1));
+
+    if (thread_count > 0) {
+        printf("R5 note                  R1-R4 skipped: --threads selects the concurrency "
+               "sweep only\n");
+        rc = run_concurrency(ctx, tid, &backing, conc_len, iters, distinct, remap, thread_list,
+                             thread_count);
+        goto teardown;
+    }
 
     for (pass = 0; pass < 2; pass++) {
         for (i = 0; i < LENGTH_COUNT; i++) {
@@ -693,6 +1135,7 @@ int main(int argc, char **argv)
     report_head_to_head(by_len, remap);
     report_slope(by_len);
 
+teardown:
     (void)urma_free_token_id(tid);
     close_backing(&backing);
     if (urma_delete_context(ctx) != URMA_SUCCESS) {
