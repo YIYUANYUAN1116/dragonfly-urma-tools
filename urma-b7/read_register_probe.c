@@ -8,14 +8,15 @@
  *   B  register k consecutive Pieces as one window  (32 -> 4 calls at k=8)
  *   A  register the whole task file once            (32 -> 1 call)
  * Both are memory-neutral in the product's accounting (admission charges the
- * registered length, and the pool ceiling is unchanged), so the only open
- * question is whether the cost per registration is bound *per call* or
- * *per byte*.
+ * registered length, and the pool ceiling is unchanged). This probe answers
+ * only the performance question of whether registration is bound *per call*
+ * or *per byte*. Product use must separately preserve the exact-Piece bearer
+ * capability boundary; a larger Segment is not automatically safe.
  *
  *   per call -> coarsening removes the bottleneck outright
  *   per byte -> total pinned bytes are constant (1 GiB is 1 GiB whether it is
- *               32 windows or 1), so coarsening buys almost nothing and the
- *               only levers are fewer/faster pages and less concurrent pinning
+ *               32 windows or 1), so coarsening buys almost nothing; optimize
+ *               or overlap the provider path instead
  *
  * The 1.95 ms / 32 MiB figure is 16.8 GiB/s, which is suspiciously close to a
  * page-walking rate and therefore does not settle the question by itself. This
@@ -23,7 +24,7 @@
  *
  * What it does (local, single node, no peer, no product code touched):
  *   R1 length sweep  1 MiB .. 1 GiB, same resident buffer, per-call p50 plus
- *                    ns/MiB and ns/page, run twice (pass 1 / pass 2) so a
+ *                    ms/MiB and GiB/s, run twice (pass 1 / pass 2) so a
  *                    file-backed run separates page-fault/IO cost from the
  *                    registration cost itself
  *   R2 head-to-head  the actual A/B question: 32 x 32 MiB vs 1 x 1 GiB over the
