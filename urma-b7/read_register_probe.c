@@ -49,16 +49,34 @@
  *      -L <umdk>/build/urma/common -Wl,-rpath-link,<umdk>/build/urma/common \
  *      -lurma -lurma_common -lpthread -o read_register_probe
  *
+ * Fidelity gap. By default this probe maps the backing once and re-registers
+ * windows of that one long-lived mapping. The product does not: every Piece gets
+ * a *fresh* mmap of its own window, followed by MADV_SEQUENTIAL and
+ * MADV_WILLNEED, and the mapping is dropped after revoke (Storage
+ * map_path_range). Those three actions sit inside the product's `register` span
+ * but outside its `pin` span, so the default sweep is the wrong model for the
+ * `register` column and only the right model for `pin`.
+ *
+ * --remap closes that gap: before every registration it mmaps the window fresh
+ * from the file, issues both advises, and munmaps after unregister. The mmap +
+ * advise cost is timed and reported separately per pass, which is what tells a
+ * fresh-VMA/page-fault cost from the provider's pin cost, and (because pass 2
+ * re-maps the same still-warm pages) what tells page residency from VMA setup.
+ *
  * run (parent node; default 1 GiB aligned resident buffer, keep eid 0):
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --device udmac0d1e2 --eid 0
  *   # same sweep over a real content file instead of anonymous memory, to see
  *   # how much of the register cost is page faulting rather than pinning
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --file /path/to/content.bin
+ *   # product shape: fresh mmap + MADV_SEQUENTIAL + MADV_WILLNEED per call, and
+ *   # munmap after unregister -- run this one against the real content file, on
+ *   # the same filesystem the product registers from
+ *   LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --file /path/to/content.bin --remap
  *   # control: keep re-registering the same window (offset 0) instead of the
  *   # distinct consecutive windows the product actually registers
  *   LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --same
  *
- * argv: [--device NAME] [--eid N] [--max-bytes N] [--file PATH] [--same]
+ * argv: [--device NAME] [--eid N] [--max-bytes N] [--file PATH] [--remap] [--same]
  * exit code: 0 = sweep completed, 1 = setup or provider error.
  */
 
@@ -193,16 +211,20 @@ static int reps_for(uint64_t len, uint64_t budget)
 struct sweep_result {
     struct stats reg;
     struct stats unreg;
+    /* --remap only: fresh mmap + MADV_SEQUENTIAL + MADV_WILLNEED per call. Zero
+     * when the probe re-registers one long-lived mapping. */
+    struct stats map;
     size_t failed;
     int first_errno;
 };
 
 static int sweep_length(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *base,
                         uint64_t max_len, uint64_t len, int reps, int distinct,
-                        struct sweep_result *out)
+                        int remap, int fd, struct sweep_result *out)
 {
     struct samples reg = {0};
     struct samples unreg = {0};
+    struct samples map = {0};
     uint64_t windows = max_len / len;
     int i;
 
@@ -211,12 +233,34 @@ static int sweep_length(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *base
     }
     for (i = 0; i < reps; i++) {
         uint64_t off = distinct ? (uint64_t)(i % (int)windows) * len : 0;
-        urma_seg_cfg_t cfg = make_cfg((uint64_t)(uintptr_t)(base + off), len, tid,
-                                      (uint32_t)(0x9ee70000u + (uint32_t)i));
+        uint8_t *window = base + off;
+        void *mapped = NULL;
+        urma_seg_cfg_t cfg;
         urma_target_seg_t *seg;
         uint64_t t0;
         uint64_t t1;
 
+        if (remap) {
+            /* Mirrors Storage map_path_range: map exactly [off, off+len) of the
+             * content file, then advise it, so the provider sees a fresh VMA
+             * with a possibly non-resident PTE set, exactly as in the product. */
+            uint64_t a0 = monotonic_ns();
+
+            mapped = mmap(NULL, (size_t)len, PROT_READ, MAP_SHARED, fd, (off_t)off);
+            if (mapped == MAP_FAILED) {
+                printf("FAIL mmap(offset=%llu len=%llu) errno=%d (%s)\n",
+                       (unsigned long long)off, (unsigned long long)len, errno,
+                       strerror(errno));
+                return -1;
+            }
+            (void)madvise(mapped, (size_t)len, MADV_SEQUENTIAL);
+            (void)madvise(mapped, (size_t)len, MADV_WILLNEED);
+            record(&map, monotonic_ns() - a0);
+            window = mapped;
+        }
+
+        cfg = make_cfg((uint64_t)(uintptr_t)window, len, tid,
+                       (uint32_t)(0x9ee70000u + (uint32_t)i));
         errno = 0;
         t0 = monotonic_ns();
         seg = urma_register_seg(ctx, &cfg);
@@ -226,6 +270,9 @@ static int sweep_length(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *base
             reg.failed++;
             if (reg.first_errno == 0) {
                 reg.first_errno = errno;
+            }
+            if (mapped != NULL) {
+                (void)munmap(mapped, (size_t)len);
             }
             continue;
         }
@@ -240,6 +287,9 @@ static int sweep_length(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *base
             }
         }
         record(&unreg, monotonic_ns() - t0);
+        if (mapped != NULL) {
+            (void)munmap(mapped, (size_t)len);
+        }
     }
 
     memset(out, 0, sizeof(*out));
@@ -251,6 +301,7 @@ static int sweep_length(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *base
     /* unregister is only sampled for successful registrations; a short sample
      * set is normal, an empty one is not an error. */
     (void)summarize(&unreg, &out->unreg);
+    (void)summarize(&map, &out->map);
     return 0;
 }
 
@@ -355,7 +406,7 @@ static void report_slope(const struct sweep_result *by_len)
 
 /* ------------------------------------------------------- head-to-head A vs B */
 
-static void report_head_to_head(const struct sweep_result *by_len)
+static void report_head_to_head(const struct sweep_result *by_len, int remap)
 {
     const struct sweep_result *w32 = NULL;
     const struct sweep_result *w1g = NULL;
@@ -389,9 +440,13 @@ static void report_head_to_head(const struct sweep_result *by_len)
            " -> saving=%8.2fms (%5.1f%%)\n",
            total_32, per_call_32, total_1g, per_call_1g, total_32 - total_1g,
            total_32 > 0.0 ? (total_32 - total_1g) / total_32 * 100.0 : 0.0);
-    printf("R2 note                  the product also mmaps a fresh Piece window per call"
-           " (map_path_range); this probe re-registers windows of one resident mapping,"
-           " so a positive gap here is the registration granularity alone\n");
+    printf("R2 note                  %s\n",
+           remap ? "fresh mmap + advise + munmap per call, as in the product, so this gap is"
+                   " the whole per-Piece source cost the product pays, not the pin alone"
+                 : "the product also mmaps a fresh Piece window per call (map_path_range);"
+                   " this probe re-registers windows of one resident mapping, so a positive"
+                   " gap here is the registration granularity alone; use --remap for the"
+                   " product shape");
 }
 
 /* ------------------------------------------------------------------- backing */
@@ -478,6 +533,7 @@ int main(int argc, char **argv)
     uint64_t max_bytes = DEFAULT_MAX_BYTES;
     const char *file_path = NULL;
     int distinct = 1;
+    int remap = 0;
     struct backing backing;
     struct sweep_result by_len[LENGTH_COUNT];
     struct sweep_result pass1[LENGTH_COUNT];
@@ -500,16 +556,23 @@ int main(int argc, char **argv)
             max_bytes = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--file") == 0 && i + 1 < (size_t)argc) {
             file_path = argv[++i];
+        } else if (strcmp(argv[i], "--remap") == 0) {
+            remap = 1;
         } else if (strcmp(argv[i], "--same") == 0) {
             distinct = 0;
         } else {
-            printf("usage: %s [--device NAME] [--eid N] [--max-bytes N] [--file PATH] [--same]\n",
-                   argv[0]);
+            printf("usage: %s [--device NAME] [--eid N] [--max-bytes N] [--file PATH] "
+                   "[--remap] [--same]\n", argv[0]);
             return 1;
         }
     }
     if (max_bytes < LENGTHS[0]) {
         printf("FAIL --max-bytes must be at least 1 MiB\n");
+        return 1;
+    }
+    if (remap && file_path == NULL) {
+        printf("FAIL --remap needs --file: it re-maps the product's content-file windows"
+               " per call, which has no meaning over anonymous memory\n");
         return 1;
     }
 
@@ -550,11 +613,13 @@ int main(int argc, char **argv)
         }
     }
     printf("       env                 device=%s eid=%u max_bytes=%llu (%llu MiB) "
-           "lengths=%zu mode=%s offset=%s\n",
+           "lengths=%zu mode=%s offset=%s mapping=%s\n",
            device_name, eid_index, (unsigned long long)backing.len,
            (unsigned long long)(backing.len / MI_BYTES), active,
            file_path != NULL ? "file-backed" : "anonymous pre-touched",
-           distinct ? "distinct consecutive windows" : "same window (offset 0)");
+           distinct ? "distinct consecutive windows" : "same window (offset 0)",
+           remap ? "fresh mmap+advise+munmap per call (product shape)"
+                 : "one long-lived mapping");
     printf("       token id            mode=%s (urma_alloc_token_id -> MAPT_MODE_TABLE,"
            " shared by every Segment as in the product)\n",
            "table");
@@ -582,7 +647,7 @@ int main(int argc, char **argv)
             }
             reps = reps_for(LENGTHS[i], budget);
             if (sweep_length(ctx, tid, backing.base, backing.len, LENGTHS[i], reps,
-                             distinct, &r) != 0) {
+                             distinct, remap, backing.fd, &r) != 0) {
                 printf("R1 pass%d  L=%6.0fMiB SKIPPED (no accepted registration)\n", pass + 1,
                        (double)LENGTHS[i] / (double)MI_BYTES);
                 rc = 1;
@@ -590,6 +655,13 @@ int main(int argc, char **argv)
             }
             snprintf(tag, sizeof(tag), "pass%d", pass + 1);
             print_length_line(tag, LENGTHS[i], reps, &r);
+            if (remap && r.map.p50 != 0) {
+                /* The product's `register` span contains this; its `pin` span does
+                 * not. A pass1 >> pass2 gap here is page residency, not VMA setup. */
+                printf("R1 map %-5s L=%6.0fMiB mmap+2xadvise p50=%7.3fms first=%7.3fms "
+                       "max=%7.3fms\n", tag, (double)LENGTHS[i] / (double)MI_BYTES,
+                       to_ms(r.map.p50), to_ms(r.map.first), to_ms(r.map.max));
+            }
             if (r.first_errno != 0) {
                 printf("R1 pass%d  L=%6.0fMiB first register errno=%d (%s)\n", pass + 1,
                        (double)LENGTHS[i] / (double)MI_BYTES, r.first_errno,
@@ -617,7 +689,7 @@ int main(int argc, char **argv)
                to_ms(pass1[i].reg.p50) - to_ms(by_len[i].reg.p50));
     }
 
-    report_head_to_head(by_len);
+    report_head_to_head(by_len, remap);
     report_slope(by_len);
 
     (void)urma_free_token_id(tid);
