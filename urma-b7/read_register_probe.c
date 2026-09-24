@@ -34,9 +34,9 @@
  *   R4 unregister    the same sweep for urma_unregister_seg, because revoke ->
  *                    unregister is the second term on that critical path
  *   R5 concurrency   --threads 1,2,4,8 drives the same file-backed path from T
- *                    threads and reports wall-clock throughput scaling, so a
- *                    provider/driver lock that serializes registration is
- *                    separable from a per-node per-byte rate that scales with T.
+ *                    threads and reports registration API interval overlap and
+ *                    effective registration throughput. API overlap includes any wait
+ *                    inside liburma/driver; it does not identify a specific lock.
  *                    R1-R4 are skipped in this mode.
  *
  * The register call mirrors the product's direct path exactly (see
@@ -246,6 +246,8 @@ struct sweep_result {
  * itself cannot be mapped. */
 struct once {
     uint64_t reg_ns;
+    uint64_t reg_start_ns;
+    uint64_t reg_end_ns;
     uint64_t unreg_ns;
     uint64_t map_ns;
     int reg_failed;
@@ -290,6 +292,8 @@ static int register_once(urma_context_t *ctx, urma_token_id_t *tid, uint8_t *win
     seg = urma_register_seg(ctx, &cfg);
     t1 = monotonic_ns();
     out->reg_ns = t1 - t0;
+    out->reg_start_ns = t0;
+    out->reg_end_ns = t1;
     if (seg == NULL) {
         out->reg_failed = 1;
         out->first_errno = errno;
@@ -524,26 +528,97 @@ struct backing {
 
 /* ------------------------------------------------------------- R5: concurrency */
 
-/* Single-use-safe barrier. A hand-rolled one keeps the file free of feature-test
- * macro dependencies (pthread_barrier_t sits behind _POSIX_C_SOURCE). */
-struct barrier {
-    unsigned arrived;
-    unsigned generation;
-    unsigned total;
+/* Release only successfully created workers; no mutable barrier count. */
+struct start_gate {
+    unsigned ready;
+    unsigned go;
 };
 
-static void barrier_wait(struct barrier *b)
+static void start_gate_wait(struct start_gate *gate)
 {
-    unsigned gen = __atomic_load_n(&b->generation, __ATOMIC_ACQUIRE);
-
-    if (__atomic_add_fetch(&b->arrived, 1, __ATOMIC_ACQ_REL) == b->total) {
-        __atomic_store_n(&b->arrived, 0, __ATOMIC_RELEASE);
-        __atomic_add_fetch(&b->generation, 1, __ATOMIC_RELEASE);
-        return;
-    }
-    while (__atomic_load_n(&b->generation, __ATOMIC_ACQUIRE) == gen) {
+    __atomic_add_fetch(&gate->ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&gate->go, __ATOMIC_ACQUIRE)) {
         sched_yield();
     }
+}
+
+struct reg_interval {
+    uint64_t start;
+    uint64_t end;
+};
+
+struct reg_intervals {
+    struct reg_interval calls[MAX_SAMPLES];
+    size_t count;
+};
+
+struct reg_event {
+    uint64_t time;
+    int delta;
+};
+
+struct reg_envelope {
+    uint64_t span_ns;
+    uint64_t active_ns;
+    uint64_t overlap_ns;
+    uint64_t call_ns;
+    unsigned peak_calls;
+    size_t calls;
+};
+
+static int cmp_reg_event(const void *lhs, const void *rhs)
+{
+    const struct reg_event *a = lhs;
+    const struct reg_event *b = rhs;
+    if (a->time != b->time) {
+        return a->time < b->time ? -1 : 1;
+    }
+    return a->delta < b->delta ? -1 : (a->delta > b->delta ? 1 : 0);
+}
+
+/* API-call overlap includes waiting inside liburma/driver; it does not prove
+ * the provider executes registrations in parallel. */
+static struct reg_envelope summarize_reg_intervals(const struct reg_intervals *sets,
+                                                    uint32_t threads,
+                                                    struct reg_event *events)
+{
+    struct reg_envelope out = {0};
+    size_t event_count = 0;
+    uint64_t previous;
+    unsigned inflight = 0;
+    uint32_t t;
+    size_t i;
+
+    for (t = 0; t < threads; t++) {
+        for (i = 0; i < sets[t].count; i++) {
+            const struct reg_interval *call = &sets[t].calls[i];
+            events[event_count++] = (struct reg_event){call->start, 1};
+            events[event_count++] = (struct reg_event){call->end, -1};
+            out.call_ns += call->end - call->start;
+            out.calls++;
+        }
+    }
+    if (event_count == 0) {
+        return out;
+    }
+    qsort(events, event_count, sizeof(*events), cmp_reg_event);
+    out.span_ns = events[event_count - 1].time - events[0].time;
+    previous = events[0].time;
+    for (i = 0; i < event_count; i++) {
+        uint64_t elapsed = events[i].time - previous;
+        if (inflight > 0) {
+            out.active_ns += elapsed;
+        }
+        if (inflight > 1) {
+            out.overlap_ns += elapsed;
+        }
+        inflight = (unsigned)((int)inflight + events[i].delta);
+        if (inflight > out.peak_calls) {
+            out.peak_calls = inflight;
+        }
+        previous = events[i].time;
+    }
+    return out;
 }
 
 struct conc_ctx {
@@ -558,7 +633,8 @@ struct conc_ctx {
     int fd;
     uint32_t index;
     uint32_t threads;
-    struct barrier *bar;
+    struct start_gate *gate;
+    struct reg_intervals *intervals;
     struct sweep_result *res;
 };
 
@@ -579,7 +655,7 @@ static void *conc_worker(void *argp)
     if (windows == 0) {
         windows = 1;
     }
-    barrier_wait(c->bar);
+    start_gate_wait(c->gate);
 
     for (k = 0; k < c->iters; k++) {
         uint64_t widx = c->distinct
@@ -598,6 +674,10 @@ static void *conc_worker(void *argp)
         if (c->remap) {
             record(&map, o.map_ns);
         }
+        if (o.reg_end_ns > o.reg_start_ns && c->intervals->count < MAX_SAMPLES) {
+            c->intervals->calls[c->intervals->count++] =
+                (struct reg_interval){o.reg_start_ns, o.reg_end_ns};
+        }
         record(&reg, o.reg_ns);
         if (o.reg_failed) {
             reg.failed++;
@@ -608,8 +688,12 @@ static void *conc_worker(void *argp)
         }
         if (o.unreg_failed) {
             unreg.failed++;
+            reg.failed++;
             if (unreg.first_errno == 0) {
                 unreg.first_errno = o.first_errno;
+            }
+            if (reg.first_errno == 0) {
+                reg.first_errno = o.first_errno;
             }
         }
         record(&unreg, o.unreg_ns);
@@ -633,18 +717,11 @@ static double conc_agg_mib(size_t ok, uint64_t len, uint64_t wall_ns)
     return ((double)ok * (double)len / (double)MI_BYTES) / ((double)wall_ns / 1e9);
 }
 
-/* One line per thread count. "worst" is the slowest thread's percentile: under
- * contention the per-call cost rises, and a rising worst p50 with flat aggregate
- * throughput is the signature of a serializing lock.
- *
- * scaling is wall(ref)/wall(T). Every thread runs its own `iters` registrations,
- * so total work grows with T and the per-thread wall is the discriminator:
- *   wall(T) ~ wall(ref)      -> registration is concurrent, agg grows ~T-fold
- *   wall(T) ~ (T/ref)*wall(ref) -> a provider/driver lock serializes it, agg flat
- * (Comparing agg(T) against agg(ref) says the same thing; both are reported.) */
+/* wall/agg include mmap and unregister; regActive/rate only cover measured
+ * urma_register_seg API intervals. Overlap includes internal queueing. */
 static void conc_line(const char *tag, uint32_t n, const struct sweep_result *res,
                       size_t ok, size_t attempted, size_t err, uint64_t wall_ns,
-                      uint64_t len, uint64_t ref_wall_ns, uint32_t ref_n)
+                      uint64_t len, const struct reg_envelope *reg)
 {
     uint64_t reg_p50 = 0, reg_p95 = 0, unreg_p50 = 0, map_p50 = 0;
     size_t i;
@@ -667,22 +744,28 @@ static void conc_line(const char *tag, uint32_t n, const struct sweep_result *re
            "reg p50=%7.3fms p95=%7.3fms | unreg p50=%7.3fms | map p50=%7.3fms err=%zu",
            tag, n, to_ms(wall_ns), ok, attempted, conc_agg_mib(ok, len, wall_ns),
            to_ms(reg_p50), to_ms(reg_p95), to_ms(unreg_p50), to_ms(map_p50), err);
-    if (ref_wall_ns != 0 && wall_ns != 0) {
-        printf(" scaling(vs T=%u)=%5.2fx", ref_n, (double)ref_wall_ns / (double)wall_ns);
-    }
     printf("\n");
+    printf("R5 %-6s T=%-2u          regSpan=%8.2fms regActive=%8.2fms "
+           "regRate=%7.0fMiB/s apiPeak=%u apiOverlap=%5.1f%% avgApi=%4.2f\n",
+           tag, n, to_ms(reg->span_ns), to_ms(reg->active_ns),
+           conc_agg_mib(reg->calls, len, reg->active_ns), reg->peak_calls,
+           reg->active_ns ? 100.0 * (double)reg->overlap_ns / (double)reg->active_ns : 0.0,
+           reg->active_ns ? (double)reg->call_ns / (double)reg->active_ns : 0.0);
 }
 
 static int run_concurrency(urma_context_t *ctx, urma_token_id_t *tid, struct backing *b,
                            uint64_t len, int iters, int distinct, int remap,
                            const uint32_t *thread_list, size_t thread_count)
 {
-    struct conc_ctx *args;
-    struct sweep_result *res;
-    pthread_t *th;
-    uint64_t wall[2][MAX_THREADS];
-    size_t ok[2][MAX_THREADS];
-    size_t err[2][MAX_THREADS];
+    struct conc_ctx *args = calloc(MAX_THREADS, sizeof(*args));
+    struct sweep_result *res = calloc(MAX_THREADS, sizeof(*res));
+    struct reg_intervals *intervals = calloc(MAX_THREADS, sizeof(*intervals));
+    struct reg_event *events = calloc(2 * MAX_THREADS * MAX_SAMPLES, sizeof(*events));
+    pthread_t *th = calloc(MAX_THREADS, sizeof(*th));
+    uint64_t wall[2][MAX_THREADS] = {{0}};
+    double reg_rate[2][MAX_THREADS] = {{0}};
+    int valid[2][MAX_THREADS] = {{0}};
+    int failed = 0;
     size_t li;
     int pass;
 
@@ -691,35 +774,28 @@ static int run_concurrency(urma_context_t *ctx, urma_token_id_t *tid, struct bac
            (unsigned long long)(len / MI_BYTES), iters,
            (unsigned long long)(b->len / len),
            b->mapped ? "file-backed" : "anonymous pre-touched", remap);
-
-    args = calloc(MAX_THREADS, sizeof(*args));
-    res = calloc(MAX_THREADS, sizeof(*res));
-    th = calloc(MAX_THREADS, sizeof(*th));
-    if (args == NULL || res == NULL || th == NULL) {
+    if (args == NULL || res == NULL || intervals == NULL || events == NULL || th == NULL) {
         printf("FAIL calloc for the thread tables\n");
-        free(args);
-        free(res);
-        free(th);
-        return 1;
+        failed = 1;
+        goto out;
     }
-    memset(wall, 0, sizeof(wall));
-    memset(ok, 0, sizeof(ok));
-    memset(err, 0, sizeof(err));
 
     for (pass = 0; pass < 2; pass++) {
         for (li = 0; li < thread_count; li++) {
             uint32_t n = thread_list[li];
-            struct barrier bar = {0, 0, 0};
+            struct start_gate gate = {0};
+            struct reg_envelope envelope;
             uint32_t started = 0;
             uint32_t ti;
-            uint64_t t0;
-            uint64_t t1;
+            uint64_t t0, t1;
             size_t sum_reg = 0;
             size_t sum_err = 0;
-            size_t sum_ok;
+            size_t expected = (size_t)n * (size_t)iters;
+            int create_failed = 0;
             char tag[16];
 
-            bar.total = n + 1;
+            memset(res, 0, MAX_THREADS * sizeof(*res));
+            memset(intervals, 0, MAX_THREADS * sizeof(*intervals));
             for (ti = 0; ti < n; ti++) {
                 args[ti].ctx = ctx;
                 args[ti].tid = tid;
@@ -732,21 +808,23 @@ static int run_concurrency(urma_context_t *ctx, urma_token_id_t *tid, struct bac
                 args[ti].fd = b->fd;
                 args[ti].index = ti;
                 args[ti].threads = n;
-                args[ti].bar = &bar;
+                args[ti].gate = &gate;
+                args[ti].intervals = &intervals[ti];
                 args[ti].res = &res[ti];
-                if (pthread_create(&th[ti], NULL, conc_worker, &args[ti]) != 0) {
-                    printf("FAIL pthread_create(thread %u of %u) errno=%d (%s)\n", ti, n,
-                           errno, strerror(errno));
-                    /* Keep the barrier reachable for the threads that did start;
-                     * main still arrives, so the release still happens. */
-                    bar.total = ti + 1;
+                int err = pthread_create(&th[ti], NULL, conc_worker, &args[ti]);
+                if (err != 0) {
+                    printf("FAIL pthread_create(thread %u of %u) error=%d (%s)\n",
+                           ti, n, err, strerror(err));
+                    create_failed = 1;
                     break;
                 }
                 started++;
             }
-            /* Timed window: everything after this instant is concurrent work. */
-            barrier_wait(&bar);
+            while (__atomic_load_n(&gate.ready, __ATOMIC_ACQUIRE) != started) {
+                sched_yield();
+            }
             t0 = monotonic_ns();
+            __atomic_store_n(&gate.go, 1, __ATOMIC_RELEASE);
             for (ti = 0; ti < started; ti++) {
                 (void)pthread_join(th[ti], NULL);
             }
@@ -756,14 +834,15 @@ static int run_concurrency(urma_context_t *ctx, urma_token_id_t *tid, struct bac
                 sum_reg += res[ti].count;
                 sum_err += res[ti].failed;
             }
-            sum_ok = sum_reg > sum_err ? sum_reg - sum_err : 0;
+            envelope = summarize_reg_intervals(intervals, started, events);
             wall[pass][li] = t1 - t0;
-            ok[pass][li] = sum_ok;
-            err[pass][li] = sum_err;
+            valid[pass][li] = !create_failed && started == n &&
+                              sum_reg == expected && sum_err == 0 &&
+                              envelope.calls == expected;
+            reg_rate[pass][li] = conc_agg_mib(envelope.calls, len, envelope.active_ns);
             snprintf(tag, sizeof(tag), "pass%d", pass + 1);
-            conc_line(tag, started, res, sum_ok, (size_t)started * (size_t)iters, sum_err,
-                      wall[pass][li], len, pass == 1 ? wall[1][0] : 0,
-                      pass == 1 ? thread_list[0] : 0);
+            conc_line(tag, started, res, sum_reg > sum_err ? sum_reg - sum_err : 0,
+                      expected, sum_err, wall[pass][li], len, &envelope);
             if (pass == 1) {
                 printf("R5 pass2 T=%-2u            reg p50 per thread =", started);
                 for (ti = 0; ti < started; ti++) {
@@ -771,11 +850,15 @@ static int run_concurrency(urma_context_t *ctx, urma_token_id_t *tid, struct bac
                 }
                 printf(" ms\n");
             }
-            if (sum_err != 0) {
+            if (!valid[pass][li]) {
+                failed = 1;
+                printf("R5 %-6s T=%-2u          INVALID: completed=%zu expected=%zu errors=%zu "
+                       "threads=%u/%u; exclude from scaling\n",
+                       tag, n, sum_reg, expected, sum_err, started, n);
                 for (ti = 0; ti < started; ti++) {
                     if (res[ti].first_errno != 0) {
-                        printf("R5 %-6s T=%-2u          first register errno=%d (%s)\n", tag,
-                               started, res[ti].first_errno,
+                        printf("R5 %-6s T=%-2u          first error=%d (%s)\n",
+                               tag, n, res[ti].first_errno,
                                strerror(res[ti].first_errno));
                         break;
                     }
@@ -784,50 +867,34 @@ static int run_concurrency(urma_context_t *ctx, urma_token_id_t *tid, struct bac
         }
     }
 
-    printf("R5 pass1/pass2 delta     (pass1 pays first-touch; the scaling verdict uses"
-           " pass2)\n");
+    printf("R5 pass1/pass2 delta     (compare warm pass2 only; wall includes map and unregister)\n");
     for (li = 0; li < thread_count; li++) {
-        printf("R5 delta    T=%-2u          pass1=%8.2fms pass2=%8.2fms delta=%+8.2fms\n",
-               thread_list[li], to_ms(wall[0][li]), to_ms(wall[1][li]),
-               to_ms(wall[0][li]) - to_ms(wall[1][li]));
-    }
-    {
-        uint32_t ref_n = thread_list[0];
-        uint32_t last_n = thread_list[thread_count - 1];
-        uint64_t ref_wall = wall[1][0];
-        uint64_t last_wall = wall[1][thread_count - 1];
-
-        if (ref_wall != 0 && last_wall != 0) {
-            /* Every thread runs a fixed `iters` registrations, so total work
-             * grows with T. A concurrent provider keeps the wall clock nearly
-             * flat (scaling -> 1.00); a provider/driver lock queues the calls,
-             * so the wall clock grows with T (scaling -> ref_n/last_n, the
-             * theoretical floor; a real lock lands slightly above it because
-             * per-call cost also inflates under contention, so accept within 2x
-             * of the floor). Speedup is not the discriminator -- scaling is. */
-            double scaling = (double)ref_wall / (double)last_wall;
-            double serial = (double)ref_n / (double)last_n;
-
-            printf("R5 verdict               ref T=%u wall=%8.2fms agg=%7.0fMiB/s -> T=%u"
-                   " wall=%8.2fms agg=%7.0fMiB/s | scaling=%5.2fx (serial floor=%4.2fx)"
-                   " -> %s\n",
-                   ref_n, to_ms(ref_wall), conc_agg_mib(ok[1][0], len, ref_wall), last_n,
-                   to_ms(last_wall), conc_agg_mib(ok[1][thread_count - 1], len, last_wall),
-                   scaling, serial,
-                   scaling >= 0.85
-                       ? "SCALES (registration is concurrent; no provider-level lock)"
-                       : (scaling <= serial * 2.0
-                              ? "SERIALIZED (threads queue; a provider/driver lock)"
-                              : "PARTIAL scaling (some serialized resource)"));
-        } else {
-            printf("R5 verdict               SKIPPED (no timed pass completed)\n");
+        if (valid[0][li] && valid[1][li]) {
+            printf("R5 delta    T=%-2u          pass1=%8.2fms pass2=%8.2fms delta=%+8.2fms\n",
+                   thread_list[li], to_ms(wall[0][li]), to_ms(wall[1][li]),
+                   to_ms(wall[0][li]) - to_ms(wall[1][li]));
         }
     }
+    if (thread_count < 2 || failed) {
+        printf("R5 comparison           SKIPPED (needs two or more fully valid thread counts)\n");
+    } else {
+        size_t last = thread_count - 1;
+        printf("R5 comparison           T=%u -> T=%u pass2 regRate=%7.0f -> %7.0fMiB/s "
+               "(%.2fx); wall=%8.2f -> %8.2fms\n",
+               thread_list[0], thread_list[last], reg_rate[1][0], reg_rate[1][last],
+               reg_rate[1][0] ? reg_rate[1][last] / reg_rate[1][0] : 0.0,
+               to_ms(wall[1][0]), to_ms(wall[1][last]));
+        printf("R5 interpretation       API overlap includes provider/driver wait; "
+               "regRate measures effective API throughput, not a specific lock.\n");
+    }
 
+out:
     free(args);
     free(res);
+    free(intervals);
+    free(events);
     free(th);
-    return err[0][0] != 0 && ok[0][0] == 0 && ok[1][0] == 0 ? 1 : 0;
+    return failed;
 }
 
 /* ------------------------------------------------------------------- backing */
@@ -910,7 +977,7 @@ static int parse_threads(const char *s, uint32_t *out, size_t *count)
         char *end = NULL;
         long v = strtol(p, &end, 10);
 
-        if (end == p || v < 1 || v > 1024 || *count >= MAX_THREADS) {
+        if (end == p || v < 1 || v > MAX_THREADS || *count >= MAX_THREADS) {
             return -1;
         }
         out[(*count)++] = (uint32_t)v;
@@ -1041,6 +1108,19 @@ int main(int argc, char **argv)
             (void)urma_delete_context(ctx);
             (void)urma_uninit();
             return 1;
+        }
+        if (distinct) {
+            for (i = 0; i < thread_count; i++) {
+                if (thread_list[i] > backing.len / conc_len) {
+                    printf("FAIL --threads %u exceeds the %llu distinct windows; "
+                           "reduce threads or --len\n", thread_list[i],
+                           (unsigned long long)(backing.len / conc_len));
+                    close_backing(&backing);
+                    (void)urma_delete_context(ctx);
+                    (void)urma_uninit();
+                    return 1;
+                }
+            }
         }
         if (remap == 0) {
             printf("WARN --threads without --remap: every thread re-registers windows of one"
