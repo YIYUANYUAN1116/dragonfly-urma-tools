@@ -2123,6 +2123,32 @@ storage:
             timing["dfgetElapsedNs"],
         )
 
+    def test_task_timing_exposes_common_send_recv_transport_split(self):
+        piece = (
+            '2026-08-31T10:41:35.100000000Z DEBUG finished piece task-0 '
+            'from parent Some("parent") using protocol urma task_id="task-id"'
+        )
+        start = (
+            '2026-08-31T10:41:35.050000000Z INFO task_id="task-id" '
+            'starting dragonfly urma SEND-RECV piece attempt'
+        )
+        started = b7.parse_log_timestamp_ns(piece) - 100_000_000
+        finished = b7.parse_log_timestamp_ns(piece) + 200_000_000
+
+        timing = b7.analyze_task_timing(
+            {
+                "startedAtUnixNs": started,
+                "finishedAtUnixNs": finished,
+                "elapsedNs": finished - started,
+            },
+            start + "\n" + piece + "\n",
+        )
+
+        self.assertEqual(timing["transportKind"], "send-recv")
+        self.assertEqual(timing["dfgetToFirstTransportStartNs"], 50_000_000)
+        self.assertEqual(timing["firstTransportStartToFirstPieceNs"], 50_000_000)
+        self.assertNotIn("dfgetToFirstReadStartNs", timing)
+
     def test_task_timing_filters_overlapping_concurrent_task_logs(self):
         task_a = (
             '2026-08-31T10:41:35.100000000Z DEBUG finished piece task-a-0 '
@@ -2646,6 +2672,73 @@ storage:
         self.assertEqual(timeline["averageReadActiveMilli"], 667)
         self.assertEqual(timeline["readBusyPermille"], 667)
         self.assertEqual(timeline["peakReadActive"], 1)
+
+    def test_send_recv_batch_timeline_uses_only_child_piece_events(self):
+        log = "\n".join(
+            (
+                "2026-09-23T01:00:00.025000000Z task_id=t piece_number=0 "
+                "receive_completion_ns=20000000 receive_completion_to_event_ns=5000000 "
+                "finished receiving urma piece into registered windows",
+                "2026-09-23T01:00:00.035000000Z task_id=t piece_number=1 "
+                "receive_completion_ns=20000000 receive_completion_to_event_ns=5000000 "
+                "finished receiving urma piece into registered windows",
+                "2026-09-23T01:00:00.050000000Z task_id=t piece_id=p0 "
+                "storage_total_ns=40000000 pwrite_start_ns=15000000 "
+                "pwrite_end_ns=35000000 finished writing urma piece from registered receive windows",
+                "2026-09-23T01:00:00.065000000Z task_id=t piece_id=p1 "
+                "storage_total_ns=40000000 pwrite_start_ns=10000000 "
+                "pwrite_end_ns=35000000 finished writing urma piece from registered receive windows",
+            )
+        )
+
+        timeline = b7.urma_send_recv_batch_timeline(log)
+
+        self.assertTrue(timeline["complete"])
+        self.assertEqual(timeline["clockScope"], "child-process-only")
+        self.assertFalse(timeline["stageDurationsAreAdditive"])
+        self.assertEqual(timeline["receiveBatchEnvelopeNs"], 30_000_000)
+        self.assertEqual(timeline["receiveActiveAreaNs"], 40_000_000)
+        self.assertEqual(timeline["receiveBusyUnionNs"], 30_000_000)
+        self.assertEqual(timeline["peakReceiveActive"], 2)
+        self.assertEqual(timeline["pwriteEnvelopeNs"], 35_000_000)
+        self.assertEqual(
+            timeline["firstReceiveCompletionToFirstPwriteStartNs"], 5_000_000
+        )
+        self.assertEqual(
+            timeline["lastReceiveCompletionToLastPwriteEndNs"], 30_000_000
+        )
+        self.assertEqual(timeline["receivePwriteEnvelopeOverlapNs"], 5_000_000)
+        summary = b7.urma_send_recv_timeline_summary([timeline])
+        self.assertEqual(summary["completeBatchCount"], 1)
+        self.assertEqual(
+            summary["duration"]["receiveBatchEnvelopeNs"]["medianNs"], 30_000_000
+        )
+
+    def test_send_recv_stage_summary_marks_overlapping_stages_non_additive(self):
+        child = "\n".join(
+            (
+                "session_queue_wait_ns=1 request_ready_ns=2 rx_window_wait_ns=3 "
+                "receive_completion_ns=4 receive_completion_to_event_ns=5 done_wait_ns=6 "
+                "window_publish_wait_ns=7 client_piece_total_ns=8 "
+                "finished receiving urma piece into registered windows",
+                "file_open_ns=10 rx_window_wait_ns=20 digest_ns=30 "
+                "digest_envelope_ns=40 pwrite_ns=50 pwrite_envelope_ns=60 "
+                "crc_pwrite_overlap_ns=25 recycle_ns=5 storage_total_ns=100 "
+                "finished writing urma piece from registered receive windows",
+                "transport_download_ns=80 storage_finish_ns=120 child_piece_e2e_ns=205 "
+                "finished dragonfly urma piece attempt",
+            )
+        )
+
+        summary = b7.urma_send_recv_stage_summary(child)
+
+        self.assertTrue(summary["observed"])
+        self.assertFalse(summary["stageDurationsAreAdditive"])
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertEqual(summary["receive"]["receiveCompletionNs"]["totalNs"], 4)
+        self.assertEqual(summary["storage"]["pwriteEnvelopeNs"]["totalNs"], 60)
+        self.assertEqual(summary["storage"]["crcPwriteOverlapNs"]["totalNs"], 25)
+        self.assertEqual(summary["attempt"]["pieceE2eNs"]["totalNs"], 205)
 
     def test_storage_consumer_summary_attributes_digest_and_pwrite(self):
         child = "\n".join(

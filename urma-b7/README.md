@@ -237,6 +237,22 @@ Storage 侧含 file open/pwrite/CRC/recycle/metadata commit。`taskTimingSummary
 pwrite 区间、两者 envelope overlap、最后 CQE 到最后 pwrite 的距离，以及实际 pwrite 峰值并发；
 不需要启用 transport-only profile。`read_attribution_summary.py` 会直接打印这些字段的 p50。
 
+### READ 与 SEND/RECV 同口径时延
+
+新构建的 SEND/RECV 路径会把 measured samples 写入
+`result.transfer.urmaSendRecvStageSummary` 和 `urmaSendRecvTimelineSummary`。同时，READ 与
+SEND/RECV 的 `taskTimingSummary` 都提供中性字段 `dfgetToFirstTransportStartNs`、
+`firstTransportStartToFirstPieceNs`、`firstTransportStartToLastPieceNs`，原 READ 专用字段继续保留。
+
+```bash
+python3 transport_timing_summary.py \
+  results/read-run/manifest.json results/send-recv-run/manifest.json
+```
+
+输出包含完整 dfget、to-transport、transport→首 Piece、首末 Piece span、tail、transport envelope
+和 pwrite envelope。阶段耗时是归因数据，不可相加为 batch 墙钟；receive/READ 与 pwrite、CRC 与
+pwrite 均可能重叠。所有 envelope 只使用 child 进程时间戳，不比较 Parent/Child 的绝对时间。
+
 ## Performance case
 
 `cases.json` 中的 performance case 会真实执行 `warmups` 和 `repetitions`，不是只记录矩阵参数。工具先在

@@ -77,6 +77,24 @@ STORAGE_PWRITE_CALLS_RE = re.compile(r"\bpwrite_calls=(\d+)")
 READ_PWRITE_ACTIVE_RE = re.compile(r"\bpwrite_active_at_start=(\d+)")
 STORAGE_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
 STORAGE_TOTAL_NS_RE = re.compile(r"\bstorage_total_ns=(\d+)")
+STORAGE_DIGEST_START_NS_RE = re.compile(r"\bdigest_start_ns=(\d+)")
+STORAGE_DIGEST_END_NS_RE = re.compile(r"\bdigest_end_ns=(\d+)")
+STORAGE_DIGEST_ENVELOPE_NS_RE = re.compile(r"\bdigest_envelope_ns=(\d+)")
+STORAGE_PWRITE_START_NS_RE = re.compile(r"\bpwrite_start_ns=(\d+)")
+STORAGE_PWRITE_END_NS_RE = re.compile(r"\bpwrite_end_ns=(\d+)")
+STORAGE_PWRITE_ENVELOPE_NS_RE = re.compile(r"\bpwrite_envelope_ns=(\d+)")
+STORAGE_CRC_PWRITE_OVERLAP_NS_RE = re.compile(r"\bcrc_pwrite_overlap_ns=(\d+)")
+RECEIVE_COMPLETION_NS_RE = re.compile(r"\breceive_completion_ns=(\d+)")
+RECEIVE_COMPLETION_TO_EVENT_NS_RE = re.compile(
+    r"\breceive_completion_to_event_ns=(\d+)"
+)
+RECEIVE_SESSION_QUEUE_WAIT_NS_RE = re.compile(r"\bsession_queue_wait_ns=(\d+)")
+RECEIVE_REQUEST_READY_NS_RE = re.compile(r"\brequest_ready_ns=(\d+)")
+RECEIVE_DONE_WAIT_NS_RE = re.compile(r"\bdone_wait_ns=(\d+)")
+RECEIVE_WINDOW_PUBLISH_WAIT_NS_RE = re.compile(r"\bwindow_publish_wait_ns=(\d+)")
+RECEIVE_CLIENT_PIECE_TOTAL_NS_RE = re.compile(r"\bclient_piece_total_ns=(\d+)")
+SEND_RECV_DOWNLOAD_NS_RE = re.compile(r"\btransport_download_ns=(\d+)")
+SEND_RECV_STORAGE_FINISH_NS_RE = re.compile(r"\bstorage_finish_ns=(\d+)")
 READ_RETAINED_CLEANUP_NS_RE = re.compile(r"\bretained_cleanup_ns=(\d+)")
 READ_LANE_ACQUIRE_NS_RE = re.compile(r"\blane_acquire_ns=(\d+)")
 READ_BUFFER_READY_SEND_NS_RE = re.compile(r"\bbuffer_ready_send_ns=(\d+)")
@@ -1557,28 +1575,48 @@ def analyze_task_timing(
         "lastPieceToDfgetEndNs": finished - last_piece,
         "dfgetElapsedNs": elapsed,
     }
-    read_start_lines = [
-        line
-        for line in task_log.splitlines()
-        if "starting dragonfly urma READ piece attempt" in line
-        and last_task_id(line) == result["taskId"]
-    ]
-    if read_start_lines:
-        read_starts = [parse_log_timestamp_ns(line) for line in read_start_lines]
-        first_read_start = min(read_starts)
-        last_read_start = max(read_starts)
-        if not started <= first_read_start <= last_read_start <= last_piece:
-            raise B7Error("READ Piece start timestamps are outside the dfget interval")
+    transport_markers = (
+        ("read", "starting dragonfly urma READ piece attempt"),
+        ("send-recv", "starting dragonfly urma SEND-RECV piece attempt"),
+    )
+    for transport_kind, marker in transport_markers:
+        start_lines = [
+            line
+            for line in task_log.splitlines()
+            if marker in line and last_task_id(line) == result["taskId"]
+        ]
+        if not start_lines:
+            continue
+        transport_starts = [parse_log_timestamp_ns(line) for line in start_lines]
+        first_transport_start = min(transport_starts)
+        last_transport_start = max(transport_starts)
+        if not started <= first_transport_start <= last_transport_start <= last_piece:
+            raise B7Error(
+                f"{transport_kind} Piece start timestamps are outside the dfget interval"
+            )
         result.update(
             {
-                "readPieceStarts": len(read_starts),
-                "firstReadStartAtUnixNs": first_read_start,
-                "lastReadStartAtUnixNs": last_read_start,
-                "dfgetToFirstReadStartNs": first_read_start - started,
-                "firstReadStartToFirstPieceNs": first_piece - first_read_start,
-                "firstReadStartToLastPieceNs": last_piece - first_read_start,
+                "transportKind": transport_kind,
+                "transportPieceStarts": len(transport_starts),
+                "firstTransportStartAtUnixNs": first_transport_start,
+                "lastTransportStartAtUnixNs": last_transport_start,
+                "dfgetToFirstTransportStartNs": first_transport_start - started,
+                "firstTransportStartToFirstPieceNs": first_piece - first_transport_start,
+                "firstTransportStartToLastPieceNs": last_piece - first_transport_start,
             }
         )
+        if transport_kind == "read":
+            result.update(
+                {
+                    "readPieceStarts": len(transport_starts),
+                    "firstReadStartAtUnixNs": first_transport_start,
+                    "lastReadStartAtUnixNs": last_transport_start,
+                    "dfgetToFirstReadStartNs": first_transport_start - started,
+                    "firstReadStartToFirstPieceNs": first_piece - first_transport_start,
+                    "firstReadStartToLastPieceNs": last_piece - first_transport_start,
+                }
+            )
+        break
     return result
 
 
@@ -2641,6 +2679,271 @@ def urma_read_timeline_summary(timelines: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+SEND_RECV_TIMELINE_DURATION_FIELDS = (
+    "receiveStartSpanNs",
+    "receiveCompletionSpanNs",
+    "receiveBatchEnvelopeNs",
+    "receiveActiveAreaNs",
+    "receiveBusyUnionNs",
+    "receiveIdleNs",
+    "pwriteStartSpanNs",
+    "pwriteEndSpanNs",
+    "pwriteEnvelopeNs",
+    "firstReceiveCompletionToFirstPwriteStartNs",
+    "lastReceiveCompletionToLastPwriteEndNs",
+    "firstReceiveStartToLastPwriteEndNs",
+    "receivePwriteEnvelopeOverlapNs",
+)
+
+
+def urma_send_recv_stage_summary(child: str) -> dict[str, Any]:
+    """Summarize low-frequency SEND/RECV stages from existing per-Piece events.
+
+    Stage totals are attribution counters, not an additive batch wall clock:
+    receive, CRC32, and pwrite intervals can overlap.
+    """
+
+    def rows(marker: str, fields: tuple[tuple[str, re.Pattern[str]], ...]):
+        parsed: list[tuple[int, ...]] = []
+        malformed = 0
+        for line in child.splitlines():
+            if marker not in line:
+                continue
+            values = tuple(last_int_match(pattern, line) for _, pattern in fields)
+            if any(value is None for value in values):
+                malformed += 1
+                continue
+            parsed.append(tuple(int(value) for value in values))
+        return parsed, malformed
+
+    receive_fields = (
+        ("sessionQueueWaitNs", RECEIVE_SESSION_QUEUE_WAIT_NS_RE),
+        ("requestReadyNs", RECEIVE_REQUEST_READY_NS_RE),
+        ("rxWindowWaitNs", STORAGE_RX_WAIT_NS_RE),
+        ("receiveCompletionNs", RECEIVE_COMPLETION_NS_RE),
+        ("receiveCompletionToEventNs", RECEIVE_COMPLETION_TO_EVENT_NS_RE),
+        ("doneWaitNs", RECEIVE_DONE_WAIT_NS_RE),
+        ("windowPublishWaitNs", RECEIVE_WINDOW_PUBLISH_WAIT_NS_RE),
+        ("clientPieceTotalNs", RECEIVE_CLIENT_PIECE_TOTAL_NS_RE),
+    )
+    storage_fields = (
+        ("fileOpenNs", STORAGE_FILE_OPEN_NS_RE),
+        ("rxWindowWaitNs", STORAGE_RX_WAIT_NS_RE),
+        ("digestNs", STORAGE_DIGEST_NS_RE),
+        ("digestEnvelopeNs", STORAGE_DIGEST_ENVELOPE_NS_RE),
+        ("pwriteNs", STORAGE_PWRITE_NS_RE),
+        ("pwriteEnvelopeNs", STORAGE_PWRITE_ENVELOPE_NS_RE),
+        ("crcPwriteOverlapNs", STORAGE_CRC_PWRITE_OVERLAP_NS_RE),
+        ("recycleNs", STORAGE_RECYCLE_NS_RE),
+        ("storageTotalNs", STORAGE_TOTAL_NS_RE),
+    )
+    attempt_fields = (
+        ("downloadNs", SEND_RECV_DOWNLOAD_NS_RE),
+        ("finishNs", SEND_RECV_STORAGE_FINISH_NS_RE),
+        ("pieceE2eNs", READ_CHILD_PIECE_E2E_NS_RE),
+    )
+    receive, receive_bad = rows(
+        "finished receiving urma piece into registered windows", receive_fields
+    )
+    storage, storage_bad = rows(
+        "finished writing urma piece from registered receive windows", storage_fields
+    )
+    attempt, attempt_bad = rows(
+        "finished dragonfly urma piece attempt", attempt_fields
+    )
+
+    def summarize(samples, fields):
+        return {
+            "pieceCount": len(samples),
+            **{
+                name: integer_ns_summary([row[index] for row in samples])
+                for index, (name, _) in enumerate(fields)
+            },
+        }
+
+    return {
+        "observed": bool(receive or storage or attempt),
+        "receive": summarize(receive, receive_fields),
+        "storage": summarize(storage, storage_fields),
+        "attempt": summarize(attempt, attempt_fields),
+        "malformedLines": receive_bad + storage_bad + attempt_bad,
+        "stageDurationsAreAdditive": False,
+    }
+
+
+def _interval_metrics(events: list[tuple[int, int]]) -> tuple[int, int, int, int]:
+    """Return envelope, active area, busy union, and peak concurrency."""
+    envelope = max(end for _, end in events) - min(start for start, _ in events)
+    active_area = sum(end - start for start, end in events)
+    merged: list[list[int]] = []
+    for start, end in sorted(events):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    busy_union = sum(end - start for start, end in merged)
+    active = peak = 0
+    for _, delta in sorted(
+        (point for start, end in events for point in ((start, 1), (end, -1))),
+        key=lambda point: (point[0], point[1]),
+    ):
+        active += delta
+        peak = max(peak, active)
+    return envelope, active_area, busy_union, peak
+
+
+def urma_send_recv_batch_timeline(child: str) -> dict[str, Any]:
+    """Reconstruct SEND/RECV receive and pwrite envelopes on the Child clock."""
+    receive_events: list[tuple[int, int]] = []
+    pwrite_events: list[tuple[int, int]] = []
+    malformed = 0
+    for line in child.splitlines():
+        if "finished receiving urma piece into registered windows" in line:
+            try:
+                emitted = parse_log_timestamp_ns(line)
+            except B7Error:
+                malformed += 1
+                continue
+            duration = last_int_match(RECEIVE_COMPLETION_NS_RE, line)
+            delay = last_int_match(RECEIVE_COMPLETION_TO_EVENT_NS_RE, line)
+            if duration is None or delay is None or delay > emitted:
+                malformed += 1
+                continue
+            end = emitted - delay
+            if duration > end:
+                malformed += 1
+                continue
+            receive_events.append((end - duration, end))
+        elif "finished writing urma piece from registered receive windows" in line:
+            try:
+                emitted = parse_log_timestamp_ns(line)
+            except B7Error:
+                malformed += 1
+                continue
+            total = last_int_match(STORAGE_TOTAL_NS_RE, line)
+            start_offset = last_int_match(STORAGE_PWRITE_START_NS_RE, line)
+            end_offset = last_int_match(STORAGE_PWRITE_END_NS_RE, line)
+            if (
+                total is None
+                or start_offset is None
+                or end_offset is None
+                or start_offset > end_offset
+                or end_offset > total
+                or total > emitted
+            ):
+                malformed += 1
+                continue
+            origin = emitted - total
+            pwrite_events.append((origin + start_offset, origin + end_offset))
+
+    result: dict[str, Any] = {
+        "observed": bool(receive_events or pwrite_events),
+        "complete": False,
+        "receiveStartCount": len(receive_events),
+        "receiveCompletionCount": len(receive_events),
+        "pwriteStartCount": len(pwrite_events),
+        "pwriteEndCount": len(pwrite_events),
+        "malformedLines": malformed,
+        "clockScope": "child-process-only",
+        "stageDurationsAreAdditive": False,
+    }
+    if not result["observed"]:
+        return result
+
+    starts = [start for start, _ in receive_events]
+    completions = [end for _, end in receive_events]
+    pwrite_starts = [start for start, _ in pwrite_events]
+    pwrite_ends = [end for _, end in pwrite_events]
+    if receive_events:
+        envelope, area, busy, peak = _interval_metrics(receive_events)
+        result.update(
+            {
+                "receiveStartSpanNs": max(starts) - min(starts),
+                "receiveCompletionSpanNs": max(completions) - min(completions),
+                "receiveBatchEnvelopeNs": envelope,
+                "receiveActiveAreaNs": area,
+                "receiveBusyUnionNs": busy,
+                "receiveIdleNs": envelope - busy,
+                "averageReceiveActiveMilli": round(area * 1000 / envelope)
+                if envelope
+                else 0,
+                "receiveBusyPermille": round(busy * 1000 / envelope)
+                if envelope
+                else 0,
+                "peakReceiveActive": peak,
+            }
+        )
+    if pwrite_events:
+        _, _, _, peak_pwrite = _interval_metrics(pwrite_events)
+        result.update(
+            {
+                "pwriteStartSpanNs": max(pwrite_starts) - min(pwrite_starts),
+                "pwriteEndSpanNs": max(pwrite_ends) - min(pwrite_ends),
+                "pwriteEnvelopeNs": max(pwrite_ends) - min(pwrite_starts),
+                "peakPwriteActive": peak_pwrite,
+            }
+        )
+    if completions and pwrite_starts:
+        result["firstReceiveCompletionToFirstPwriteStartNs"] = (
+            min(pwrite_starts) - min(completions)
+        )
+        result["pwriteStartedBeforeLastReceiveCompletion"] = sum(
+            start < max(completions) for start in pwrite_starts
+        )
+    if completions and pwrite_ends:
+        result["lastReceiveCompletionToLastPwriteEndNs"] = (
+            max(pwrite_ends) - max(completions)
+        )
+    if starts and pwrite_ends:
+        result["firstReceiveStartToLastPwriteEndNs"] = max(pwrite_ends) - min(starts)
+    if receive_events and pwrite_events:
+        overlap_start = max(min(starts), min(pwrite_starts))
+        overlap_end = min(max(completions), max(pwrite_ends))
+        result["receivePwriteEnvelopeOverlapNs"] = max(0, overlap_end - overlap_start)
+    result["complete"] = (
+        bool(receive_events)
+        and len(receive_events) == len(pwrite_events)
+        and malformed == 0
+    )
+    return result
+
+
+def urma_send_recv_timeline_summary(timelines: list[dict[str, Any]]) -> dict[str, Any]:
+    observed = [timeline for timeline in timelines if timeline.get("observed")]
+    return {
+        "observed": bool(observed),
+        "batchCount": len(observed),
+        "completeBatchCount": sum(bool(timeline.get("complete")) for timeline in observed),
+        "peakReceiveActive": integer_value_summary(
+            [int(timeline.get("peakReceiveActive", 0)) for timeline in observed]
+        ),
+        "averageReceiveActiveMilli": integer_value_summary(
+            [int(timeline.get("averageReceiveActiveMilli", 0)) for timeline in observed]
+        ),
+        "receiveBusyPermille": integer_value_summary(
+            [int(timeline.get("receiveBusyPermille", 0)) for timeline in observed]
+        ),
+        "peakPwriteActive": integer_value_summary(
+            [int(timeline.get("peakPwriteActive", 0)) for timeline in observed]
+        ),
+        "pwriteStartedBeforeLastReceiveCompletion": integer_value_summary(
+            [
+                int(timeline.get("pwriteStartedBeforeLastReceiveCompletion", 0))
+                for timeline in observed
+            ]
+        ),
+        "duration": {
+            field: integer_ns_summary(
+                [int(timeline[field]) for timeline in observed if field in timeline]
+            )
+            for field in SEND_RECV_TIMELINE_DURATION_FIELDS
+        },
+        "malformedLines": sum(int(timeline.get("malformedLines", 0)) for timeline in observed),
+        "clockScope": "child-process-only",
+        "stageDurationsAreAdditive": False,
+    }
+
+
 def analyze_fanout_transport_health(parent: str, children: str) -> dict[str, Any]:
     combined = parent + "\n" + children
     lower_parent = parent.lower()
@@ -3264,6 +3567,9 @@ def task_timing_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "dfgetElapsedNs",
     )
     optional_fields = (
+        "dfgetToFirstTransportStartNs",
+        "firstTransportStartToFirstPieceNs",
+        "firstTransportStartToLastPieceNs",
         "dfgetToFirstReadStartNs",
         "firstReadStartToFirstPieceNs",
         "firstReadStartToLastPieceNs",
@@ -5310,6 +5616,12 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                 read_timeline = urma_read_batch_timeline(scoped_task_log)
                 if read_timeline["observed"]:
                     child_transfer["urmaReadTimeline"] = read_timeline
+                send_recv_stages = urma_send_recv_stage_summary(scoped_task_log)
+                if send_recv_stages["observed"]:
+                    child_transfer["urmaSendRecvStages"] = send_recv_stages
+                send_recv_timeline = urma_send_recv_batch_timeline(scoped_task_log)
+                if send_recv_timeline["observed"]:
+                    child_transfer["urmaSendRecvTimeline"] = send_recv_timeline
                 if case.get("urmaPerformanceProfile") == "transport-only":
                     completed_pieces = filter_task_scoped_log(
                         task_log, {expected_task_id}
@@ -5416,6 +5728,11 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             )
             if batch_read_timeline["observed"]:
                 batch_result["urmaReadTimeline"] = batch_read_timeline
+            batch_send_recv_timeline = urma_send_recv_batch_timeline(
+                filter_task_scoped_log(task_log, task_ids)
+            )
+            if batch_send_recv_timeline["observed"]:
+                batch_result["urmaSendRecvTimeline"] = batch_send_recv_timeline
             if case.get("urmaPerformanceProfile") == "transport-only":
                 batch_result["urmaServerTransportSpan"] = (
                     analyze_urma_server_transport_span(
@@ -5461,6 +5778,21 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
         )
         if read_timeline_summary["observed"]:
             result["transfer"]["urmaReadTimelineSummary"] = read_timeline_summary
+        send_recv_stage_summary = urma_send_recv_stage_summary(
+            "\n".join(sample_read_logs)
+        )
+        if send_recv_stage_summary["observed"]:
+            result["transfer"]["urmaSendRecvStageSummary"] = send_recv_stage_summary
+        send_recv_timeline_summary = urma_send_recv_timeline_summary(
+            [
+                batch.get("urmaSendRecvTimeline", {})
+                for batch in result["transfer"]["batches"]["samples"]
+            ]
+        )
+        if send_recv_timeline_summary["observed"]:
+            result["transfer"]["urmaSendRecvTimelineSummary"] = (
+                send_recv_timeline_summary
+            )
         result["transfer"]["concurrentSummary"] = concurrent_batches_summary(
             result["transfer"]["batches"]["samples"]
         )
