@@ -324,7 +324,7 @@ def print_tables(records: list[dict]) -> None:
     print(
         f"{'run':<14} {'lane':>7} {'offer':>7} {'dstAdm':>7} {'READ':>7} "
         f"{'lease':>7} {'doneTx':>7} {'doneWait':>8} {'pwrWait':>8} {'pwrite':>7} "
-        f"{'crc':>7} {'recycle':>7} "
+        f"{'crc':>7} {'pwrQ':>7} {'crcQ':>7} {'recycle':>7} "
         f"{'meta':>7} {'pieceE2E':>9}"
     )
     for r in records:
@@ -348,6 +348,8 @@ def print_tables(records: list[dict]) -> None:
             f"{stage_ms('storage', 'pwriteAdmissionNs'):>8.2f} "
             f"{stage_ms('storage', 'pwriteNs'):>7.2f} "
             f"{stage_ms('storage', 'digestNs'):>7.2f} "
+            f"{stage_ms('storage', 'pwriteBlockingQueueNs'):>7.2f} "
+            f"{stage_ms('storage', 'digestBlockingQueueNs'):>7.2f} "
             f"{stage_ms('finish', 'recycleNs'):>7.2f} "
             f"{stage_ms('finish', 'metadataCommitNs'):>7.2f} "
             f"{stage_ms('attempt', 'pieceE2eNs'):>9.2f}"

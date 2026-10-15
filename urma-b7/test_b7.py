@@ -108,9 +108,8 @@ class B7Tests(unittest.TestCase):
             )
 
     def test_read_overlay_injects_shared_wr_credits(self):
-        # The per-peer WR credit pool is shared across concurrent transfers;
-        # the 8-WR default exhausts at cc8 x 16MiB / 4MiB = 32 outstanding WRs
-        # (read-perf-001 diagnosis) and fails pieces over to TCP.
+        # Shared credits and the per-Piece window are independent. Exhaustion
+        # now waits; performance cases should use the current product defaults.
         inventory = b7.select_profile(self.inventory, "read")
         _, _, generated = b7.generated_layout(inventory, "dual", "run-read-credits", None)
         case = b7.load_cases(TOOL_DIR / "cases.json")["read-piece16-cc8-post1-pipe2"]
@@ -119,7 +118,7 @@ class B7Tests(unittest.TestCase):
                 inventory, generated[role], role, "run-read-credits", case
             )
             self.assertEqual(
-                overlays[("storage", "server", "urma", "read", "maxOutstandingPerPeer")], 256
+                overlays[("storage", "server", "urma", "read", "maxOutstandingPerPeer")], 64
             )
             self.assertEqual(
                 overlays[
@@ -174,6 +173,56 @@ class B7Tests(unittest.TestCase):
                 b7.load_cases(cases_path)
         finally:
             cases_path.unlink()
+
+    def test_current_read_cases_render_and_override_stale_config(self):
+        inventory = b7.select_profile(self.inventory, "read")
+        self.assertEqual(inventory["urma"]["expectedBranch"], "urma-rm-read-only-cleanup")
+        _, _, layouts = b7.generated_layout(inventory, "dual", "read-current", None)
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        source = "storage:\n  server:\n    urma:\n      read:\n        maxReadSize: 1MiB\n        sourceWorkers: 8\n        maxOutstandingPerPeer: 256\n"
+        for role in ("parent", "child"):
+            rendered = b7.render_role_config(source, inventory, layouts[role], role,
+                                            "read-current", cases["read-auto-piece32-cc16"])
+            self.assertIn('maxReadSize: "4294967295B"', rendered)
+            self.assertIn("sourceWorkers: 0", rendered)
+            self.assertIn("maxOutstandingPerPeer: 64", rendered)
+            self.assertIn("maxOutstandingPerPiece: 8", rendered)
+            self.assertIn('totalBytes: "32GiB"', rendered)
+            self.assertIn('perPeerSourceBytes: "8GiB"', rendered)
+            for key in ("postListSize", "maxRegisteredBytes", "peerGuaranteedRxCredits"):
+                self.assertNotIn(key + ":", rendered)
+            for credits in (1, 8):
+                case = cases[f"read-backpressure-piece32-cc16-credit{credits}"]
+                overlays = b7.role_overlays(inventory, layouts[role], role, "read-current", case)
+                self.assertEqual(overlays[("storage", "server", "urma", "read", "maxOutstandingPerPeer")], credits)
+            legacy = b7.role_overlays(inventory, layouts[role], role, "read-current",
+                                      cases["read-piece64-cc16-post1-pipe2"])
+            for pool, peer in (("sourceBytes", "perPeerSourceBytes"),
+                               ("destinationBytes", "perPeerDestinationBytes")):
+                self.assertEqual(legacy[("storage", "server", "urma", "read", pool)], "2GiB")
+                self.assertEqual(legacy[("storage", "server", "urma", "read", peer)], "2GiB")
+            for workers in (1, 2, 4):
+                case = cases[f"read-workers{workers}-piece32-cc16"]
+                overlays = b7.role_overlays(inventory, layouts[role], role, "read-current", case)
+                self.assertEqual(overlays[("storage", "server", "urma", "read", "sourceWorkers")], workers)
+
+    def test_read_case_rejects_wrong_checkout_profile(self):
+        _, _, layouts = b7.generated_layout(self.inventory, "dual", "wrong-profile", None)
+        case = b7.load_cases(TOOL_DIR / "cases.json")["read-auto-piece32-cc16"]
+        with self.assertRaisesRegex(b7.B7Error, "require --profile read"):
+            b7.role_overlays(self.inventory, layouts["parent"], "parent", "wrong-profile", case)
+
+    def test_read_worker_and_piece_window_validation(self):
+        base = dict(b7.load_cases(TOOL_DIR / "cases.json")["read-auto-piece32-cc16"])
+        for key, invalid in (("sourceWorkers", (-1, 17, True, "2")),
+                             ("maxOutstandingPerPiece", (0, 1025, True, "8"))):
+            for value in invalid:
+                with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "cases.json"
+                    path.write_text(json.dumps({"schemaVersion": 1, "cases": [
+                        {**base, "urmaRead": {key: value}}]}))
+                    with self.assertRaisesRegex(b7.B7Error, key):
+                        b7.load_cases(path)
 
     def test_inventory_freezes_rm_preflight_contract(self):
         b7.validate_inventory(self.inventory)
@@ -2576,6 +2625,18 @@ storage:
         self.assertEqual(summary["finish"]["recycleNs"]["totalNs"], 5)
         self.assertEqual(summary["finish"]["metadataCommitNs"]["totalNs"], 7)
         self.assertEqual(summary["attempt"]["pieceE2eNs"]["totalNs"], 115)
+
+    def test_read_storage_queue_fields_remain_optional_for_archived_logs(self):
+        old = ("file_open_ns=10 pwrite_admission_ns=15 pwrite_ns=20 "
+               "digest_ns=30 storage_total_ns=65 "
+               "finished writing piece from RM-READ lease")
+        current = old + " digest_blocking_queue_ns=11 pwrite_blocking_queue_ns=12"
+        summary = b7.urma_read_stage_summary(old + "\n" + current)
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertEqual(summary["storage"]["pieceCount"], 2)
+        self.assertEqual(summary["storage"]["digestBlockingQueueNs"]["count"], 1)
+        self.assertEqual(summary["storage"]["digestBlockingQueueNs"]["totalNs"], 11)
+        self.assertEqual(summary["storage"]["pwriteBlockingQueueNs"]["totalNs"], 12)
 
     def test_read_stage_summary_keeps_legacy_combined_done_logs(self):
         summary = b7.urma_read_stage_summary(

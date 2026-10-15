@@ -7,7 +7,7 @@
   },
   "nodes": {
     "node1": {
-      "host": "141.61.17.196",
+      "host": "10.10.10.2",
       "user": "root",
       "roles": ["scheduler", "origin", "parent"],
       "workspaceRoot": "/home/y30083740/dragonfly",
@@ -19,7 +19,7 @@
       "schedulerConfig": "/home/y30083740/dragonfly/config/scheduler.yaml"
     },
     "node2": {
-      "host": "141.61.17.198",
+      "host": "141.61.17.188",
       "user": "root",
       "roles": ["child"],
       "workspaceRoot": "/home/y30083740/dragonfly",
@@ -63,7 +63,7 @@
       },
       "read": {
         "repoField": "readRepo",
-        "expectedBranch": "urma-read-prototype",
+        "expectedBranch": "urma-rm-read-only-cleanup",
         "transportMode": "rm",
         "tpType": "ctp",
         "requiredMaxMessageBytes": 65536,

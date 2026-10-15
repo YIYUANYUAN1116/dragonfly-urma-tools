@@ -15,11 +15,13 @@ UMDK 行为参考，不提供替代数据路径。
   传输并采集证据；
 - `cleanup`：只有显式 `--execute` 且 owner/PID/path gate 全部通过才删除本轮资源。
 
-B7 同时支持两个显式 URMA profile，但两套 Dragonfly 代码不混编：
+B7 支持三个显式 URMA profile，各自使用独立 Dragonfly checkout：
 
 - `--profile rm`（默认）：`dragonfly-client-urma-rm` / `urma-rm-prototype`，当前诊断清单生成
   `transportMode: rm`、`tpType: ctp` 和 `peerGuaranteedRxCredits`；Dragonfly 自身缺省仍为 RTP，B7 显式
   选择 CTP 是为了复测已观察到的单机 CTP 路径。资源模型是 process-wide shared endpoint + PeerTarget；
+- `--profile read`：`dragonfly-client-urma-read` / `urma-rm-read-only-cleanup`，RM READ-only，
+  当前测试栈使用 CTP/eid0。新一轮 READ 测试显式选择这个 profile；默认 CLI profile 仍为历史 `rm`。
 - `--profile rc`：`dragonfly-client-urma-private` / `urma-main`，生成 `transportMode: rc`，不写入 RM-only
   的 per-peer guarantee，资源模型是 per-peer RC Jetty/JFR lane。
 
@@ -212,10 +214,57 @@ placement，应先固定 CPU 做可比测试，再单独增加 `numactl --membin
 `origin` 目录，或将 inventory 的 `origin.directory` 改回服务实际提供的目录；B7 不会自动修改
 nginx/HTTP 服务配置。
 
+### 当前 READ-only 验证（2026-10-15）
+
+两端 checkout 使用 `urma-rm-read-only-cleanup`，构建应包含 `d79c69c` 的 WR 背压修复。
+先核对 inventory 的 SSH 地址、设备、EID、配置和工作目录，执行 `discover --profile read`；
+新的部署栈需要重新确认 provider 和撤权证据，inventory 的历史 passed 记录不能替代本次验证。
+READ profile 继续显式写 `providerRevocationValidated: true`，这只是测试配置，不是工具执行了撤权验证。
+
+READ overlay 固定当前默认：total/source/destination 32/16/16 GiB、per-peer source/destination 各8 GiB、
+quarantine 1 GiB、共享 WR64、每 Piece 窗口8、sourceWorkers=0、pwrite并发1024。
+`maxReadSize: 4294967295B` 等于当前代码默认的软件上限，覆盖源配置遗留的1MiB；
+实际 READ 大小取 Piece 剩余长度与两端 provider 上限的最小值，不会预分配4GiB内存。
+显式 case 的 `urmaRead` 覆盖这些默认值；缩小池预算时应同时将 per-peer 预算调至不超过对应池。READ profile 不再注入旧 SEND/RECV 调优字段；
+源 YAML 中已有弃用字段仍可能触发迁移警告，它们不会控制 READ。
+
+按以下顺序执行，所有新增 case 均为1GiB文件、预热1次、测量3次：
+
+| 顺序 | case | 用途 |
+|---|---|---|
+| 1 | `read-auto-piece32-cc1` | owner 同步注册基线、正确性 |
+| 2 | `read-auto-piece64-cc1` | 大Piece按provider上限自动拆分 |
+| 3 | `read-auto-piece32-cc16` | CC16基线，也是workers=0对照 |
+| 4 | `read-backpressure-piece32-cc16-credit1` / `credit8` | READ软件上限4MiB，强制共享额度竞争 |
+| 5 | `read-workers1-piece32-cc16` / `read-workers2-piece32-cc16` / `read-workers4-piece32-cc16` | 仅改变注册/清理worker数 |
+| 6 | `read-auto-piece64-cc16` | 大Piece并发容量和资源回收 |
+
+低额度用例必须同时满足校验通过、实际URMA传输、无TCP fallback、无卡死或异常资源积累。
+线程池用例先跑 `read_register_probe --file <file> --remap --threads 1,2,4,8`，
+再验证产品中与READ并行时的行为；取消、断连和shutdown仍需额外验证，case未自动注入这些故障。
+旧 `read-*post1-pipe2` case 保留其显式READ大小/预算用于历史复测，post/pipeline在READ-only中不参与调优。
+1GiB用例用于快速验证，不能替代长时间模型文件吞吐和多节点稳定性测试。
+
+```bash
+python3 b7.py discover --profile read
+# 先生成计划核对，再添加 --execute；替换 case/run-id 可执行其它组。
+python3 b7.py prepare --profile read --mode dual --run-id read-current-001 \
+  --case read-auto-piece32-cc1
+python3 b7.py prepare --profile read --mode dual --run-id read-current-001 \
+  --case read-auto-piece32-cc1 --execute
+python3 b7.py run --manifest results/read-current-001/manifest.json --execute
+python3 read_attribution_summary.py results/read-current-001
+python3 b7.py cleanup --manifest results/read-current-001/manifest.json --execute
+```
+
+新结果的 `urmaReadStageSummary.storage` 增加 `digestBlockingQueueNs` / `pwriteBlockingQueueNs`，
+归因表的 `crcQ` / `pwrQ` 为blocking线程池排队，`pwrWait` 为pwrite准入等待。
+旧日志缺少的字段不计入样本；保留原始日志用于进一步检查，分位数不能直接相加归因。
+
 ### RM READ direct source 验证
 
 `read-src-010` 与 `read-wr4-001` 已证明 32 MiB Piece 使用 1 个 32 MiB WR 优于 8 个 4 MiB WR。
-下一轮只复跑 `read-piece32-cc16-post1-pipe2`，验证 page-aligned `MappedPiece` direct registration。
+以下为当时的 page-aligned `MappedPiece` direct registration 复测步骤；当前验证矩阵见上一节。
 调度层不在本轮范围内，性能归因只使用 RM READ 的 source、READ WR/CQE、CRC、pwrite、recycle 与 metadata 阶段。
 
 ```bash

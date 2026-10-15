@@ -1498,9 +1498,140 @@
         "destinationBytes": "2GiB",
         "totalBytes": "4GiB",
         "quarantineBytes": "512MiB",
-        "maxReadSize": "64MiB"
+        "maxReadSize": "64MiB",
+        "perPeerSourceBytes": "2GiB",
+        "perPeerDestinationBytes": "2GiB"
       },
       "category": "urma-read-wr-size"
+    },
+    {
+      "name": "read-auto-piece32-cc1",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 1,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {},
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-auto-piece32-cc16",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {},
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-auto-piece64-cc1",
+      "fileClass": "1g",
+      "pieceLength": "64mib",
+      "concurrentPieceCount": 1,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {},
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-auto-piece64-cc16",
+      "fileClass": "1g",
+      "pieceLength": "64mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {},
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-backpressure-piece32-cc16-credit1",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "maxOutstandingPerPeer": 1,
+        "maxReadSize": "4MiB"
+      },
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-backpressure-piece32-cc16-credit8",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "maxOutstandingPerPeer": 8,
+        "maxReadSize": "4MiB"
+      },
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-workers1-piece32-cc16",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "sourceWorkers": 1
+      },
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-workers2-piece32-cc16",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "sourceWorkers": 2
+      },
+      "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-workers4-piece32-cc16",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "sourceWorkers": 4
+      },
+      "category": "urma-read-current-validation"
     }
   ]
 }

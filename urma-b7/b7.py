@@ -73,6 +73,8 @@ STORAGE_RX_WAIT_NS_RE = re.compile(r"\brx_window_wait_ns=(\d+)")
 STORAGE_DIGEST_NS_RE = re.compile(r"\bdigest_ns=(\d+)")
 STORAGE_PWRITE_NS_RE = re.compile(r"\bpwrite_ns=(\d+)")
 STORAGE_PWRITE_ADMISSION_NS_RE = re.compile(r"\bpwrite_admission_ns=(\d+)")
+STORAGE_DIGEST_BLOCKING_QUEUE_NS_RE = re.compile(r"\bdigest_blocking_queue_ns=(\d+)")
+STORAGE_PWRITE_BLOCKING_QUEUE_NS_RE = re.compile(r"\bpwrite_blocking_queue_ns=(\d+)")
 STORAGE_PWRITE_CALLS_RE = re.compile(r"\bpwrite_calls=(\d+)")
 READ_PWRITE_ACTIVE_RE = re.compile(r"\bpwrite_active_at_start=(\d+)")
 STORAGE_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
@@ -2409,6 +2411,8 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         ("pwriteNs", STORAGE_PWRITE_NS_RE),
         ("digestNs", STORAGE_DIGEST_NS_RE),
         ("storageTotalNs", STORAGE_TOTAL_NS_RE),
+        ("digestBlockingQueueNs", STORAGE_DIGEST_BLOCKING_QUEUE_NS_RE),
+        ("pwriteBlockingQueueNs", STORAGE_PWRITE_BLOCKING_QUEUE_NS_RE),
     )
     finish_fields = (
         ("storageWriteNs", READ_STORAGE_WRITE_NS_RE),
@@ -2431,8 +2435,8 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
     storage, storage_bad = samples(
         "finished writing piece from RM-READ lease",
         tuple(pattern for _, pattern in storage_fields),
-        # Logs written before pwrite admission control have no wait field.
-        optional_indexes=frozenset((1,)),
+        # Older logs lack admission and blocking-pool queue fields.
+        optional_indexes=frozenset((1, 5, 6)),
     )
     finish, finish_bad = samples(
         "finished committing urma READ piece to storage", tuple(pattern for _, pattern in finish_fields)
@@ -3966,6 +3970,8 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 "perPeerDestinationBytes",
                 "quarantineBytes",
                 "maxOutstandingPerPeer",
+                "maxOutstandingPerPiece",
+                "sourceWorkers",
                 "maxReadSize",
                 "maxConcurrentStorageWrites",
             }
@@ -3986,14 +3992,21 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                     raise B7Error(
                         f"case {case['name']} urmaRead.{key} must be a human-readable byte size"
                     )
-            for key in ("maxOutstandingPerPeer", "maxConcurrentStorageWrites"):
+            for key in ("maxOutstandingPerPeer", "maxOutstandingPerPiece", "maxConcurrentStorageWrites"):
                 if key in urma_read and not (
-                    isinstance(urma_read[key], int)
+                    type(urma_read[key]) is int
                     and 1 <= urma_read[key] <= 1024
                 ):
                     raise B7Error(
                         f"case {case['name']} urmaRead.{key} must be an int in 1..=1024"
                     )
+            if "sourceWorkers" in urma_read and not (
+                type(urma_read["sourceWorkers"]) is int
+                and 0 <= urma_read["sourceWorkers"] <= 16
+            ):
+                raise B7Error(
+                    f"case {case['name']} urmaRead.sourceWorkers must be an int in 0..=16"
+                )
         if protocol == "tcp" and topology != "queue":
             raise B7Error(
                 f"case {case['name']} protocol tcp only supports queue topology"
@@ -4124,6 +4137,8 @@ def role_overlays(
     run_id: str,
     case: dict[str, Any],
 ) -> dict[tuple[str, ...], Any]:
+    if "urmaRead" in case and inventory.get("selectedProfile") != "read":
+        raise B7Error("urmaRead cases require --profile read")
     node = inventory["nodes"][layout["node"]]
     ports = layout["ports"]
     is_parent = role == "parent"
@@ -4190,54 +4205,34 @@ def role_overlays(
             "peerGuaranteedRxCredits", inventory["urma"].get("peerGuaranteedRxCredits", 0)
         )
     if inventory.get("selectedProfile") == "read":
-        # Enable the RM-READ-only data plane on both roles. The budgets live
-        # in the read config section (validated against each other by the
-        # dfdaemon config schema) and are overrideable per case via urmaRead.
+        # Pin current READ defaults explicitly so stale operator configs cannot
+        # silently change a comparison. A case may override each field.
+        # UINT32_MAX is the software ceiling; Piece/provider limits still split
+        # WRs. This is not a request to allocate a buffer of that size.
         read = case.get("urmaRead", {})
-        overlays[("storage", "server", "urma", "read", "providerRevocationValidated")] = read.get(
-            "providerRevocationValidated", True
-        )
-        overlays[("storage", "server", "urma", "read", "totalBytes")] = read.get(
-            "totalBytes", "2GiB"
-        )
-        overlays[("storage", "server", "urma", "read", "sourceBytes")] = read.get(
-            "sourceBytes", "1GiB"
-        )
-        overlays[("storage", "server", "urma", "read", "destinationBytes")] = read.get(
-            "destinationBytes", "1GiB"
-        )
-        # READ registers one whole registered destination/source buffer per
-        # in-flight piece, and each allocation is additionally capped by the
-        # per-peer budgets. The built-in defaults (4MiB) assume 1MiB RM-era
-        # chunks and would reject whole-piece allocations, so default the
-        # per-peer budgets to their pool values unless a case overrides them.
-        source_budget = read.get("sourceBytes", "1GiB")
-        destination_budget = read.get("destinationBytes", "1GiB")
-        overlays[("storage", "server", "urma", "read", "perPeerSourceBytes")] = read.get(
-            "perPeerSourceBytes", source_budget
-        )
-        overlays[("storage", "server", "urma", "read", "perPeerDestinationBytes")] = read.get(
-            "perPeerDestinationBytes", destination_budget
-        )
-        # A failed owner is quarantined with its full piece charge, so the
-        # quarantine budget must hold at least a couple of the largest pieces.
-        overlays[("storage", "server", "urma", "read", "quarantineBytes")] = read.get(
-            "quarantineBytes", "128MiB"
-        )
-        # The per-peer WR credit pool is shared by ALL concurrent piece
-        # transfers towards one parent: demand is roughly concurrentPieceCount
-        # x pieceLength / maxReadSize. The 4-WR default (sized for one legacy
-        # transfer) exhausts under any concurrency and fails pieces over to
-        # TCP; 256 covers cc32 x 16MiB pieces with 1MiB maxReadSize.
-        overlays[("storage", "server", "urma", "read", "maxOutstandingPerPeer")] = read.get(
-            "maxOutstandingPerPeer", 256
-        )
-        overlays[("storage", "server", "urma", "read", "maxReadSize")] = read.get(
-            "maxReadSize", "1MiB"
-        )
-        overlays[("storage", "server", "urma", "read", "maxConcurrentStorageWrites")] = read.get(
-            "maxConcurrentStorageWrites", 1024
-        )
+        defaults = {
+            "providerRevocationValidated": True,
+            "totalBytes": "32GiB",
+            "sourceBytes": "16GiB",
+            "destinationBytes": "16GiB",
+            "perPeerSourceBytes": "8GiB",
+            "perPeerDestinationBytes": "8GiB",
+            "quarantineBytes": "1GiB",
+            "maxOutstandingPerPeer": 64,
+            "maxOutstandingPerPiece": 8,
+            "sourceWorkers": 0,
+            "maxReadSize": "4294967295B",
+            "maxConcurrentStorageWrites": 1024,
+        }
+        for key, default in defaults.items():
+            overlays[("storage", "server", "urma", "read", key)] = read.get(key, default)
+        # READ-only no longer consumes SEND/RECV tuning. Keep historical RM/RC
+        # overlays on their own profiles, without adding deprecated knobs here.
+        for key in (
+            "maxRegisteredBytes", "txRegisteredBytes", "maxInflightChunks",
+            "postListSize", "pipelineDepth", "peerGuaranteedRxCredits",
+        ):
+            overlays.pop(("storage", "server", "urma", key), None)
     return overlays
 
 
