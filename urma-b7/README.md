@@ -217,6 +217,8 @@ nginx/HTTP 服务配置。
 ### 当前 READ-only 验证（2026-10-15）
 
 两端 checkout 使用 `urma-rm-read-only-cleanup`，构建应包含 `d79c69c` 的 WR 背压修复。
+inventory 的 `readRepo` 目录名接受 `dragonfly-client-urma-read` 或
+`dragonfly-client-urma-rm-read-only-cleanup`；路径应指向实际构建的 checkout，分支校验保持不变。
 先核对 inventory 的 SSH 地址、设备、EID、配置和工作目录，执行 `discover --profile read`；
 新的部署栈需要重新确认 provider 和撤权证据，inventory 的历史 passed 记录不能替代本次验证。
 READ profile 继续显式写 `providerRevocationValidated: true`，这只是测试配置，不是工具执行了撤权验证。

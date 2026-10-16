@@ -224,6 +224,23 @@ class B7Tests(unittest.TestCase):
                     with self.assertRaisesRegex(b7.B7Error, key):
                         b7.load_cases(path)
 
+    def test_read_checkout_directory_alias(self):
+        for basename in ("dragonfly-client-urma-read",
+                         "dragonfly-client-urma-rm-read-only-cleanup"):
+            with self.subTest(basename=basename):
+                inventory = json.loads((TOOL_DIR / "inventory.json").read_text())
+                for node in inventory["nodes"].values():
+                    node["readRepo"] = str(PurePosixPath(node["workspaceRoot"]) / basename)
+                b7.validate_inventory(inventory)
+                selected = b7.select_profile(inventory, "read")
+                for node in selected["nodes"].values():
+                    self.assertEqual(node["repo"], node["readRepo"])
+                    self.assertEqual(PurePosixPath(node["repo"]).name, basename)
+                self.assertEqual(selected["urma"]["expectedBranch"], "urma-rm-read-only-cleanup")
+        inventory["nodes"]["node1"]["readRepo"] = "/tmp/unexpected-checkout"
+        with self.assertRaisesRegex(b7.B7Error, "READ repo must be"):
+            b7.validate_inventory(inventory)
+
     def test_inventory_freezes_rm_preflight_contract(self):
         b7.validate_inventory(self.inventory)
         for node in self.inventory["nodes"].values():

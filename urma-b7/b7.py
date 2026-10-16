@@ -174,8 +174,14 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
             raise B7Error(f"node {name} RM repo must be dragonfly-client-urma-rm")
         if PurePosixPath(node["rcRepo"]).name != "dragonfly-client-urma-private":
             raise B7Error(f"node {name} RC baseline repo must be dragonfly-client-urma-private")
-        if PurePosixPath(node["readRepo"]).name != "dragonfly-client-urma-read":
-            raise B7Error(f"node {name} READ repo must be dragonfly-client-urma-read")
+        if PurePosixPath(node["readRepo"]).name not in (
+            "dragonfly-client-urma-read",
+            "dragonfly-client-urma-rm-read-only-cleanup",
+        ):
+            raise B7Error(
+                f"node {name} READ repo must be dragonfly-client-urma-read "
+                "or dragonfly-client-urma-rm-read-only-cleanup"
+            )
         if len({node["rmRepo"], node["rcRepo"], node["readRepo"]}) != 3:
             raise B7Error(f"node {name} RM, RC, and READ repos must be distinct")
     single_host = inventory.get("singleHost")
