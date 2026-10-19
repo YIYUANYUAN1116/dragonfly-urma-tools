@@ -184,7 +184,8 @@ def pool_logs(logs: list[Path], warmup: bool) -> list[Path]:
     ]
     if picked or warmup:
         return picked
-    return [log for log in logs if readable(log) and "sample-" not in log.name]
+    return [log for log in logs if readable(log)
+            and ".sample-" not in log.name and ".warmup-" not in log.name]
 
 
 def recompute_stage_summary(run_dir: Path, manifest: dict):

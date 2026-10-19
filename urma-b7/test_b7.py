@@ -166,6 +166,16 @@ class B7Tests(unittest.TestCase):
             self.assertIn("cache-summary", output.getvalue())
             self.assertEqual(record["pools"]["samples"]["parent"]["source_cached_done"], 32)
 
+    def test_read_attribution_does_not_promote_failed_warmup_to_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "parent.warmup-001.log"
+            log.write_text(self.cached_parent_log())
+            self.assertEqual(read_attribution.pool_logs([log], False), [])
+            self.assertEqual(read_attribution.pool_logs([log], True), [log])
+            legacy = Path(tmp) / "parent.legacy.log"
+            legacy.write_text(self.cached_parent_log())
+            self.assertEqual(read_attribution.pool_logs([log, legacy], False), [legacy])
+
     def setUp(self):
         self.inventory = json.loads((TOOL_DIR / "inventory.json").read_text(encoding="utf-8"))
         # Existing executor tests exercise remote orchestration rather than the
@@ -324,7 +334,7 @@ class B7Tests(unittest.TestCase):
 
     def test_read_checkout_directory_alias(self):
         for basename in ("dragonfly-client-urma-read",
-                         "dragonfly-client-urma-rm-read-only-cleanup"):
+                         "dragonfly-client-urma-rm-read-only-cleanup", "urma-cached-source"):
             with self.subTest(basename=basename):
                 inventory = json.loads((TOOL_DIR / "inventory.json").read_text())
                 for node in inventory["nodes"].values():
