@@ -27,6 +27,9 @@
  *   M4 pwrite    the same pwritev from T threads, aggregate + per-call p50
  *   M5 tmpfs     M3/M4 against a tmpfs dir: page cache, no backing store
  *   M6 O_DIRECT  M3/M4 with O_DIRECT: skips the page-cache copy
+ *   M7 mmap      the M3 layout mapped MAP_SHARED and written with memcpy: the
+ *                same page-cache write without a write syscall, so M7 against
+ *                M3 same-file separates the inode lock from the copy
  *
  * By default each thread writes its own file. --same-file instead has every
  * thread write a disjoint region of one shared file, which is the product's
@@ -39,12 +42,19 @@
  * writes extend the files and pay block allocation, so the two layouts are only
  * comparable against the product when it is on.
  *
+ * M7 always ftruncates the file to its final length before mapping, because
+ * mmap cannot extend past EOF (the first touch would raise SIGBUS); --fallocate
+ * then only adds the product's block reservation on top. It needs no extra flag
+ * and runs against --dir at every --threads value, right after M3's disk row.
+ *
  * Read the result against the real path:
  *   M3 p50 near M1 p50      -> the buffered pwrite is copy-bound (memory)
  *   M4 aggregate ~ M2 (and not T x M3) -> concurrent writes share one ceiling
  *   M5 ~ M3                 -> the device and dirty throttling are not it
  *   M6 << M3                -> skipping the page-cache copy is the lever
  *   same-file << per-file   -> the cost is same-inode concurrency, not hardware
+ *   M3 samefile collapses but M7 samefile holds -> the serializer is the write
+ *   syscall's inode lock, not the copy and not the page cache
  *
  * The probe times only its own operations. It is a synthetic reproduction of
  * the storage step, so use it to decide *where* the cost is, then confirm any
@@ -84,6 +94,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -486,6 +497,193 @@ cleanup:
     return ok ? 0 : -1;
 }
 
+/* -------------------------------------------------------------- mmap + memcpy */
+
+struct mmap_args {
+    uint8_t *map; /* this thread's own mapping, starting at its base offset */
+    uint8_t *src;
+    uint64_t len;
+    int iters;
+    uint64_t *ns;
+    struct start_gate *gate;
+    uint64_t *sink;
+};
+
+static void *mmap_worker(void *argp)
+{
+    struct mmap_args *a = (struct mmap_args *)argp;
+    uint64_t checksum = 0;
+
+    memset(a->src, 0x3c, (size_t)a->len);
+    start_gate_wait(a->gate);
+    for (int i = 0; i < a->iters; i++) {
+        uint8_t *dst = a->map + (uint64_t)i * a->len;
+        uint64_t t0 = monotonic_ns();
+        memcpy(dst, a->src, (size_t)a->len);
+        uint64_t t1 = monotonic_ns();
+        a->ns[i] = t1 - t0;
+    }
+
+    /* Read the mapping back so the compiler cannot drop the copies. */
+    for (uint64_t off = 0; off < a->len; off += PAGE_BYTES) {
+        checksum += a->map[off];
+    }
+    *a->sink = checksum;
+    return NULL;
+}
+
+/* Size a file before mapping it. mmap cannot extend past EOF, so the ftruncate
+ * is mandatory here even without --fallocate; the fallocate only adds the
+ * product's block reservation. Returns 0 on success, -1 on a hard error. */
+static int size_for_mmap(int fd, uint64_t total, int prealloc, const char *dir)
+{
+    if (ftruncate(fd, (off_t)total) != 0) {
+        return -1;
+    }
+    if (prealloc && fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, (off_t)total) != 0) {
+        if (errno != EOPNOTSUPP && errno != ENOSYS) {
+            return -1;
+        }
+        printf("      note: %s does not support fallocate, not preallocated\n", dir);
+    }
+    return 0;
+}
+
+/* The M7 counterpart of run_write_target: the same file layout, but each thread
+ * memcpys into a MAP_SHARED window instead of calling pwritev, so no write
+ * syscall and no per-inode lock is involved. */
+static int run_mmap_target(const char *target_label, const char *dir, int same_file,
+                           int prealloc, uint32_t threads, uint64_t len, int iters,
+                           uint8_t **srcs)
+{
+    pthread_t tids[MAX_THREADS];
+    struct mmap_args args[MAX_THREADS];
+    struct start_gate gate = {0};
+    struct samples pooled = {0};
+    uint64_t sinks[MAX_THREADS];
+    int fds[MAX_THREADS];
+    uint8_t *maps[MAX_THREADS];
+    uint32_t created = 0;
+    uint64_t wall_ns;
+    int ok = 1;
+    int flags = O_RDWR | O_CREAT | O_TRUNC;
+    char layout[24];
+    uint64_t per_file = (uint64_t)iters * len;
+
+    snprintf(layout, sizeof(layout), "%s%s", same_file ? "samefile" : "perfile",
+             prealloc ? "+pre" : "");
+
+    g_path_count = 0;
+    for (uint32_t t = 0; t < threads; t++) {
+        fds[t] = -1;
+        maps[t] = NULL;
+    }
+    if (same_file) {
+        snprintf(g_paths[0], sizeof(g_paths[0]), "%s/membw.%d.mmap.shared.bin", dir,
+                 (int)getpid());
+        int fd = open(g_paths[0], flags, 0644);
+        if (fd < 0) {
+            printf("FAIL open %s: %s\n", g_paths[0], strerror(errno));
+            ok = 0;
+            goto cleanup;
+        }
+        for (uint32_t t = 0; t < threads; t++) {
+            fds[t] = fd;
+        }
+        g_path_count = 1;
+    } else {
+        for (uint32_t t = 0; t < threads; t++) {
+            snprintf(g_paths[t], sizeof(g_paths[t]), "%s/membw.%d.%u.mmap.bin", dir,
+                     (int)getpid(), t);
+            fds[t] = open(g_paths[t], flags, 0644);
+            if (fds[t] < 0) {
+                printf("FAIL open %s: %s\n", g_paths[t], strerror(errno));
+                ok = 0;
+                goto cleanup;
+            }
+            g_path_count = (sig_atomic_t)(t + 1);
+        }
+    }
+    if (same_file) {
+        if (size_for_mmap(fds[0], per_file * (uint64_t)threads, prealloc, dir) != 0) {
+            printf("FAIL size file for %s: %s\n", target_label, strerror(errno));
+            ok = 0;
+            goto cleanup;
+        }
+    } else {
+        for (uint32_t t = 0; t < threads; t++) {
+            if (size_for_mmap(fds[t], per_file, prealloc, dir) != 0) {
+                printf("FAIL size file for %s: %s\n", target_label, strerror(errno));
+                ok = 0;
+                goto cleanup;
+            }
+        }
+    }
+    for (uint32_t t = 0; t < threads; t++) {
+        uint64_t off = same_file ? (uint64_t)t * per_file : 0;
+        void *p = mmap(NULL, (size_t)per_file, PROT_READ | PROT_WRITE, MAP_SHARED, fds[t],
+                       (off_t)off);
+        if (p == MAP_FAILED) {
+            printf("FAIL mmap for %s: %s\n", target_label, strerror(errno));
+            ok = 0;
+            goto cleanup;
+        }
+        maps[t] = (uint8_t *)p;
+    }
+    for (uint32_t t = 0; t < threads; t++) {
+        args[t].map = maps[t];
+        args[t].src = srcs[t];
+        args[t].len = len;
+        args[t].iters = iters;
+        args[t].ns = &pooled.ns[t * iters];
+        args[t].gate = &gate;
+        args[t].sink = &sinks[t];
+        if (pthread_create(&tids[t], NULL, mmap_worker, &args[t]) != 0) {
+            printf("FAIL pthread_create for %s\n", target_label);
+            ok = 0;
+            break;
+        }
+        created++;
+    }
+    start_gate_release(&gate, created);
+    wall_ns = monotonic_ns();
+    for (uint32_t t = 0; t < created; t++) {
+        pthread_join(tids[t], NULL);
+    }
+    wall_ns = monotonic_ns() - wall_ns;
+
+    pooled.count = (size_t)created * (size_t)iters;
+    struct stats st;
+    if (summarize(&pooled, &st) == 0) {
+        printf("%-7s %-8s %-8s %-12s threads=%-2u ops=%-4zu p50=%8.3f ms p95=%8.3f ms  agg=%8.1f GiB/s\n",
+               "M7", target_label, "mmap", layout, threads, pooled.count,
+               (double)st.p50 / 1e6, (double)st.p95 / 1e6,
+               gib_per_s(len * pooled.count, wall_ns));
+    }
+
+cleanup:
+    for (uint32_t t = 0; t < threads; t++) {
+        if (maps[t] != NULL) {
+            munmap(maps[t], (size_t)per_file);
+        }
+    }
+    if (same_file) {
+        if (fds[0] >= 0) {
+            close(fds[0]);
+            unlink(g_paths[0]);
+        }
+    } else {
+        for (uint32_t t = 0; t < threads; t++) {
+            if (fds[t] >= 0) {
+                close(fds[t]);
+                unlink(g_paths[t]);
+            }
+        }
+    }
+    g_path_count = 0;
+    return ok ? 0 : -1;
+}
+
 /* ------------------------------------------------------------------------ main */
 
 static int parse_threads(const char *s, uint32_t *out, size_t *count)
@@ -644,12 +842,15 @@ int main(int argc, char **argv)
             goto out;
         }
     }
-    printf("\n== M3-M6 pwritev %s (per-op p50; agg over all threads wall) ==\n",
+    printf("\n== M3-M6 pwritev, M7 mmap+memcpy %s (per-op p50; agg over all threads wall) ==\n",
            odirect ? "buffered + O_DIRECT" : "buffered");
     for (size_t ti = 0; ti < thread_count; ti++) {
         uint32_t t = thread_list[ti];
         if (dir != NULL) {
             if (run_write_target("disk", dir, 0, same_file, prealloc, t, len, iters, srcs) != 0) {
+                rc = 1;
+            }
+            if (run_mmap_target("disk", dir, same_file, prealloc, t, len, iters, srcs) != 0) {
                 rc = 1;
             }
             if (odirect) {
@@ -678,6 +879,10 @@ int main(int argc, char **argv)
     printf("samefile collapses toward the product's ~24 ms while perfile stays\n");
     printf("fast, the cost is same-inode concurrency in the filesystem, not the\n");
     printf("copy and not the device.\n");
+    printf("Then compare M7 mmap against M3 pwritev at the same samefile thread\n");
+    printf("count: M7 keeps the same copy into the page cache but removes the\n");
+    printf("write syscall and its per-inode lock, so if M7 holds its p50 while\n");
+    printf("M3 collapses, the serializer is the syscall's inode lock, not memory.\n");
 
 out:
     for (uint32_t t = 0; t < max_t; t++) {
