@@ -180,10 +180,11 @@ def validate_inventory(inventory: dict[str, Any]) -> None:
         if PurePosixPath(node["readRepo"]).name not in (
             "dragonfly-client-urma-read",
             "dragonfly-client-urma-rm-read-only-cleanup",
+            "urma-cached-source",
         ):
             raise B7Error(
-                f"node {name} READ repo must be dragonfly-client-urma-read "
-                "or dragonfly-client-urma-rm-read-only-cleanup"
+                f"node {name} READ repo must be dragonfly-client-urma-read, "
+                "dragonfly-client-urma-rm-read-only-cleanup, or urma-cached-source"
             )
         if len({node["rmRepo"], node["rcRepo"], node["readRepo"]}) != 3:
             raise B7Error(f"node {name} RM, RC, and READ repos must be distinct")
