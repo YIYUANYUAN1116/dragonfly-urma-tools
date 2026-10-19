@@ -268,6 +268,22 @@ storage 组另含 `fileOpenNs`、`pwriteCalls`（每 Piece 的 pwritev 次数）
 归因表读取时若 manifest 缺少这些字段，会从 `evidence/child.*.tasks.log` 重新解析补齐。
 旧日志缺少的字段不计入样本；保留原始日志用于进一步检查，分位数不能直接相加归因。
 
+child 落盘阶段 `pwrite` 占 Piece E2E 约 65-75%，而 `pwrWait`/`pwrQ` 都接近 0、`pwrAct` 已达
+~11 并发，说明瓶颈不在限流、线程池或并发度，而在并发 pwrite 共享的 page-cache 拷贝带宽。
+`read_membw_probe.c` 用来验证这一点（对照 memcpy 上限 / buffered pwrite / tmpfs / O_DIRECT，
+形状为 `--len` × N 并发，不触碰产品代码）：
+
+```bash
+cc -O2 -Wall -Wextra -pthread read_membw_probe.c -o read_membw_probe
+# 在 child 节点、指向产品实际写入的同一文件系统
+./read_membw_probe --dir /path/to/storage --tmpfs /dev/shm --odirect \
+  --len 33554432 --iters 8 --threads 1,2,4,8,16
+```
+
+读法见 probe 头部注释：M3 buffered p50 接近 2×M1 memcpy p50 即拷贝受限；并发 pwrite 聚合
+不再随线程数线性增长而 memcpy 仍在增长，说明共享内存上限；tmpfs ≈ disk 排除设备与脏页节流；
+O_DIRECT ≪ buffered 即跳过 page-cache 拷贝的收益上限。
+
 ### RM READ direct source 验证
 
 `read-src-010` 与 `read-wr4-001` 已证明 32 MiB Piece 使用 1 个 32 MiB WR 优于 8 个 4 MiB WR。
