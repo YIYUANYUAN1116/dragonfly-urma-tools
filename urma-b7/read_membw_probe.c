@@ -28,11 +28,18 @@
  *   M5 tmpfs     M3/M4 against a tmpfs dir: page cache, no backing store
  *   M6 O_DIRECT  M3/M4 with O_DIRECT: skips the page-cache copy
  *
+ * By default each thread writes its own file. --same-file instead has every
+ * thread write a disjoint region of one shared file, which is the product's
+ * real shape (many lanes into a single task file). If per-file pwrite is fast
+ * but same-file pwrite collapses to the product's ~24 ms, the cost is per-inode
+ * serialization in the filesystem, not the copy and not the device.
+ *
  * Read the result against the real path:
  *   M3 p50 near M1 p50      -> the buffered pwrite is copy-bound (memory)
  *   M4 aggregate ~ M2 (and not T x M3) -> concurrent writes share one ceiling
  *   M5 ~ M3                 -> the device and dirty throttling are not it
  *   M6 << M3                -> skipping the page-cache copy is the lever
+ *   same-file << per-file   -> the cost is same-inode concurrency, not hardware
  *
  * The probe times only its own operations. It is a synthetic reproduction of
  * the storage step, so use it to decide *where* the cost is, then confirm any
@@ -45,6 +52,8 @@
  *   ./read_membw_probe --dir /path/to/storage --len 33554432 --threads 1,2,4,8,16
  *   # add a tmpfs and an O_DIRECT comparison to separate page cache from device
  *   ./read_membw_probe --dir /path/to/storage --tmpfs /dev/shm --odirect
+ *   # the product shape: many lanes into one file, to test same-inode contention
+ *   ./read_membw_probe --dir /path/to/storage --same-file --threads 1,2,4,8,16
  *
  * Each buffered run writes --iters * --len bytes per thread into freshly
  * created files and unlinks them on exit, so the largest thread count needs
@@ -52,8 +61,8 @@
  * --iters if the target is small, and keep the tmpfs target off a filesystem
  * that cannot hold that footprint.
  *
- * argv: [--dir PATH] [--tmpfs PATH] [--odirect] [--len N] [--iters N]
- *       [--threads LIST]
+ * argv: [--dir PATH] [--tmpfs PATH] [--odirect] [--same-file] [--len N]
+ *       [--iters N] [--threads LIST]
  * exit code: 0 = completed, 1 = usage or setup error.
  */
 
@@ -258,6 +267,7 @@ struct write_args {
     int fd;
     uint8_t *src;
     uint64_t len;
+    uint64_t base_offset;
     int iters;
     uint64_t *ns;
     struct start_gate *gate;
@@ -273,7 +283,7 @@ static void *write_worker(void *argp)
     memset(a->src, 0x3c, (size_t)a->len);
     start_gate_wait(a->gate);
     for (int i = 0; i < a->iters; i++) {
-        uint64_t offset = (uint64_t)i * a->len;
+        uint64_t offset = a->base_offset + (uint64_t)i * a->len;
         iov.iov_base = a->src;
         iov.iov_len = (size_t)a->len;
         uint64_t t0 = monotonic_ns();
@@ -310,7 +320,7 @@ static const char *mode_name(int odirect)
 }
 
 static int run_write_target(const char *target_label, const char *dir, int odirect,
-                            uint32_t threads, uint64_t len, int iters,
+                            int same_file, uint32_t threads, uint64_t len, int iters,
                             uint8_t **srcs)
 {
     pthread_t tids[MAX_THREADS];
@@ -324,6 +334,7 @@ static int run_write_target(const char *target_label, const char *dir, int odire
     int flags = O_WRONLY | O_CREAT | O_TRUNC;
     size_t failed = 0;
     int first_errno = 0;
+    const char *layout = same_file ? "samefile" : "perfile";
 
     if (odirect) {
         flags |= O_DIRECT;
@@ -332,20 +343,37 @@ static int run_write_target(const char *target_label, const char *dir, int odire
     for (uint32_t t = 0; t < threads; t++) {
         fds[t] = -1;
     }
-    for (uint32_t t = 0; t < threads; t++) {
-        snprintf(g_paths[t], sizeof(g_paths[t]), "%s/membw.%d.%u.bin", dir, (int)getpid(), t);
-        fds[t] = open(g_paths[t], flags, 0644);
-        if (fds[t] < 0) {
-            printf("FAIL open %s: %s\n", g_paths[t], strerror(errno));
+    if (same_file) {
+        /* One file shared by every thread, each writing a disjoint region: the
+         * product shape, where many lanes land in a single task file. */
+        snprintf(g_paths[0], sizeof(g_paths[0]), "%s/membw.%d.shared.bin", dir, (int)getpid());
+        int fd = open(g_paths[0], flags, 0644);
+        if (fd < 0) {
+            printf("FAIL open %s: %s\n", g_paths[0], strerror(errno));
             ok = 0;
             goto cleanup;
         }
-        g_path_count = (sig_atomic_t)(t + 1);
+        for (uint32_t t = 0; t < threads; t++) {
+            fds[t] = fd;
+        }
+        g_path_count = 1;
+    } else {
+        for (uint32_t t = 0; t < threads; t++) {
+            snprintf(g_paths[t], sizeof(g_paths[t]), "%s/membw.%d.%u.bin", dir, (int)getpid(), t);
+            fds[t] = open(g_paths[t], flags, 0644);
+            if (fds[t] < 0) {
+                printf("FAIL open %s: %s\n", g_paths[t], strerror(errno));
+                ok = 0;
+                goto cleanup;
+            }
+            g_path_count = (sig_atomic_t)(t + 1);
+        }
     }
     for (uint32_t t = 0; t < threads; t++) {
         args[t].fd = fds[t];
         args[t].src = srcs[t];
         args[t].len = len;
+        args[t].base_offset = same_file ? (uint64_t)t * (uint64_t)iters * len : 0;
         args[t].iters = iters;
         args[t].ns = &pooled.ns[t * iters];
         args[t].gate = &gate;
@@ -372,22 +400,29 @@ static int run_write_target(const char *target_label, const char *dir, int odire
     pooled.count = (size_t)created * (size_t)iters;
     struct stats st;
     if (summarize(&pooled, &st) == 0) {
-        printf("%-7s %-8s %-8s threads=%-2u ops=%-4zu p50=%8.3f ms p95=%8.3f ms  agg=%8.1f GiB/s\n",
-               "M3-M6", target_label, mode_name(odirect), threads, pooled.count,
+        printf("%-7s %-8s %-8s %-8s threads=%-2u ops=%-4zu p50=%8.3f ms p95=%8.3f ms  agg=%8.1f GiB/s\n",
+               "M3-M6", target_label, mode_name(odirect), layout, threads, pooled.count,
                (double)st.p50 / 1e6, (double)st.p95 / 1e6,
                gib_per_s((len * pooled.count) - failed * len, wall_ns));
     }
     if (failed) {
-        printf("      %s mode=%s: %zu/%zu writes failed, first errno=%d (%s)\n",
-               target_label, mode_name(odirect), failed, pooled.count, first_errno,
+        printf("      %s mode=%s layout=%s: %zu/%zu writes failed, first errno=%d (%s)\n",
+               target_label, mode_name(odirect), layout, failed, pooled.count, first_errno,
                strerror(first_errno));
     }
 
 cleanup:
-    for (uint32_t t = 0; t < threads; t++) {
-        if (fds[t] >= 0) {
-            close(fds[t]);
-            unlink(g_paths[t]);
+    if (same_file) {
+        if (fds[0] >= 0) {
+            close(fds[0]);
+            unlink(g_paths[0]);
+        }
+    } else {
+        for (uint32_t t = 0; t < threads; t++) {
+            if (fds[t] >= 0) {
+                close(fds[t]);
+                unlink(g_paths[t]);
+            }
         }
     }
     g_path_count = 0;
@@ -439,6 +474,7 @@ int main(int argc, char **argv)
     const char *dir = NULL;
     const char *tmpfs = NULL;
     int odirect = 0;
+    int same_file = 0;
     uint64_t len = DEFAULT_LEN;
     int iters = DEFAULT_ITERS;
     uint32_t thread_list[MAX_THREADS];
@@ -457,6 +493,8 @@ int main(int argc, char **argv)
             tmpfs = argv[++i];
         } else if (strcmp(argv[i], "--odirect") == 0) {
             odirect = 1;
+        } else if (strcmp(argv[i], "--same-file") == 0) {
+            same_file = 1;
         } else if (strcmp(argv[i], "--len") == 0 && i + 1 < (size_t)argc) {
             len = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < (size_t)argc) {
@@ -468,8 +506,8 @@ int main(int argc, char **argv)
                 return 1;
             }
         } else {
-            printf("usage: %s [--dir PATH] [--tmpfs PATH] [--odirect] [--len N] "
-                   "[--iters N] [--threads LIST]\n", argv[0]);
+            printf("usage: %s [--dir PATH] [--tmpfs PATH] [--odirect] [--same-file] "
+                   "[--len N] [--iters N] [--threads LIST]\n", argv[0]);
             return 1;
         }
     }
@@ -513,6 +551,9 @@ int main(int argc, char **argv)
     if (odirect) {
         printf("O_DIRECT             : on (disk target only)\n");
     }
+    if (same_file) {
+        printf("layout               : same-file (all threads into one file)\n");
+    }
 
     /* One src per possible thread, plus one dst per thread for the memcpy
      * ceiling. The pwrite path only needs src (the page cache is the dst). */
@@ -545,17 +586,17 @@ int main(int argc, char **argv)
     for (size_t ti = 0; ti < thread_count; ti++) {
         uint32_t t = thread_list[ti];
         if (dir != NULL) {
-            if (run_write_target("disk", dir, 0, t, len, iters, srcs) != 0) {
+            if (run_write_target("disk", dir, 0, same_file, t, len, iters, srcs) != 0) {
                 rc = 1;
             }
             if (odirect) {
-                if (run_write_target("disk", dir, 1, t, len, iters, srcs) != 0) {
+                if (run_write_target("disk", dir, 1, same_file, t, len, iters, srcs) != 0) {
                     rc = 1;
                 }
             }
         }
         if (tmpfs != NULL) {
-            if (run_write_target("tmpfs", tmpfs, 0, t, len, iters, srcs) != 0) {
+            if (run_write_target("tmpfs", tmpfs, 0, same_file, t, len, iters, srcs) != 0) {
                 rc = 1;
             }
         }
@@ -570,6 +611,10 @@ int main(int argc, char **argv)
     printf("scaling while memcpy does not, the writes share a memory ceiling.\n");
     printf("tmpfs ~ disk rules out the device and dirty throttling; odirect <<\n");
     printf("buffered is the size of the win from skipping the page-cache copy.\n");
+    printf("Compare samefile vs perfile rows at the same thread count: if\n");
+    printf("samefile collapses toward the product's ~24 ms while perfile stays\n");
+    printf("fast, the cost is same-inode concurrency in the filesystem, not the\n");
+    printf("copy and not the device.\n");
 
 out:
     for (uint32_t t = 0; t < max_t; t++) {
