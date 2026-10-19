@@ -283,12 +283,16 @@ cc -O2 -Wall -Wextra -pthread read_membw_probe.c -o read_membw_probe
 # 复刻产品形状：所有线程写同一个文件的不同 offset
 ./read_membw_probe --dir /path/to/storage --same-file \
   --len 33554432 --iters 8 --threads 1,2,4,8,16
+# 对齐产品的预分配：create_task 会先 set_len + fallocate(KEEP_SIZE)
+./read_membw_probe --dir /path/to/storage --same-file --fallocate \
+  --len 33554432 --iters 8 --threads 1,2,4,8,16
 ```
 
 读法见 probe 头部注释：M3 buffered p50 接近 2×M1 memcpy p50 即拷贝受限；并发 pwrite 聚合
 不再随线程数线性增长而 memcpy 仍在增长，说明共享内存上限；tmpfs ≈ disk 排除设备与脏页节流；
 O_DIRECT ≪ buffered 即跳过 page-cache 拷贝的收益上限；`samefile` 行远慢于 `perfile` 行即
-同 inode 并发写受限，与硬件无关。
+同 inode 并发写受限，与硬件无关。`--fallocate` 与产品一致（预分配，避免计入块分配开销），
+做同 inode 对比时应打开。
 
 ### RM READ direct source 验证
 

@@ -34,6 +34,11 @@
  * but same-file pwrite collapses to the product's ~24 ms, the cost is per-inode
  * serialization in the filesystem, not the copy and not the device.
  *
+ * --fallocate mirrors the product's create_task, which sets the file length and
+ * reserves the blocks with fallocate(KEEP_SIZE) before writing. Without it the
+ * writes extend the files and pay block allocation, so the two layouts are only
+ * comparable against the product when it is on.
+ *
  * Read the result against the real path:
  *   M3 p50 near M1 p50      -> the buffered pwrite is copy-bound (memory)
  *   M4 aggregate ~ M2 (and not T x M3) -> concurrent writes share one ceiling
@@ -54,6 +59,8 @@
  *   ./read_membw_probe --dir /path/to/storage --tmpfs /dev/shm --odirect
  *   # the product shape: many lanes into one file, to test same-inode contention
  *   ./read_membw_probe --dir /path/to/storage --same-file --threads 1,2,4,8,16
+ *   # match the product, which preallocates the task file before writing
+ *   ./read_membw_probe --dir /path/to/storage --same-file --fallocate --threads 1,2,4,8,16
  *
  * Each buffered run writes --iters * --len bytes per thread into freshly
  * created files and unlinks them on exit, so the largest thread count needs
@@ -61,8 +68,8 @@
  * --iters if the target is small, and keep the tmpfs target off a filesystem
  * that cannot hold that footprint.
  *
- * argv: [--dir PATH] [--tmpfs PATH] [--odirect] [--same-file] [--len N]
- *       [--iters N] [--threads LIST]
+ * argv: [--dir PATH] [--tmpfs PATH] [--odirect] [--same-file] [--fallocate]
+ *       [--len N] [--iters N] [--threads LIST]
  * exit code: 0 = completed, 1 = usage or setup error.
  */
 
@@ -81,6 +88,10 @@
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
 
 #define PAGE_BYTES 4096ULL
 #define DEFAULT_LEN (32ULL << 20) /* one B7 Piece */
@@ -319,9 +330,30 @@ static const char *mode_name(int odirect)
     return odirect ? "odirect" : "buffered";
 }
 
+/* Mirrors the product's create_task, which sets the length and then reserves
+ * the blocks with fallocate(KEEP_SIZE) so the timed writes never allocate.
+ * Returns 0 on success, 1 if the filesystem does not support it (warn and
+ * continue), -1 on a hard error. */
+static int preallocate(int fd, uint64_t total)
+{
+    if (total == 0) {
+        return 0;
+    }
+    if (ftruncate(fd, (off_t)total) != 0) {
+        return -1;
+    }
+    if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, (off_t)total) != 0) {
+        if (errno == EOPNOTSUPP || errno == ENOSYS) {
+            return 1;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static int run_write_target(const char *target_label, const char *dir, int odirect,
-                            int same_file, uint32_t threads, uint64_t len, int iters,
-                            uint8_t **srcs)
+                            int same_file, int prealloc, uint32_t threads, uint64_t len,
+                            int iters, uint8_t **srcs)
 {
     pthread_t tids[MAX_THREADS];
     struct write_args args[MAX_THREADS];
@@ -334,7 +366,10 @@ static int run_write_target(const char *target_label, const char *dir, int odire
     int flags = O_WRONLY | O_CREAT | O_TRUNC;
     size_t failed = 0;
     int first_errno = 0;
-    const char *layout = same_file ? "samefile" : "perfile";
+    char layout[24];
+
+    snprintf(layout, sizeof(layout), "%s%s", same_file ? "samefile" : "perfile",
+             prealloc ? "+pre" : "");
 
     if (odirect) {
         flags |= O_DIRECT;
@@ -369,6 +404,28 @@ static int run_write_target(const char *target_label, const char *dir, int odire
             g_path_count = (sig_atomic_t)(t + 1);
         }
     }
+    if (prealloc) {
+        uint64_t per_file = (uint64_t)iters * len;
+        int pr = 0;
+        if (same_file) {
+            pr = preallocate(fds[0], per_file * (uint64_t)threads);
+        } else {
+            for (uint32_t t = 0; t < threads; t++) {
+                pr = preallocate(fds[t], per_file);
+                if (pr != 0) {
+                    break;
+                }
+            }
+        }
+        if (pr < 0) {
+            printf("FAIL fallocate for %s: %s\n", target_label, strerror(errno));
+            ok = 0;
+            goto cleanup;
+        }
+        if (pr > 0) {
+            printf("      note: %s does not support fallocate, not preallocated\n", dir);
+        }
+    }
     for (uint32_t t = 0; t < threads; t++) {
         args[t].fd = fds[t];
         args[t].src = srcs[t];
@@ -400,7 +457,7 @@ static int run_write_target(const char *target_label, const char *dir, int odire
     pooled.count = (size_t)created * (size_t)iters;
     struct stats st;
     if (summarize(&pooled, &st) == 0) {
-        printf("%-7s %-8s %-8s %-8s threads=%-2u ops=%-4zu p50=%8.3f ms p95=%8.3f ms  agg=%8.1f GiB/s\n",
+        printf("%-7s %-8s %-8s %-12s threads=%-2u ops=%-4zu p50=%8.3f ms p95=%8.3f ms  agg=%8.1f GiB/s\n",
                "M3-M6", target_label, mode_name(odirect), layout, threads, pooled.count,
                (double)st.p50 / 1e6, (double)st.p95 / 1e6,
                gib_per_s((len * pooled.count) - failed * len, wall_ns));
@@ -475,6 +532,7 @@ int main(int argc, char **argv)
     const char *tmpfs = NULL;
     int odirect = 0;
     int same_file = 0;
+    int prealloc = 0;
     uint64_t len = DEFAULT_LEN;
     int iters = DEFAULT_ITERS;
     uint32_t thread_list[MAX_THREADS];
@@ -495,6 +553,8 @@ int main(int argc, char **argv)
             odirect = 1;
         } else if (strcmp(argv[i], "--same-file") == 0) {
             same_file = 1;
+        } else if (strcmp(argv[i], "--fallocate") == 0) {
+            prealloc = 1;
         } else if (strcmp(argv[i], "--len") == 0 && i + 1 < (size_t)argc) {
             len = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < (size_t)argc) {
@@ -507,7 +567,7 @@ int main(int argc, char **argv)
             }
         } else {
             printf("usage: %s [--dir PATH] [--tmpfs PATH] [--odirect] [--same-file] "
-                   "[--len N] [--iters N] [--threads LIST]\n", argv[0]);
+                   "[--fallocate] [--len N] [--iters N] [--threads LIST]\n", argv[0]);
             return 1;
         }
     }
@@ -554,6 +614,9 @@ int main(int argc, char **argv)
     if (same_file) {
         printf("layout               : same-file (all threads into one file)\n");
     }
+    if (prealloc) {
+        printf("preallocate          : on (ftruncate + fallocate KEEP_SIZE)\n");
+    }
 
     /* One src per possible thread, plus one dst per thread for the memcpy
      * ceiling. The pwrite path only needs src (the page cache is the dst). */
@@ -586,17 +649,17 @@ int main(int argc, char **argv)
     for (size_t ti = 0; ti < thread_count; ti++) {
         uint32_t t = thread_list[ti];
         if (dir != NULL) {
-            if (run_write_target("disk", dir, 0, same_file, t, len, iters, srcs) != 0) {
+            if (run_write_target("disk", dir, 0, same_file, prealloc, t, len, iters, srcs) != 0) {
                 rc = 1;
             }
             if (odirect) {
-                if (run_write_target("disk", dir, 1, same_file, t, len, iters, srcs) != 0) {
+                if (run_write_target("disk", dir, 1, same_file, prealloc, t, len, iters, srcs) != 0) {
                     rc = 1;
                 }
             }
         }
         if (tmpfs != NULL) {
-            if (run_write_target("tmpfs", tmpfs, 0, same_file, t, len, iters, srcs) != 0) {
+            if (run_write_target("tmpfs", tmpfs, 0, same_file, prealloc, t, len, iters, srcs) != 0) {
                 rc = 1;
             }
         }
