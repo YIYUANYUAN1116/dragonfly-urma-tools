@@ -74,13 +74,18 @@ def load_json(path: Path):
 
 
 def range_logs(run_dir: Path, role: str) -> list[Path]:
-    """Per-batch raw range logs, excluding the task-scoped projections."""
+    """Per-batch raw range logs, excluding the task-scoped projections.
+
+    A queue run writes `child.<batch>.log`; a fanout run names one log per child
+    daemon (roles `child-001`...), so the dash separator must match too. The
+    trailing `.*.log` still keeps the run-scoped merged `child-001.log` out.
+    """
     evidence_dir = run_dir / "evidence"
     if not evidence_dir.is_dir():
         return []
     return [
         path
-        for path in sorted(evidence_dir.glob(f"{role}.*.log"))
+        for path in sorted(evidence_dir.glob(f"{role}*.*.log"))
         if not path.name.endswith((".tasks.log", ".shutdown.log"))
     ]
 
@@ -236,6 +241,8 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
         "concurrent_piece_count": concurrency,
         "piece_bytes": piece_bytes,
         "max_read_size": read_size,
+        "registration_mode": read.get("registration", {}).get("mode", "piece"),
+        "max_region_bytes": human_bytes(read.get("registration", {}).get("maxRegionBytes", "1GiB")),
         "chunks_per_piece": -(-piece_bytes // read_size) if piece_bytes and read_size else None,
         "max_concurrent_storage_writes": read.get("maxConcurrentStorageWrites"),
         "file_bytes": FILE_CLASS_BYTES.get(case.get("fileClass", ""), 0),
@@ -505,6 +512,24 @@ def print_tables(records: list[dict]) -> None:
                 f"{child.get('tcp_fallback', '-'):>6}",
             ]
             print(" ".join(columns))
+
+    print("\n== parent Source cache (successfully served identities; not native API call counts) ==")
+    print(f"{'run':<14} {'use':<7} {'mode':>6} {'region':>8} {'cached':>7} {'sources':>7} {'reuse':>7} {'noID':>5} {'leases':>7} {'adm ms':>8} {'lease ms':>9}")
+    for r in records:
+        for label in ("samples", "warmup"):
+            parent = r.get("pools", {}).get(label, {}).get("parent")
+            if not parent:
+                continue
+            cached = parent.get("source_cached_done", 0)
+            sources = len(parent.get("cached_source_ids", []))
+            missing = parent.get("cached_identity_missing", 0)
+            reuse = str(cached - sources) if not missing else "?"
+            adm = (parent.get("stage_cache_admission_ns") or {}).get("p50_ms")
+            lease = (parent.get("stage_lease_release_ns") or {}).get("p50_ms")
+            print(f"{str(r['run']):<14} {label:<7} {r.get('registration_mode', '?'):>6} "
+                  f"{fmt_bytes(r.get('max_region_bytes')):>8} {cached:>7} {sources:>7} {reuse:>7} "
+                  f"{missing:>5} {parent.get('cached_lease_released', 0):>7} "
+                  f"{num_or_dash(adm):>8} {num_or_dash(lease):>9}")
 
     print("\n== startup chain per batch (child clock; first line ~= dfget launch) ==")
     print(

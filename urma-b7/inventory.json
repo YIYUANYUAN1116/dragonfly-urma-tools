@@ -63,7 +63,7 @@
       },
       "read": {
         "repoField": "readRepo",
-        "expectedBranch": "urma-rm-read-only-cleanup",
+        "expectedBranch": "urma-cached-source",
         "transportMode": "rm",
         "tpType": "ctp",
         "requiredMaxMessageBytes": 65536,

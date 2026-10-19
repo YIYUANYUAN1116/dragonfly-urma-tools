@@ -68,6 +68,104 @@ class B7Tests(unittest.TestCase):
             self.assertEqual(timeline["averageReadActiveMilli"]["median"], 667)
             self.assertEqual(timeline["peakReadActive"]["median"], 1)
 
+    def test_registration_overlay_overrides_stale_cached_config(self):
+        inventory = b7.select_profile(self.inventory, "read")
+        _, _, layouts = b7.generated_layout(inventory, "dual", "cache-overlay", None)
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        stale = "storage:\n  server:\n    urma:\n      read:\n        registration:\n          mode: cached\n          maxRegionBytes: 8GiB\n"
+        for name, mode, cap in (
+            ("read-auto-piece32-cc16", "piece", "1GiB"),
+            ("read-cached-file-piece32-cc16", "cached", "1GiB"),
+            ("read-cached-region256-piece32-cc16", "cached", "256MiB"),
+        ):
+            for role in ("parent", "child"):
+                rendered = b7.render_role_config(stale, inventory, layouts[role], role, "cache-overlay", cases[name])
+                self.assertIn(f'mode: "{mode}"', rendered)
+                self.assertIn(f'maxRegionBytes: "{cap}"', rendered)
+                self.assertIn(f"mmapContent: {str(role == 'parent').lower()}", rendered)
+
+    def test_registration_case_validation(self):
+        base = b7.load_cases(TOOL_DIR / "cases.json")["read-auto-piece32-cc16"]
+        for registration in (None, [], {"mode": "file"}, {"maxRegionBytes": "0B"},
+                             {"maxRegionBytes": 1024}, {"maxRegionBytes": "bad"},
+                             {"maxRegionBytes": "-1GiB"}, {"other": True}):
+            with self.subTest(registration=registration), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "cases.json"
+                path.write_text(json.dumps({"schemaVersion": 1, "cases": [
+                    {**base, "urmaRead": {"registration": registration}}]}))
+                with self.assertRaisesRegex(b7.B7Error, "registration"):
+                    b7.load_cases(path)
+
+    @staticmethod
+    def cached_parent_log(source_count=1, missing_id=False):
+        lines = []
+        for number in range(32):
+            source_id = (number // (32 // source_count)) + 1
+            identity = "" if missing_id else f"source_id=ReadSourceId(ReadOwnerId {{ registry: 1, sequence: {source_id}, peer: ReadPeer {{ id: 0, generation: 0 }} }}) "
+            lines.append(f"task_id=cache-task piece_id=cache-task-{number} " + identity +
+                         "source_cached=true register_direct=false register_ns=10 register_seg_ns=0 "
+                         "source_e2e_ns=20 urma READ cached source fully read; releasing lease")
+            lines.append(f"task_id=cache-task piece_id=cache-task-{number} revoke_ns=5 "
+                         "urma READ cached source lease released")
+        return "\n".join(lines)
+
+    def test_cached_file_and_region_reuse_gate_checks_successful_source_identities(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        for name, count in (("read-cached-file-piece32-cc16", 1),
+                            ("read-cached-region256-piece32-cc16", 4)):
+            with self.subTest(name=name):
+                evidence = b7.validate_cached_source_reuse(cases[name], self.cached_parent_log(count), "cache-task", 1024**3)
+                self.assertEqual(evidence["distinctSources"], count)
+                self.assertEqual(evidence["reusedPieces"], 32 - count)
+        with self.assertRaisesRegex(b7.B7Error, "not proven"):
+            b7.validate_cached_source_reuse(cases["read-cached-file-piece32-cc16"], self.cached_parent_log(32), "cache-task", 1024**3)
+        with self.assertRaisesRegex(b7.B7Error, "not proven"):
+            b7.validate_cached_source_reuse(cases["read-cached-file-piece32-cc16"], self.cached_parent_log(missing_id=True), "cache-task", 1024**3)
+        with self.assertRaisesRegex(b7.B7Error, "not proven"):
+            b7.validate_cached_source_reuse(cases["read-cached-file-piece32-cc16"], self.cached_parent_log(), "another-task", 1024**3)
+
+    def test_cached_monitor_does_not_report_lease_release_as_native_unregister(self):
+        log = self.cached_parent_log() + "\n" + (
+            "register_direct=true source_e2e_ns=40 register_seg_ns=30 "
+            "urma READ source fully read; revoking export\n"
+            "revoke_ns=50 urma READ source revoke finished"
+        )
+        parent = b7_read_pool_monitor.parse_log(log, "mixed")["parent"]
+        self.assertEqual(parent["source_done"], 33)
+        self.assertEqual(parent["source_cached_done"], 32)
+        self.assertEqual(parent["cached_source_ids"], ["1:1"])
+        self.assertEqual(parent["cached_lease_released"], 32)
+        self.assertEqual(parent["source_direct"], 1)
+        self.assertEqual(parent["source_copied"], 0)
+        self.assertEqual(parent["stage_revoke_ns"]["count"], 1)
+        self.assertEqual(parent["stage_lease_release_ns"]["count"], 32)
+        self.assertEqual(parent["stage_reg_seg_ns"]["count"], 1)
+
+    def test_cached_evidence_counts_parent_completion_with_new_marker(self):
+        parent = self.cached_parent_log()
+        child = "\n".join("success=true finished dragonfly urma READ piece attempt" for _ in range(32))
+        evidence = b7.analyze_evidence(parent, child)
+        self.assertEqual(evidence["parentUrmaFinished"], 32)
+        self.assertEqual(evidence["childUrmaSuccesses"], 32)
+
+    def test_cached_attribution_outputs_source_reuse_table(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            (run / "evidence").mkdir()
+            (run / "evidence" / "parent.sample-001.log").write_text(self.cached_parent_log())
+            case = b7.load_cases(TOOL_DIR / "cases.json")["read-cached-file-piece32-cc16"]
+            (run / "manifest.json").write_text(json.dumps({"runId": "cache-summary", "case": case}))
+            record = read_attribution.summarize_run(run, {})
+            self.assertEqual(record["registration_mode"], "cached")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                read_attribution.print_tables([record])
+            self.assertIn("parent Source cache", output.getvalue())
+            self.assertIn("cache-summary", output.getvalue())
+            self.assertEqual(record["pools"]["samples"]["parent"]["source_cached_done"], 32)
+
     def setUp(self):
         self.inventory = json.loads((TOOL_DIR / "inventory.json").read_text(encoding="utf-8"))
         # Existing executor tests exercise remote orchestration rather than the
@@ -176,7 +274,7 @@ class B7Tests(unittest.TestCase):
 
     def test_current_read_cases_render_and_override_stale_config(self):
         inventory = b7.select_profile(self.inventory, "read")
-        self.assertEqual(inventory["urma"]["expectedBranch"], "urma-rm-read-only-cleanup")
+        self.assertEqual(inventory["urma"]["expectedBranch"], "urma-cached-source")
         _, _, layouts = b7.generated_layout(inventory, "dual", "read-current", None)
         cases = b7.load_cases(TOOL_DIR / "cases.json")
         source = "storage:\n  server:\n    urma:\n      read:\n        maxReadSize: 1MiB\n        sourceWorkers: 8\n        maxOutstandingPerPeer: 256\n"
@@ -236,7 +334,7 @@ class B7Tests(unittest.TestCase):
                 for node in selected["nodes"].values():
                     self.assertEqual(node["repo"], node["readRepo"])
                     self.assertEqual(PurePosixPath(node["repo"]).name, basename)
-                self.assertEqual(selected["urma"]["expectedBranch"], "urma-rm-read-only-cleanup")
+                self.assertEqual(selected["urma"]["expectedBranch"], "urma-cached-source")
         inventory["nodes"]["node1"]["readRepo"] = "/tmp/unexpected-checkout"
         with self.assertRaisesRegex(b7.B7Error, "READ repo must be"):
             b7.validate_inventory(inventory)

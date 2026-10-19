@@ -18,7 +18,7 @@ Usage:
 
 Calibration note. `*.tasks.log` artifacts are `filter_task_scoped_log` output:
 they keep only lines whose `task_id=` matches the measured task. The pool
-markers below are emitted by `read_buffer_pool.rs` on the dedicated URMA owner
+markers below are emitted by `destination_pool.rs` on the dedicated URMA owner
 thread (`dragonfly-urma-fabric`), where no task-scoped span is active, so they
 carry no `task_id` and are absent from every task-scoped projection by
 construction. Pool counters must therefore be read from the range logs
@@ -53,6 +53,8 @@ PARENT_MARKERS = {
     "source_start": "start READ upload piece content",
     "source_done": "urma READ source fully read; revoking export",
     "source_revoke": "urma READ source revoke finished",
+    "cached_done": "urma READ cached source fully read; releasing lease",
+    "cached_released": "urma READ cached source lease released",
     "source_retained": "urma READ source owner retained for cleanup",
 }
 
@@ -108,6 +110,12 @@ def parse_log(text: str, source: str) -> dict:
     parent = {
         "source_pieces": 0,
         "source_done": 0,
+        "source_cached_done": 0,
+        "cached_source_ids": [],
+        "cached_identity_missing": 0,
+        "cached_lease_released": 0,
+        "stage_cache_admission_ns": [],
+        "stage_lease_release_ns": [],
         "source_e2e_ns": [],
         "source_retained": 0,
         "source_direct": 0,
@@ -189,9 +197,27 @@ def parse_log(text: str, source: str) -> dict:
             piece_id = fields.get("piece_id", "")
             if ts is not None:
                 parent["source_start_times"][piece_id] = ts
-        elif PARENT_MARKERS["source_done"] in payload:
+        elif (PARENT_MARKERS["source_done"] in payload
+              or PARENT_MARKERS["cached_done"] in payload):
             fields = parse_fields(payload)
             parent["source_done"] += 1
+            cached = (PARENT_MARKERS["cached_done"] in payload
+                      or fields.get("source_cached") == "true")
+            if cached:
+                parent["source_cached_done"] += 1
+                identity = re.search(
+                    r"source_id=ReadSourceId\(ReadOwnerId\s*\{\s*registry:\s*(\d+),\s*sequence:\s*(\d+)", payload,
+                )
+                if identity:
+                    key = f"{identity[1]}:{identity[2]}"
+                    if key not in parent["cached_source_ids"]:
+                        parent["cached_source_ids"].append(key)
+                else:
+                    parent["cached_identity_missing"] += 1
+                try:
+                    parent["stage_cache_admission_ns"].append(int(fields.get("register_ns", "")))
+                except ValueError:
+                    pass
             try:
                 e2e = int(fields.get("source_e2e_ns", ""))
             except ValueError:
@@ -202,9 +228,9 @@ def parse_log(text: str, source: str) -> dict:
                     e2e = int((ts - start).total_seconds() * 1e9)
             if e2e is not None:
                 parent["source_e2e_ns"].append(e2e)
-            if fields.get("register_direct") == "true":
+            if not cached and fields.get("register_direct") == "true":
                 parent["source_direct"] += 1
-            elif fields.get("register_direct") == "false":
+            elif not cached and fields.get("register_direct") == "false":
                 parent["source_copied"] += 1
             for field, key in (
                 ("source_open_ns", "stage_open_ns"),
@@ -216,10 +242,19 @@ def parse_log(text: str, source: str) -> dict:
                 ("register_seg_ns", "stage_reg_seg_ns"),
                 ("wait_read_done_ns", "stage_wait_ns"),
             ):
+                if cached and field != "wait_read_done_ns":
+                    continue
                 try:
                     parent[key].append(int(fields.get(field, "")))
                 except ValueError:
                     pass
+        elif PARENT_MARKERS["cached_released"] in payload:
+            parent["cached_lease_released"] += 1
+            fields = parse_fields(payload)
+            try:
+                parent["stage_lease_release_ns"].append(int(fields.get("revoke_ns", "")))
+            except ValueError:
+                pass
         elif PARENT_MARKERS["source_revoke"] in payload:
             fields = parse_fields(payload)
             try:
@@ -264,6 +299,8 @@ def parse_log(text: str, source: str) -> dict:
             "stage_reg_seg_ns": summarize_e2e(parent["stage_reg_seg_ns"]),
             "stage_wait_ns": summarize_e2e(parent["stage_wait_ns"]),
             "stage_revoke_ns": summarize_e2e(parent["stage_revoke_ns"]),
+            "stage_cache_admission_ns": summarize_e2e(parent["stage_cache_admission_ns"]),
+            "stage_lease_release_ns": summarize_e2e(parent["stage_lease_release_ns"]),
         },
     }
 
@@ -317,6 +354,10 @@ def print_report(results):
             print(f"  pieces served       : {parent['source_pieces']} "
                   f"(done {parent['source_done']}, retained warnings {parent['source_retained']})")
             print(f"  direct / copied     : {parent['source_direct']} / {parent['source_copied']}")
+            if parent["source_cached_done"]:
+                print(f"  cached Pieces/Sources: {parent['source_cached_done']} / {len(parent['cached_source_ids'])} "
+                      f"(missing identity {parent['cached_identity_missing']})")
+                print(f"  cached leases ended : {parent['cached_lease_released']} (not Segment unregisters)")
             e2e = parent["source_e2e_ns"]
             if e2e:
                 print(f"  source E2E p50/p95  : {e2e['p50_ms']} / {e2e['p95_ms']} ms")
@@ -326,6 +367,8 @@ def print_report(results):
                 ("register", "stage_register_ns"),
                 ("wait ReadDone", "stage_wait_ns"),
                 ("revoke/unregister", "stage_revoke_ns"),
+                ("cache admission", "stage_cache_admission_ns"),
+                ("cached lease end", "stage_lease_release_ns"),
             ]
             for label, key in stages:
                 stage = parent[key]

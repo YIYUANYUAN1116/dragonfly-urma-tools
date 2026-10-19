@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from yaml_overlay import OverlayError, apply as apply_yaml_overlays
+from read_pool_monitor import parse_log as parse_read_pool_log
 
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -1711,13 +1712,45 @@ def filter_task_scoped_log(task_log: str, task_ids: set[str]) -> str:
     return "\n".join(selected) + ("\n" if selected else "")
 
 
+# Parent-side URMA Piece-service start events. The RC/RM server publishes
+# uploads ("start upload piece content over urma"); the RM-READ server
+# publishes READ sources instead ("start READ upload piece content") and never
+# uploads, so a READ-only checkout has no "...over urma" line at all.
+URMA_SERVER_PIECE_START_MARKERS = (
+    "start upload piece content over urma",
+    "start READ upload piece content",
+)
+
+# Lane lifecycle events. The RC/RM server logs peer-lane events; the RM-READ
+# server logs READ lanes instead and ends them as "closed or idle" (debug
+# level) rather than through a peer-lane finish, so a READ-only checkout has
+# none of the RC/RM strings.
+URMA_LANE_ESTABLISHED_MARKERS = (
+    "urma peer lane established",
+    "urma READ lane established",
+)
+URMA_LANE_FINISHED_MARKERS = (
+    "urma piece finished on peer lane",
+    "urma READ lane closed or idle",
+)
+
+
+def count_markers(text: str, markers: tuple[str, ...]) -> int:
+    """Total occurrences of any lane/transfer event marker in one log."""
+    return sum(text.count(marker) for marker in markers)
+
+
 def analyze_fanout_lanes(parent_log: str, task_ids: set[str]) -> dict[str, Any]:
-    """Describe server-side Piece attempts without hiding lane churn."""
+    """Describe server-side Piece attempts without hiding lane churn.
+
+    Accepts both the RC/RM upload-start event and the RM-READ READ-source
+    publish event, since exactly one of the two exists per data plane.
+    """
     counts_by_task: dict[str, dict[int, int]] = {
         task_id: {} for task_id in task_ids
     }
     for line in parent_log.splitlines():
-        if "start upload piece content over urma" not in line:
+        if not any(marker in line for marker in URMA_SERVER_PIECE_START_MARKERS):
             continue
         task_id = last_task_id(line)
         lane_id = last_lane_id(line)
@@ -3138,12 +3171,14 @@ def analyze_fanin_evidence(parent: str, children: dict[str, str]) -> dict[str, A
     total_server_uploads = 0
     for role in sorted(children):
         text = children[role]
-        uploads = text.count("finished uploading piece content over urma")
+        uploads = (text.count("finished uploading piece content over urma")
+                   + text.count("urma READ source fully read; revoking export")
+                   + text.count("urma READ cached source fully read; releasing lease"))
         total_server_uploads += uploads
         per_child[role] = {
             "urmaUploadFinished": uploads,
-            "laneEstablished": text.count("urma peer lane established"),
-            "laneFinished": text.count("urma piece finished on peer lane"),
+            "laneEstablished": count_markers(text, URMA_LANE_ESTABLISHED_MARKERS),
+            "laneFinished": count_markers(text, URMA_LANE_FINISHED_MARKERS),
         }
     client_piece_lines = [
         line
@@ -3338,13 +3373,14 @@ def analyze_evidence(
         "parentUrmaFinished": parent.count("finished uploading piece content over urma")
         # The READ parent never runs the SEND/RECV upload path; each served
         # piece logs exactly one of these, after the child has fully read it.
-        + parent.count("urma READ source fully read; revoking export"),
+        + parent.count("urma READ source fully read; revoking export")
+        + parent.count("urma READ cached source fully read; releasing lease"),
         "childUrmaAttempts": len(child_attempt_lines),
         "childUrmaSuccesses": sum("success=true" in line for line in child_attempt_lines),
-        "laneFinished": parent.count("urma piece finished on peer lane")
-        + child.count("urma piece finished on peer lane"),
-        "laneEstablished": parent.count("urma peer lane established")
-        + child.count("urma peer lane established"),
+        "laneFinished": count_markers(parent, URMA_LANE_FINISHED_MARKERS)
+        + count_markers(child, URMA_LANE_FINISHED_MARKERS),
+        "laneEstablished": count_markers(parent, URMA_LANE_ESTABLISHED_MARKERS)
+        + count_markers(child, URMA_LANE_ESTABLISHED_MARKERS),
         "reusedSessionFalse": parent.count("reused_session=false")
         + child.count("reused_session=false"),
         "reusedSessionTrue": parent.count("reused_session=true")
@@ -4004,6 +4040,7 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 "maxOutstandingPerPeer",
                 "maxOutstandingPerPiece",
                 "sourceWorkers",
+                "registration",
                 "maxReadSize",
                 "maxConcurrentStorageWrites",
             }
@@ -4039,6 +4076,19 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 raise B7Error(
                     f"case {case['name']} urmaRead.sourceWorkers must be an int in 0..=16"
                 )
+        registration = (urma_read or {}).get("registration", {})
+        if not isinstance(registration, dict) or set(registration) - {"mode", "maxRegionBytes"}:
+            raise B7Error(f"case {case['name']} has invalid urmaRead.registration")
+        if registration.get("mode", "piece") not in ("piece", "cached"):
+            raise B7Error(f"case {case['name']} registration.mode must be piece or cached")
+        if parse_registration_bytes(registration.get("maxRegionBytes", "1GiB")) is None:
+            raise B7Error(f"case {case['name']} registration.maxRegionBytes must be positive B/KiB/MiB/GiB")
+        require_cache = case.get("requireCachedSourceReuse", False)
+        if type(require_cache) is not bool:
+            raise B7Error(f"case {case['name']} requireCachedSourceReuse must be bool")
+        if require_cache and (registration.get("mode") != "cached" or topology != "queue"
+                              or protocol != "urma" or not case.get("pieceLength")):
+            raise B7Error(f"case {case['name']} cache reuse gate requires cached/urma/queue and pieceLength")
         if protocol == "tcp" and topology != "queue":
             raise B7Error(
                 f"case {case['name']} protocol tcp only supports queue topology"
@@ -4076,6 +4126,40 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 )
         result[case["name"]] = case
     return result
+
+
+def parse_registration_bytes(value: str) -> int | None:
+    match = re.fullmatch(r"([0-9]+)(b|kib|mib|gib)", value, re.IGNORECASE) if isinstance(value, str) else None
+    if not match:
+        return None
+    size = int(match[1]) * {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3}[match[2].lower()]
+    return size if size > 0 else None
+
+
+def validate_cached_source_reuse(case: dict, parent_log: str, task_id: str, file_bytes: int) -> dict:
+    """Prove successfully used Source identities, not native API call counts."""
+    parent = parse_read_pool_log(filter_task_scoped_log(parent_log, {task_id}), task_id)["parent"]
+    piece = parse_piece_length_bytes(case["pieceLength"])
+    cap = parse_registration_bytes(case["urmaRead"]["registration"].get("maxRegionBytes", "1GiB"))
+    if not piece or not cap or file_bytes <= 0:
+        raise B7Error("cache reuse gate requires valid file/Piece/Region sizes")
+    window = file_bytes if file_bytes <= cap else cap // piece * piece
+    if window == 0:
+        raise B7Error("cache reuse gate: Piece exceeds Region limit")
+    pieces = (file_bytes + piece - 1) // piece
+    sources = (file_bytes + window - 1) // window
+    observed = {
+        "cachedPieces": parent["source_cached_done"],
+        "distinctSources": len(parent["cached_source_ids"]),
+        "reusedPieces": parent["source_cached_done"] - len(parent["cached_source_ids"]),
+        "missingIdentities": parent["cached_identity_missing"],
+        "expectedPieces": pieces,
+        "expectedSources": sources,
+    }
+    if (observed["cachedPieces"] != pieces or observed["distinctSources"] != sources
+            or observed["missingIdentities"] or pieces <= sources):
+        raise B7Error(f"cached Source reuse not proven for {task_id}: {observed}")
+    return observed
 
 
 def validate_transfer_identity(
@@ -4265,6 +4349,9 @@ def role_overlays(
             "postListSize", "pipelineDepth", "peerGuaranteedRxCredits",
         ):
             overlays.pop(("storage", "server", "urma", key), None)
+        registration = read.get("registration", {})
+        for key, default in (("mode", "piece"), ("maxRegionBytes", "1GiB")):
+            overlays[("storage", "server", "urma", "read", "registration", key)] = registration.get(key, default)
     return overlays
 
 
@@ -5675,6 +5762,10 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
                     child_transfer,
                     f"origin/parent/child identity for {task_tag}",
                 )
+                if case.get("requireCachedSourceReuse"):
+                    child_transfer["sourceCacheEvidence"] = validate_cached_source_reuse(
+                        case, parent_task_log, expected_task_id, int(parent_transfer["bytes"]),
+                    )
                 child_transfer["throughputMiBps"] = (
                     child_transfer["bytes"]
                     * 1_000_000_000

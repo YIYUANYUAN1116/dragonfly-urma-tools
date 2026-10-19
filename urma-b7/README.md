@@ -841,3 +841,74 @@ task batch、单 lane 并发 Piece correctness gate、一个 Parent/多个隔离
 Child server/一个 Parent client 的 RX fan-in：唯一 origin、逐 task 预热、`--disable-back-to-source`、逐 task
 三方 SHA-256、固定拓扑与 lane-ID 校验、task-ID scoped 日志、URMA 日志/metrics 证据以及有序 shutdown。后续仍需增加
 persistent/persistent-cache、failpoint、双 lane 定向中断和带 outstanding WR 的专项 shutdown case。
+
+## 完整普通文件 Cached 注册对照（2026-10-19）
+
+当前 READ profile 的目标分支为 `urma-cached-source`。Parent/Child 都需要同步并重新构建本轮
+`dfdaemon`/`dfget`；不要沿用此前 cleanup 分支的二进制。READ checkout 的两个目录别名继续允许，
+实际路径由 `inventory.json` 的 `nodes.*.readRepo` 指定；若远端分支不同，请显式修改
+`urma.profiles.read.expectedBranch`，不要跳过预检。
+
+新增三个 case，均为 1 GiB 文件、32 MiB Piece、Piece 并发 16、sourceWorkers=0、
+1 次 warmup + 3 次 sample；保持 SHA256、零 TCP fallback 和现有 READ 生命周期校验：
+
+| case | registration.mode | maxRegionBytes | 每个 Task 使用的 Source 数 |
+|---|---|---|---:|
+| `read-registration-piece32-cc16` | piece | 1GiB | 32 个独立 Piece Source |
+| `read-cached-file-piece32-cc16` | cached | 1GiB | 1 |
+| `read-cached-region256-piece32-cc16` | cached | 256MiB | 4 |
+
+Parent 先完整下载所有 Task，随后 Child 才加入并下载。这组测试覆盖完整普通文件的
+首次注册、并发 miss 合并及文件内跨 Piece 复用；**不覆盖未完成文件的 Piece 回退或 GC 竞态**。
+每个 batch 仍使用独立 TaskID/文件实例，warmup 不会为 sample 预热同一个 Source。
+因此它比较的是每个新文件的完整传输成本，不能当作“跨批次纯热缓存吞吐”。
+
+```bash
+for case in \
+  read-registration-piece32-cc16 \
+  read-cached-file-piece32-cc16 \
+  read-cached-region256-piece32-cc16
+do
+  run_id="${case}-001"
+  python3 b7.py prepare \
+    --profile read --mode dual \
+    --run-id "$run_id" --case "$case" \
+    --parent-cpus 192-223 \
+    --child-cpus 192-223 \
+    --execute || break
+
+  python3 b7.py run \
+    --manifest "results/$run_id/manifest.json" \
+    --execute || break
+done
+
+python3 read_attribution_summary.py \
+  results/read-registration-piece32-cc16-001 \
+  results/read-cached-file-piece32-cc16-001 \
+  results/read-cached-region256-piece32-cc16-001
+```
+
+新 case 会生成 `storage.server.urma.read.registration.mode/maxRegionBytes`。
+原 READ case 会显式生成 `mode: piece`，避免基础 YAML 中遗留的 Cached 设置污染基线。
+Parent 的 `mmapContent` 由现有角色 overlay 打开。
+
+Cached case 额外校验每个 Task 的全部 32 个 Piece 均从 Cached Source 完成，并从
+Parent 完成日志的 `source_id` 提取 registry/sequence，核对成功使用的 Source 数为 1 或 4。
+缺失身份、走了旧 Piece 路径、每 Piece 都注册或计数不完整都会失败。
+该证据写入 `result.transfer.{warmups,samples}[*].child.sourceCacheEvidence`。
+Source 身份只用于诊断，不记录 token 或 descriptor 凭证。
+
+汇总新增 `parent Source cache` 表：
+
+- `cached`：Cached 服务的 Piece 数。
+- `sources`：成功服务过 Piece 的不同 Source 身份数；**不是 native 注册 API 调用总数**。
+- `reuse`：`cached - sources`，表示同 Source 服务的额外 Piece；不是严格的 lookup-hit 次数，
+  等待同一次并发注册的 Piece 也计入其中。
+- `noID`：缺失 Source 身份的 Piece 数，非零时不能证明复用。
+- `leases` / `lease ms`：缓存传输租约的完成次数/耗时，不能算作 Segment 注销。
+- `adm ms`：缓存查找、完整性检查及注册等待阶段的耗时；缓存租约的零值 shim pin 字段
+  不再混入 native 注册耗时分布。
+
+每组 3 个 measured Task，整文件模式通常显示 `cached=96, sources=3, reuse=93`；
+256 MiB Region 模式显示 `cached=96, sources=12, reuse=84`。warmup 单列。
+当前工具尚未证明跨批次热缓存、Segment 淘汰/注销或多人环境下的性能收益。
