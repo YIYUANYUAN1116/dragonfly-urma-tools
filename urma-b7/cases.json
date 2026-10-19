@@ -1632,6 +1632,36 @@
         "sourceWorkers": 4
       },
       "category": "urma-read-current-validation"
+    },
+    {
+      "name": "read-fanout-piece32-cc16-l2",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "topology": "fanout",
+      "concurrency": 2,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {},
+      "category": "urma-read-multi-task"
+    },
+    {
+      "name": "read-fanout-piece32-cc16-l4",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "topology": "fanout",
+      "concurrency": 4,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {},
+      "category": "urma-read-multi-task"
     }
   ]
 }

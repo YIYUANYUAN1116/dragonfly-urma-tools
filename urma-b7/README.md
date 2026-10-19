@@ -268,31 +268,138 @@ storage 组另含 `fileOpenNs`、`pwriteCalls`（每 Piece 的 pwritev 次数）
 归因表读取时若 manifest 缺少这些字段，会从 `evidence/child.*.tasks.log` 重新解析补齐。
 旧日志缺少的字段不计入样本；保留原始日志用于进一步检查，分位数不能直接相加归因。
 
-child 落盘阶段 `pwrite` 占 Piece E2E 约 65-75%，而 `pwrWait`/`pwrQ` 都接近 0、`pwrAct` 已达
-~11 并发，说明瓶颈不在限流、线程池或并发度。`read_membw_probe.c` 用来定位这段开销（对照
-memcpy 上限 / buffered pwrite / tmpfs / O_DIRECT，形状为 `--len` × N 并发，不触碰产品代码）。
-实测已排除内存拷贝与设备：M3 buffered p50 ≈ M1 memcpy p50（拷贝只要 ~2 ms，而产品是 ~24 ms），
-且 iostat 显示设备 `%util` 仅 ~14%。剩下最强的嫌疑是多个 lane 并发写同一个 task 文件的同一
-inode，用 `--same-file` 复刻该形状：
+child 落盘阶段 `pwrite` 占 Piece E2E 约 65-75%；它不是唯一限速项，但剩余余量比 E2E 吞吐
+看起来的小得多（见下）。用 `read_membw_probe.c` 定位（对照 memcpy 上限 / buffered pwrite / tmpfs / O_DIRECT，形状为
+`--len` × N 并发，不触碰产品代码），结论：
+
+- `pwrWait`/`pwrQ` ≈ 0、`pwrAct` ≈ 11 → 限流器、blocking 池、并发度都不是原因；
+- 一次 32 MiB pwritev 无竞争时只要 ~2 ms（M3 ≈ M1 memcpy），memcpy 聚合到 254 GiB/s →
+  不是拷贝，也不是内存带宽；
+- iostat 设备 `%util` 仅 ~14%，每轮只落 1 GiB → 不是设备；
+- `--same-file` 复刻多 lane 写同一 task 文件：聚合恒为 **16.2 GiB/s**，p50 随并发线性涨
+  （T=16 → 28.8 ms），`--fallocate` 前后一致 → 与块分配无关。根因是 **ext4 对同一 inode 的
+  buffered 写走 `inode_lock` 排他锁、完全串行**；产品的 24 ms ≈ 11 路排队 × 2 ms。
+- 按同一口径比，**余量只有 ~1.4×，不是 2.5×**：dfget E2E 吞吐 6.65 GiB/s 是**含前导**的
+  总账，前导（`toREAD`：进程/连接/任务准备/scheduler/父片元数据同步/准入，URMA lane 与
+  source 注册都在该埋点之后）占 E2E 的 **37–46%**（workers0/1/2/4）。扣掉前导后，一轮 1 GiB
+  的写入在数据期稳定跑到 **~11.8 GiB/s ≈ 16.2 GiB/s 上限的 72%**（1 GiB ÷ pwrite 区间，
+  四轮均落在 71–73%），数据期整体速率 9.3→10.5 GiB/s（占上限 57%→65%）。
+- 所以结论要改口：**不是"存储无关紧要"，而是写路径在整个数据期持续占用同 inode 硬顶的
+  七成**；该硬顶与并发数无关（probe 已证聚合恒为 16.2 GiB/s），且**它只属于"并发写同一文件"
+  这一形状**——同一台盘上 perfile 同轮能到 194.7 GiB/s（12.2×）。因此同 inode 不拆时继续抬
+  READ 并发只会把队列堆到 pwrite 上，换不到吞吐；拆同 inode 有效，但 **O_DIRECT 不行**
+  （perfile O_DIRECT 恒 4.7 GiB/s，比 buffered 慢 3.3–53×，是反向优化）。
+- 口径提醒：workers0→4 的 E2E +24%（5496→6814 MiB/s）里，首片→末片几乎不变
+  （82.92→81.23 ms）、数据期速率只 +13%，增量主要来自前导 −37%（86.94→54.98 ms），不能记作
+  READ 管道收益，与 `04-performance/rm-read.md` 的结论一致。报告 rate 的窗口口径仍待核对：
+  workers4 的 `1 GiB ÷ dfget`（6820 MiB/s）与报告值吻合，workers0/1 则偏低 5–6%。
+
+复现：
 
 ```bash
 cc -O2 -Wall -Wextra -pthread read_membw_probe.c -o read_membw_probe
 # 在 child 节点、指向产品实际写入的同一文件系统
-./read_membw_probe --dir /path/to/storage --tmpfs /dev/shm --odirect \
+# 对照基准：每线程写自己的文件（不加 --same-file）
+./read_membw_probe --dir /path/to/storage --fallocate \
   --len 33554432 --iters 8 --threads 1,2,4,8,16
-# 复刻产品形状：所有线程写同一个文件的不同 offset
-./read_membw_probe --dir /path/to/storage --same-file \
-  --len 33554432 --iters 8 --threads 1,2,4,8,16
-# 对齐产品的预分配：create_task 会先 set_len + fallocate(KEEP_SIZE)
+# 复刻产品形状：所有线程写同一个文件的不同 offset；--fallocate 对齐 create_task 的
+# set_len + fallocate(KEEP_SIZE)，两行必须同线程数对比
 ./read_membw_probe --dir /path/to/storage --same-file --fallocate \
+  --len 33554432 --iters 8 --threads 1,2,4,8,16
+# 分离 page cache 与设备：再加 tmpfs 与 O_DIRECT 变体
+./read_membw_probe --dir /path/to/storage --tmpfs /dev/shm --odirect \
   --len 33554432 --iters 8 --threads 1,2,4,8,16
 ```
 
 读法见 probe 头部注释：M3 buffered p50 接近 2×M1 memcpy p50 即拷贝受限；并发 pwrite 聚合
-不再随线程数线性增长而 memcpy 仍在增长，说明共享内存上限；tmpfs ≈ disk 排除设备与脏页节流；
-O_DIRECT ≪ buffered 即跳过 page-cache 拷贝的收益上限；`samefile` 行远慢于 `perfile` 行即
-同 inode 并发写受限，与硬件无关。`--fallocate` 与产品一致（预分配，避免计入块分配开销），
-做同 inode 对比时应打开。
+不再随线程数线性增长而 memcpy 仍在增长，说明共享内存上限；tmpfs ≈ disk 排除设备与脏页节流
+（**本轮 tmpfs 实测反常，见下节**）；O_DIRECT ≪ buffered 即跳过 page-cache 拷贝的收益上限；
+`samefile` 行远慢于 `perfile` 行即同 inode 并发写受限，与硬件无关。`--fallocate` 与产品一致
+（预分配，避免计入块分配开销），做同 inode 对比时应打开。
+
+### read_membw_probe 实测数据
+
+2026-10-19 在 child 节点实测，目标为产品实际写入的 storage（本地 ext4 on LVM），三轮均为
+`--len 33554432 --iters 8 --threads 1,2,4,8,16`，每档 op 数 = threads × 8：
+
+| 轮 | 命令要点 | 跑出的行 |
+|---|---|---|
+| A | `--same-file` | memcpy、disk buffered samefile |
+| B | `--tmpfs /dev/shm --odirect`（**无** `--same-file`，即 perfile） | memcpy、disk buffered perfile、disk odirect perfile、tmpfs buffered perfile |
+| C | `--same-file --fallocate` | memcpy、disk buffered samefile+pre |
+
+原始输出未归档到本仓库，下面为三轮输出转录。
+
+**M1/M2 memcpy —— 纯内存拷贝，只用 src/dst 缓冲区、不碰文件**，与 layout / 预分配无关
+（探针只跑 threads=1 与 threads=16 两档，下表为三轮范围）：
+
+| target | threads | p50 (ms) | agg (GiB/s) |
+|---|---:|---:|---:|
+| M1/M2 memcpy | 1 | 1.601–1.829 | 17.4–19.0 |
+| M1/M2 memcpy | 16 | 1.602–1.855 | 246.1–254.5 |
+
+**M3 disk buffered samefile —— 所有线程写同一个文件**（A = 不带 `--fallocate`，C = 带）：
+
+| threads | p50 (ms) A | agg A | p50 (ms) C | agg C |
+|---:|---:|---:|---:|---:|
+| 1 | 2.082 | 15.0 | 2.015 | 15.5 |
+| 2 | 1.874 | 15.9 | 2.022 | 16.1 |
+| 4 | 7.214 | 16.1 | 7.397 | 16.1 |
+| 8 | 12.598 | 16.1 | 12.545 | 16.2 |
+| 16 | 29.707 | 16.0 | 28.771 | 16.2 |
+
+**M3–M6 perfile —— 每线程写自己的文件**（轮 B，无 `--fallocate`）：
+
+| target | 模式 | threads | p50 (ms) | p95 (ms) | agg (GiB/s) |
+|---|---|---|---:|---:|---:|---:|
+| M3 disk | buffered | 1 | 2.026 | 2.471 | 15.4 |
+| M3 disk | buffered | 2 | 2.021 | 2.565 | 30.4 |
+| M3 disk | buffered | 4 | 1.812 | 2.593 | 64.1 |
+| M3 disk | buffered | 8 | 1.908 | 2.591 | 122.4 |
+| M3 disk | buffered | 16 | 2.001 | 2.690 | **194.7** |
+| M4 disk | odirect | 1 | 6.680 | 6.815 | 4.7 |
+| M4 disk | odirect | 2 | 13.275 | 13.399 | 4.7 |
+| M4 disk | odirect | 4 | 26.541 | 26.599 | 4.7 |
+| M4 disk | odirect | 8 | 53.064 | 74.179 | 4.7 |
+| M4 disk | odirect | 16 | 106.978 | 135.121 | 4.7 |
+| M5 tmpfs | buffered | 1 | 8.821 | 9.175 | 3.5 |
+| M5 tmpfs | buffered | 2 | 9.369 | 9.751 | 6.6 |
+| M5 tmpfs | buffered | 4 | 9.292 | 9.703 | 13.3 |
+| M5 tmpfs | buffered | 8 | 9.316 | 9.768 | 26.2 |
+| M5 tmpfs | buffered | 16 | 9.562 | 10.000 | 49.4 |
+
+读到的东西：
+
+- memcpy 三轮一致（单线程 1.60–1.83 ms / 17.4–19.0 GiB/s，16 线程 246–254 GiB/s）→ 内存与
+  拷贝路径余量极大，三轮之间可比。
+- **samefile vs perfile 是只差"是否同一个文件"的决定性对照**（A vs B，同 `--len`/`--iters`）：
+
+  | threads | samefile agg | perfile agg | 倍数 |
+  |---:|---:|---:|---:|
+  | 1 | 15.0 | 15.4 | 1.0× |
+  | 2 | 15.9 | 30.4 | 1.9× |
+  | 4 | 16.1 | 64.1 | 4.0× |
+  | 8 | 16.1 | 122.4 | 7.6× |
+  | 16 | 16.0 | **194.7** | **12.2×** |
+
+- perfile 聚合随线程数几乎线性涨到 194.7 GiB/s（逼近 memcpy 的 253.7），且 p50 恒定在
+  ~1.8–2.0 ms（无排队）；samefile 聚合恒定 16.0 GiB/s，p50 线性涨到 29.707 ms
+  （每多一路约 +2 ms，是排队不是变慢）。
+- 关键签名：**samefile 的聚合上限 16.0 GiB/s ≈ 单线程 memcpy 的 19.0 GiB/s** —— 16 路并发写
+  同一文件，实际退化成"一个核在拷"。这坐实 probe 头部那条判据：代价是同 inode 并发，
+  不是拷贝、不是设备。
+- `--fallocate` 前后 samefile 两列几乎完全一致（p50 1.87–29.71 vs 2.02–28.77，agg 均 ~16）→
+  塌陷与块分配无关。
+- `--odirect`（perfile）是**反向优化**：agg 恒定 4.7 GiB/s，p50 6.680→106.978 ms；T=1 比
+  buffered 慢 3.3×，T=16 慢 53×（107 vs 2.001）。当轮曾据此误判"设备上限 4.7 GiB/s"，后被
+  iostat（dm-0/nvme1n1 `%util` 仅 14–16%、`w_await` 0.25 ms）推翻——4.7 GiB/s 是 O_DIRECT
+  串行同步写的速率，不是设备带宽上限。
+- `--tmpfs`（perfile）单次 9.3 ms，比磁盘 buffered 的 2.0 ms **慢 4.6×**，16 线程也只有
+  49.4 GiB/s（磁盘 perfile 是 194.7）。本轮 tmpfs 不是有效的"纯 page cache 上界"，文档里
+  "tmpfs ≈ disk" 的判据在这台机器上不成立（反常，当轮未定位）；脏页节流改用 vmstat 排除
+  （约 1.7 TiB RAM，脏页阈值 ~170 GB，每轮只落 1 GiB，不可能触发）。
+- 与产品对齐：samefile T=16 的 28.771 ms 与产品 pwrite p50（workers1/2 的 28.07/28.73 ms）
+  吻合 → 产品的落盘代价来自同 inode 串行，不是拷贝、内存或设备。
 
 ### RM READ direct source 验证
 
