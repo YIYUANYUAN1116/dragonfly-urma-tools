@@ -62,6 +62,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,6 +143,30 @@ static int aligned_alloc_buffer(uint8_t **out, uint64_t len)
     return 0;
 }
 
+/* Releases only workers that were actually created, so a partial
+ * pthread_create failure cannot leave the survivors spinning forever (the
+ * same idiom read_register_probe uses). */
+struct start_gate {
+    unsigned ready;
+    unsigned go;
+};
+
+static void start_gate_wait(struct start_gate *gate)
+{
+    __atomic_add_fetch(&gate->ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&gate->go, __ATOMIC_ACQUIRE)) {
+        sched_yield();
+    }
+}
+
+static void start_gate_release(struct start_gate *gate, unsigned expected)
+{
+    while (__atomic_load_n(&gate->ready, __ATOMIC_ACQUIRE) < expected) {
+        sched_yield();
+    }
+    __atomic_store_n(&gate->go, 1, __ATOMIC_RELEASE);
+}
+
 /* --------------------------------------------------------------- memcpy copy */
 
 struct copy_args {
@@ -149,7 +175,7 @@ struct copy_args {
     uint64_t len;
     int iters;
     uint64_t *ns;
-    pthread_barrier_t *barrier;
+    struct start_gate *gate;
     uint64_t *sink;
 };
 
@@ -163,7 +189,7 @@ static void *copy_worker(void *argp)
     memset(a->src, 0xa5, (size_t)a->len);
     memset(a->dst, 0x5a, (size_t)a->len);
 
-    pthread_barrier_wait(a->barrier);
+    start_gate_wait(a->gate);
     for (int i = 0; i < a->iters; i++) {
         uint64_t t0 = monotonic_ns();
         memcpy(a->dst, a->src, (size_t)a->len);
@@ -184,40 +210,38 @@ static int run_copy(const char *label, uint32_t threads, uint64_t len, int iters
 {
     pthread_t tids[MAX_THREADS];
     struct copy_args args[MAX_THREADS];
-    pthread_barrier_t barrier;
+    struct start_gate gate = {0};
     uint64_t sinks[MAX_THREADS];
+    uint32_t created = 0;
     uint64_t wall_ns;
     int rc = 0;
 
-    if (pthread_barrier_init(&barrier, NULL, threads) != 0) {
-        printf("FAIL barrier init for %s\n", label);
-        return -1;
-    }
     for (uint32_t t = 0; t < threads; t++) {
         args[t].src = srcs[t];
         args[t].dst = dsts[t];
         args[t].len = len;
         args[t].iters = iters;
         args[t].ns = &out->ns[t * iters];
-        args[t].barrier = &barrier;
+        args[t].gate = &gate;
         args[t].sink = &sinks[t];
         if (pthread_create(&tids[t], NULL, copy_worker, &args[t]) != 0) {
             printf("FAIL pthread_create for %s\n", label);
             rc = -1;
             break;
         }
+        created++;
     }
+    start_gate_release(&gate, created);
     wall_ns = monotonic_ns();
-    for (uint32_t t = 0; t < threads; t++) {
+    for (uint32_t t = 0; t < created; t++) {
         pthread_join(tids[t], NULL);
     }
     wall_ns = monotonic_ns() - wall_ns;
-    pthread_barrier_destroy(&barrier);
     if (rc != 0) {
         return -1;
     }
 
-    out->count = (size_t)threads * (size_t)iters;
+    out->count = (size_t)created * (size_t)iters;
     struct stats st;
     if (summarize(out, &st) != 0) {
         return -1;
@@ -236,7 +260,7 @@ struct write_args {
     uint64_t len;
     int iters;
     uint64_t *ns;
-    pthread_barrier_t *barrier;
+    struct start_gate *gate;
     size_t failed;
     int first_errno;
 };
@@ -247,7 +271,7 @@ static void *write_worker(void *argp)
     struct iovec iov;
 
     memset(a->src, 0x3c, (size_t)a->len);
-    pthread_barrier_wait(a->barrier);
+    start_gate_wait(a->gate);
     for (int i = 0; i < a->iters; i++) {
         uint64_t offset = (uint64_t)i * a->len;
         iov.iov_base = a->src;
@@ -267,6 +291,19 @@ static void *write_worker(void *argp)
     return NULL;
 }
 
+/* The files currently open, so an interrupt can unlink them the same way the
+ * normal and error paths do. Only one target runs at a time. */
+static char g_paths[MAX_THREADS][512];
+static volatile sig_atomic_t g_path_count;
+
+static void cleanup_handler(int sig)
+{
+    for (int i = 0; i < g_path_count; i++) {
+        unlink(g_paths[i]);
+    }
+    _exit(128 + sig);
+}
+
 static const char *mode_name(int odirect)
 {
     return odirect ? "odirect" : "buffered";
@@ -278,10 +315,10 @@ static int run_write_target(const char *target_label, const char *dir, int odire
 {
     pthread_t tids[MAX_THREADS];
     struct write_args args[MAX_THREADS];
-    pthread_barrier_t barrier;
+    struct start_gate gate = {0};
     struct samples pooled = {0};
-    char paths[MAX_THREADS][512];
     int fds[MAX_THREADS];
+    uint32_t created = 0;
     uint64_t wall_ns;
     int ok = 1;
     int flags = O_WRONLY | O_CREAT | O_TRUNC;
@@ -291,22 +328,19 @@ static int run_write_target(const char *target_label, const char *dir, int odire
     if (odirect) {
         flags |= O_DIRECT;
     }
+    g_path_count = 0;
     for (uint32_t t = 0; t < threads; t++) {
         fds[t] = -1;
     }
     for (uint32_t t = 0; t < threads; t++) {
-        snprintf(paths[t], sizeof(paths[t]), "%s/membw.%d.%u.bin", dir, (int)getpid(), t);
-        fds[t] = open(paths[t], flags, 0644);
+        snprintf(g_paths[t], sizeof(g_paths[t]), "%s/membw.%d.%u.bin", dir, (int)getpid(), t);
+        fds[t] = open(g_paths[t], flags, 0644);
         if (fds[t] < 0) {
-            printf("FAIL open %s: %s\n", paths[t], strerror(errno));
+            printf("FAIL open %s: %s\n", g_paths[t], strerror(errno));
             ok = 0;
             goto cleanup;
         }
-    }
-    if (pthread_barrier_init(&barrier, NULL, threads) != 0) {
-        printf("FAIL barrier init for %s\n", target_label);
-        ok = 0;
-        goto cleanup;
+        g_path_count = (sig_atomic_t)(t + 1);
     }
     for (uint32_t t = 0; t < threads; t++) {
         args[t].fd = fds[t];
@@ -314,7 +348,7 @@ static int run_write_target(const char *target_label, const char *dir, int odire
         args[t].len = len;
         args[t].iters = iters;
         args[t].ns = &pooled.ns[t * iters];
-        args[t].barrier = &barrier;
+        args[t].gate = &gate;
         args[t].failed = 0;
         args[t].first_errno = 0;
         if (pthread_create(&tids[t], NULL, write_worker, &args[t]) != 0) {
@@ -322,9 +356,11 @@ static int run_write_target(const char *target_label, const char *dir, int odire
             ok = 0;
             break;
         }
+        created++;
     }
+    start_gate_release(&gate, created);
     wall_ns = monotonic_ns();
-    for (uint32_t t = 0; t < threads; t++) {
+    for (uint32_t t = 0; t < created; t++) {
         pthread_join(tids[t], NULL);
         failed += args[t].failed;
         if (first_errno == 0) {
@@ -332,9 +368,8 @@ static int run_write_target(const char *target_label, const char *dir, int odire
         }
     }
     wall_ns = monotonic_ns() - wall_ns;
-    pthread_barrier_destroy(&barrier);
 
-    pooled.count = (size_t)threads * (size_t)iters;
+    pooled.count = (size_t)created * (size_t)iters;
     struct stats st;
     if (summarize(&pooled, &st) == 0) {
         printf("%-7s %-8s %-8s threads=%-2u ops=%-4zu p50=%8.3f ms p95=%8.3f ms  agg=%8.1f GiB/s\n",
@@ -352,9 +387,10 @@ cleanup:
     for (uint32_t t = 0; t < threads; t++) {
         if (fds[t] >= 0) {
             close(fds[t]);
-            unlink(paths[t]);
+            unlink(g_paths[t]);
         }
     }
+    g_path_count = 0;
     return ok ? 0 : -1;
 }
 
@@ -462,6 +498,9 @@ int main(int argc, char **argv)
                iters, MAX_SAMPLES);
         return 1;
     }
+
+    signal(SIGINT, cleanup_handler);
+    signal(SIGTERM, cleanup_handler);
 
     printf("read_membw_probe len=%llu bytes iters=%d\n",
            (unsigned long long)len, iters);
