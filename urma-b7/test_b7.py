@@ -2643,6 +2643,37 @@ storage:
         self.assertEqual(summary["finish"]["metadataCommitNs"]["totalNs"], 7)
         self.assertEqual(summary["attempt"]["pieceE2eNs"]["totalNs"], 115)
 
+    def test_read_stage_summary_extracts_pwrite_calls_writeback_and_concurrency(self):
+        child = "\n".join(
+            (
+                "file_open_ns=10 pwrite_admission_ns=15 pwrite_ns=20 "
+                "digest_ns=30 storage_total_ns=65 pwrite_calls=1 writeback_ns=250000 "
+                "finished writing piece from RM-READ lease",
+                "pwrite_ns=20 pwrite_blocking_queue_ns=12 pwrite_active_at_start=3 "
+                "pwrite_active_after=4 finished pwrite for RM-READ lease",
+            )
+        )
+
+        summary = b7.urma_read_stage_summary(child)
+
+        self.assertTrue(summary["observed"])
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertEqual(summary["storage"]["pwriteCalls"]["totalNs"], 1)
+        self.assertEqual(summary["storage"]["writebackNs"]["totalNs"], 250000)
+        self.assertEqual(summary["pwriteActivity"]["pwriteActiveAtStart"]["medianNs"], 3)
+        self.assertEqual(summary["pwriteActivity"]["pwriteActiveAfter"]["medianNs"], 4)
+        self.assertEqual(summary["pwriteActivity"]["pwriteBlockingQueueNs"]["totalNs"], 12)
+
+    def test_read_pwrite_activity_fields_remain_optional_for_archived_logs(self):
+        summary = b7.urma_read_stage_summary(
+            "file_open_ns=10 pwrite_ns=20 digest_ns=30 storage_total_ns=65 "
+            "finished writing piece from RM-READ lease"
+        )
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertEqual(summary["storage"]["pwriteCalls"]["count"], 0)
+        self.assertEqual(summary["storage"]["writebackNs"]["count"], 0)
+        self.assertEqual(summary["pwriteActivity"]["pwriteActiveAtStart"]["count"], 0)
+
     def test_read_storage_queue_fields_remain_optional_for_archived_logs(self):
         old = ("file_open_ns=10 pwrite_admission_ns=15 pwrite_ns=20 "
                "digest_ns=30 storage_total_ns=65 "

@@ -261,6 +261,11 @@ python3 b7.py cleanup --manifest results/read-current-001/manifest.json --execut
 
 新结果的 `urmaReadStageSummary.storage` 增加 `digestBlockingQueueNs` / `pwriteBlockingQueueNs`，
 归因表的 `crcQ` / `pwrQ` 为blocking线程池排队，`pwrWait` 为pwrite准入等待。
+storage 组另含 `fileOpenNs`、`pwriteCalls`（每 Piece 的 pwritev 次数）与 `writebackNs`（后台
+`sync_file_range` 时延），归因表的 `fileOpen` / `calls` / `writeback` 列对应它们；
+`urmaReadStageSummary.pwriteActivity` 从 pwrite worker 的独立日志行取 `pwriteActiveAtStart`
+/ `pwriteActiveAfter`，归因表的 `pwrAct` / `pwrEnd` 列为该 Piece 的 pwrite 并发度（不是时延）。
+归因表读取时若 manifest 缺少这些字段，会从 `evidence/child.*.tasks.log` 重新解析补齐。
 旧日志缺少的字段不计入样本；保留原始日志用于进一步检查，分位数不能直接相加归因。
 
 ### RM READ direct source 验证

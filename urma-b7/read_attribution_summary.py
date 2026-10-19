@@ -182,6 +182,36 @@ def pool_logs(logs: list[Path], warmup: bool) -> list[Path]:
     return [log for log in logs if readable(log) and "sample-" not in log.name]
 
 
+def recompute_stage_summary(run_dir: Path, manifest: dict):
+    """Rebuild the RM-READ stage summary from the measured task-scoped child
+    logs, so fields added after a run was written still surface. This mirrors
+    what b7.py stores in `result.transfer.urmaReadStageSummary`."""
+    transfer = (manifest.get("result") or {}).get("transfer") or {}
+    samples = (transfer.get("batches") or {}).get("samples") or []
+    texts = []
+    for batch in samples:
+        name = (batch.get("taskScopedEvidence") or {}).get("child")
+        if not name:
+            continue
+        try:
+            texts.append((run_dir / "evidence" / name).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    if not texts:
+        return None
+    summary = b7.urma_read_stage_summary("\n".join(texts))
+    return summary if summary.get("observed") else None
+
+
+def stage_summary(run_dir: Path, manifest: dict, stored: dict) -> dict:
+    """The manifest summary when it already carries the pwrite call count and
+    concurrency, otherwise a fresh parse of the stored task-scoped logs."""
+    storage = (stored or {}).get("storage") or {}
+    if storage.get("pwriteCalls") and (stored or {}).get("pwriteActivity"):
+        return stored
+    return recompute_stage_summary(run_dir, manifest) or stored
+
+
 def summarize_run(run_dir: Path, cases: dict) -> dict:
     manifest = load_json(run_dir / "manifest.json") or {}
     views = manifest_views(manifest)
@@ -211,7 +241,7 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
         "file_bytes": FILE_CLASS_BYTES.get(case.get("fileClass", ""), 0),
         "throughput": views["throughput"],
         "timing": views["timing"],
-        "read_stages": views["read_stages"],
+        "read_stages": stage_summary(run_dir, manifest, views["read_stages"]),
         "read_timeline": views["read_timeline"],
         "evidence": views["evidence"],
         "sample_count": views["samples"],
@@ -323,9 +353,9 @@ def print_tables(records: list[dict]) -> None:
     print("\n== child RM READ stages (measured samples, p50 ms) ==")
     print(
         f"{'run':<14} {'lane':>7} {'offer':>7} {'dstAdm':>7} {'READ':>7} "
-        f"{'lease':>7} {'doneTx':>7} {'doneWait':>8} {'pwrWait':>8} {'pwrite':>7} "
-        f"{'crc':>7} {'pwrQ':>7} {'crcQ':>7} {'recycle':>7} "
-        f"{'meta':>7} {'pieceE2E':>9}"
+        f"{'lease':>7} {'doneTx':>7} {'doneWait':>8} {'pwrWait':>8} {'fileOpen':>8} "
+        f"{'pwrite':>7} {'crc':>7} {'writeback':>9} {'calls':>5} {'pwrAct':>6} {'pwrEnd':>6} "
+        f"{'pwrQ':>7} {'crcQ':>7} {'recycle':>7} {'meta':>7} {'pieceE2E':>9}"
     )
     for r in records:
         stages = r.get("read_stages") or {}
@@ -333,6 +363,12 @@ def print_tables(records: list[dict]) -> None:
         def stage_ms(group, field):
             value = (((stages.get(group) or {}).get(field) or {}).get("medianNs"))
             return ns_to_ms(value)
+
+        def stage_count(group, field):
+            entry = (stages.get(group) or {}).get(field) or {}
+            if not entry.get("count"):
+                return "-"
+            return f"{entry.get('medianNs', 0):.0f}"
 
         if not stages.get("observed"):
             continue
@@ -346,8 +382,13 @@ def print_tables(records: list[dict]) -> None:
             f"{stage_ms('transport', 'readDoneSendNs'):>7.2f} "
             f"{stage_ms('transport', 'doneWaitNs'):>8.2f} "
             f"{stage_ms('storage', 'pwriteAdmissionNs'):>8.2f} "
+            f"{stage_ms('storage', 'fileOpenNs'):>8.2f} "
             f"{stage_ms('storage', 'pwriteNs'):>7.2f} "
             f"{stage_ms('storage', 'digestNs'):>7.2f} "
+            f"{stage_ms('storage', 'writebackNs'):>9.2f} "
+            f"{stage_count('storage', 'pwriteCalls'):>5} "
+            f"{stage_count('pwriteActivity', 'pwriteActiveAtStart'):>6} "
+            f"{stage_count('pwriteActivity', 'pwriteActiveAfter'):>6} "
             f"{stage_ms('storage', 'pwriteBlockingQueueNs'):>7.2f} "
             f"{stage_ms('storage', 'digestBlockingQueueNs'):>7.2f} "
             f"{stage_ms('finish', 'recycleNs'):>7.2f} "

@@ -77,8 +77,10 @@ STORAGE_DIGEST_BLOCKING_QUEUE_NS_RE = re.compile(r"\bdigest_blocking_queue_ns=(\
 STORAGE_PWRITE_BLOCKING_QUEUE_NS_RE = re.compile(r"\bpwrite_blocking_queue_ns=(\d+)")
 STORAGE_PWRITE_CALLS_RE = re.compile(r"\bpwrite_calls=(\d+)")
 READ_PWRITE_ACTIVE_RE = re.compile(r"\bpwrite_active_at_start=(\d+)")
+READ_PWRITE_ACTIVE_AFTER_RE = re.compile(r"\bpwrite_active_after=(\d+)")
 STORAGE_RECYCLE_NS_RE = re.compile(r"\brecycle_ns=(\d+)")
 STORAGE_TOTAL_NS_RE = re.compile(r"\bstorage_total_ns=(\d+)")
+STORAGE_WRITEBACK_NS_RE = re.compile(r"\bwriteback_ns=(\d+)")
 STORAGE_DIGEST_START_NS_RE = re.compile(r"\bdigest_start_ns=(\d+)")
 STORAGE_DIGEST_END_NS_RE = re.compile(r"\bdigest_end_ns=(\d+)")
 STORAGE_DIGEST_ENVELOPE_NS_RE = re.compile(r"\bdigest_envelope_ns=(\d+)")
@@ -2419,6 +2421,16 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         ("storageTotalNs", STORAGE_TOTAL_NS_RE),
         ("digestBlockingQueueNs", STORAGE_DIGEST_BLOCKING_QUEUE_NS_RE),
         ("pwriteBlockingQueueNs", STORAGE_PWRITE_BLOCKING_QUEUE_NS_RE),
+        ("pwriteCalls", STORAGE_PWRITE_CALLS_RE),
+        ("writebackNs", STORAGE_WRITEBACK_NS_RE),
+    )
+    # The pwrite worker emits its own line before the storage envelope, so the
+    # observed pwrite concurrency is sampled separately. These are counts, not
+    # durations, but share the summary shape so the report reads one median.
+    pwrite_activity_fields = (
+        ("pwriteActiveAtStart", READ_PWRITE_ACTIVE_RE),
+        ("pwriteActiveAfter", READ_PWRITE_ACTIVE_AFTER_RE),
+        ("pwriteBlockingQueueNs", STORAGE_PWRITE_BLOCKING_QUEUE_NS_RE),
     )
     finish_fields = (
         ("storageWriteNs", READ_STORAGE_WRITE_NS_RE),
@@ -2441,8 +2453,15 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
     storage, storage_bad = samples(
         "finished writing piece from RM-READ lease",
         tuple(pattern for _, pattern in storage_fields),
-        # Older logs lack admission and blocking-pool queue fields.
-        optional_indexes=frozenset((1, 5, 6)),
+        # Older logs lack admission, blocking-pool queue, call count and
+        # writeback fields.
+        optional_indexes=frozenset((1, 5, 6, 7, 8)),
+    )
+    pwrite_activity, pwrite_activity_bad = samples(
+        "finished pwrite for RM-READ lease",
+        tuple(pattern for _, pattern in pwrite_activity_fields),
+        # Older logs lack the concurrency counters and the queue field.
+        optional_indexes=frozenset((0, 1, 2)),
     )
     finish, finish_bad = samples(
         "finished committing urma READ piece to storage", tuple(pattern for _, pattern in finish_fields)
@@ -2469,9 +2488,16 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         "observed": bool(transport or storage or finish or attempt),
         "transport": summarize(transport, transport_fields),
         "storage": summarize(storage, storage_fields),
+        "pwriteActivity": summarize(pwrite_activity, pwrite_activity_fields),
         "finish": summarize(finish, finish_fields),
         "attempt": summarize(attempt, attempt_fields),
-        "malformedLines": transport_bad + storage_bad + finish_bad + attempt_bad,
+        "malformedLines": (
+            transport_bad
+            + storage_bad
+            + pwrite_activity_bad
+            + finish_bad
+            + attempt_bad
+        ),
     }
 
 
