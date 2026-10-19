@@ -351,7 +351,7 @@ cc -O2 -Wall -Wextra -pthread read_membw_probe.c -o read_membw_probe
 **M3–M6 perfile —— 每线程写自己的文件**（轮 B，无 `--fallocate`）：
 
 | target | 模式 | threads | p50 (ms) | p95 (ms) | agg (GiB/s) |
-|---|---|---|---:|---:|---:|---:|
+|---|---|---|---:|---:|---:|
 | M3 disk | buffered | 1 | 2.026 | 2.471 | 15.4 |
 | M3 disk | buffered | 2 | 2.021 | 2.565 | 30.4 |
 | M3 disk | buffered | 4 | 1.812 | 2.593 | 64.1 |
