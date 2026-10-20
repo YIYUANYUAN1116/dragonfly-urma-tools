@@ -176,6 +176,36 @@ class B7Tests(unittest.TestCase):
             legacy.write_text(self.cached_parent_log())
             self.assertEqual(read_attribution.pool_logs([log, legacy], False), [legacy])
 
+    def test_sendrecv_case_renders_both_sides_and_resets_stale_control_on_tcp_baseline(self):
+        inventory = b7.select_profile(self.inventory, "read")
+        _, _, layouts = b7.generated_layout(inventory, "dual", "control-mode", None)
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        stale = "storage:\n  server:\n    urma:\n      read:\n        controlTransport: sendrecv\n        controlBytes: 64KiB\n"
+        for name, mode in (("read-registration-piece32-cc16", "tcp"),
+                           ("read-sendrecv-piece32-cc16", "sendrecv"),
+                           ("read-cached-region256-sendrecv-piece32-cc16", "sendrecv")):
+            for role in ("parent", "child"):
+                output = b7.render_role_config(stale, inventory, layouts[role], role, "control-mode", cases[name])
+                self.assertIn(f'controlTransport: "{mode}"', output)
+                self.assertIn('controlBytes: "16MiB"', output)
+
+    def test_sendrecv_gate_requires_negotiated_mode_on_both_peers(self):
+        native = "control_transport=Sendrecv urma READ lane established"
+        tcp = "control_transport=Tcp urma READ lane established"
+        self.assertEqual(b7.validate_sendrecv_control(native, native)["childSendrecvLanes"], 1)
+        for parent, child in ((tcp, native), (native, tcp), (native, "")):
+            with self.assertRaisesRegex(b7.B7Error, "control not proven"):
+                b7.validate_sendrecv_control(parent, child)
+
+    def test_sendrecv_configuration_rejects_unknown_mode_or_too_small_budget(self):
+        base = b7.load_cases(TOOL_DIR / "cases.json")["read-sendrecv-piece32-cc16"]
+        for read in ({"controlTransport": "auto"}, {"controlTransport": "sendrecv", "controlBytes": "64KiB"}):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "cases.json"
+                path.write_text(json.dumps({"schemaVersion": 1, "cases": [{**base, "urmaRead": read}]}))
+                with self.assertRaisesRegex(b7.B7Error, "controlTransport|controlBytes"):
+                    b7.load_cases(path)
+
     def setUp(self):
         self.inventory = json.loads((TOOL_DIR / "inventory.json").read_text(encoding="utf-8"))
         # Existing executor tests exercise remote orchestration rather than the

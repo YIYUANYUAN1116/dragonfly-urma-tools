@@ -4042,6 +4042,8 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 "maxOutstandingPerPiece",
                 "sourceWorkers",
                 "registration",
+                "controlTransport",
+                "controlBytes",
                 "maxReadSize",
                 "maxConcurrentStorageWrites",
             }
@@ -4077,6 +4079,11 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
                 raise B7Error(
                     f"case {case['name']} urmaRead.sourceWorkers must be an int in 0..=16"
                 )
+        if (urma_read or {}).get("controlTransport", "tcp") not in ("tcp", "sendrecv"):
+            raise B7Error(f"case {case['name']} urmaRead.controlTransport must be tcp or sendrecv")
+        control_bytes = parse_registration_bytes((urma_read or {}).get("controlBytes", "16MiB"))
+        if control_bytes is None or ((urma_read or {}).get("controlTransport") == "sendrecv" and control_bytes < 33 * 4096):
+            raise B7Error(f"case {case['name']} urmaRead.controlBytes must cover the SEND/RECV endpoint")
         registration = (urma_read or {}).get("registration", {})
         if not isinstance(registration, dict) or set(registration) - {"mode", "maxRegionBytes"}:
             raise B7Error(f"case {case['name']} has invalid urmaRead.registration")
@@ -4135,6 +4142,19 @@ def parse_registration_bytes(value: str) -> int | None:
         return None
     size = int(match[1]) * {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3}[match[2].lower()]
     return size if size > 0 else None
+
+
+def validate_sendrecv_control(parent_log: str, child_log: str) -> dict:
+    """Require actual negotiated-mode logs on both sides, not just YAML intent."""
+    evidence = {}
+    for role, text in (("parent", parent_log), ("child", child_log)):
+        count = sum("urma READ lane established" in line
+                    and re.search(r"\bcontrol_transport=Sendrecv\b", line) is not None
+                    for line in text.splitlines())
+        evidence[role + "SendrecvLanes"] = count
+        if count == 0:
+            raise B7Error(f"SEND/RECV control not proven on {role}; check rebuilt v7 binaries and both configs")
+    return evidence
 
 
 def validate_cached_source_reuse(case: dict, parent_log: str, task_id: str, file_bytes: int) -> dict:
@@ -4338,6 +4358,8 @@ def role_overlays(
             "maxOutstandingPerPeer": 64,
             "maxOutstandingPerPiece": 8,
             "sourceWorkers": 0,
+            "controlTransport": "tcp",
+            "controlBytes": "16MiB",
             "maxReadSize": "4294967295B",
             "maxConcurrentStorageWrites": 1024,
         }
@@ -5028,6 +5050,8 @@ def command_run_fanout(
         result["fanoutDiagnostics"] = analyze_fanout_transport_health(
             evidence_by_role["parent"], child_evidence
         )
+        if case.get("urmaRead", {}).get("controlTransport") == "sendrecv":
+            result["controlEvidence"] = validate_sendrecv_control(evidence_by_role["parent"], evidence_by_role["child"])
         try:
             result["evidence"] = analyze_evidence(
                 evidence_by_role["parent"],
@@ -5933,6 +5957,8 @@ def command_run(args: argparse.Namespace, inventory: dict[str, Any]) -> int:
             evidence = collect_remote_evidence(node, inventory, layout)
             evidence_by_role[role] = evidence
             (evidence_dir / f"{role}.log").write_text(evidence, encoding="utf-8")
+        if case.get("urmaRead", {}).get("controlTransport") == "sendrecv":
+            result["controlEvidence"] = validate_sendrecv_control(evidence_by_role["parent"], evidence_by_role["child"])
         try:
             result["evidence"] = analyze_evidence(
                 evidence_by_role["parent"],

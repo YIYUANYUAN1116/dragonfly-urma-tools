@@ -242,6 +242,7 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
         "concurrent_piece_count": concurrency,
         "piece_bytes": piece_bytes,
         "max_read_size": read_size,
+        "control_transport": read.get("controlTransport", "tcp"),
         "registration_mode": read.get("registration", {}).get("mode", "piece"),
         "max_region_bytes": human_bytes(read.get("registration", {}).get("maxRegionBytes", "1GiB")),
         "chunks_per_piece": -(-piece_bytes // read_size) if piece_bytes and read_size else None,
@@ -515,7 +516,7 @@ def print_tables(records: list[dict]) -> None:
             print(" ".join(columns))
 
     print("\n== parent Source cache (successfully served identities; not native API call counts) ==")
-    print(f"{'run':<14} {'use':<7} {'mode':>6} {'region':>8} {'cached':>7} {'sources':>7} {'reuse':>7} {'noID':>5} {'leases':>7} {'adm ms':>8} {'lease ms':>9}")
+    print(f"{'run':<14} {'use':<7} {'mode':>6} {'ctl':>8} {'region':>8} {'cached':>7} {'sources':>7} {'reuse':>7} {'noID':>5} {'leases':>7} {'adm ms':>8} {'lease ms':>9}")
     for r in records:
         for label in ("samples", "warmup"):
             parent = r.get("pools", {}).get(label, {}).get("parent")
@@ -527,7 +528,7 @@ def print_tables(records: list[dict]) -> None:
             reuse = str(cached - sources) if not missing else "?"
             adm = (parent.get("stage_cache_admission_ns") or {}).get("p50_ms")
             lease = (parent.get("stage_lease_release_ns") or {}).get("p50_ms")
-            print(f"{str(r['run']):<14} {label:<7} {r.get('registration_mode', '?'):>6} "
+            print(f"{str(r['run']):<14} {label:<7} {r.get('registration_mode', '?'):>6} {r.get('control_transport', 'tcp'):>8} "
                   f"{fmt_bytes(r.get('max_region_bytes')):>8} {cached:>7} {sources:>7} {reuse:>7} "
                   f"{missing:>5} {parent.get('cached_lease_released', 0):>7} "
                   f"{num_or_dash(adm):>8} {num_or_dash(lease):>9}")

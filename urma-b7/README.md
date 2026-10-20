@@ -912,3 +912,43 @@ Source 身份只用于诊断，不记录 token 或 descriptor 凭证。
 每组 3 个 measured Task，整文件模式通常显示 `cached=96, sources=3, reuse=93`；
 256 MiB Region 模式显示 `cached=96, sources=12, reuse=84`。warmup 单列。
 当前工具尚未证明跨批次热缓存、Segment 淘汰/注销或多人环境下的性能收益。
+
+
+### SEND/RECV 控制通道对照
+
+两端需更新到支持 **DFUR READ v7** 的二进制；v6 及更早版本不兼容。
+默认 `controlTransport: tcp`，新 case 显式设为 `sendrecv`，`controlBytes: 16MiB`。
+TCP 只负责握手交换 descriptor 和连接断开检测；握手后控制消息走 SEND/RECV，
+大块数据仍走 READ。活动会话不会悄悄切回 TCP 控制。
+
+控制 Jetty/CQ、收发 Buffer 独立于 READ，32 个 4 KiB RX Slot + 1 个 TX Slot，
+每条 lane 注册 132 KiB，预算耗尽拒绝新控制端点。TCP 基线 case 显式覆盖为 tcp，
+无需修改基础 config 模板。两端仍须同时升级，即使本次运行选 TCP。
+
+新增 case 保留 SHA256、零 fallback 和 READ 生命周期校验；Cached case 另保留复用校验。
+运行后还会核对 Parent/Child 原始日志中的 `control_transport=Sendrecv`，
+缺失任一端的实际协商证据都会失败。结果保存在 `result.controlEvidence`。
+
+```bash
+for case in \
+  read-registration-piece32-cc16 \
+  read-sendrecv-piece32-cc16 \
+  read-cached-region256-piece32-cc16 \
+  read-cached-region256-sendrecv-piece32-cc16
+do
+  run_id="${case}-001"
+  python3 b7.py prepare \
+    --profile read --mode dual \
+    --run-id "$run_id" --case "$case" \
+    --parent-cpus 192-223 \
+    --child-cpus 192-223 \
+    --execute || break
+  python3 b7.py run \
+    --manifest "results/$run_id/manifest.json" \
+    --execute || break
+done
+```
+
+先单独跑一个 SEND/RECV case 确认能握手、完成和安全关停，再进行上述同配置 A/B。
+本轮仅离线验证；真实 provider 的收发、低 credit/接收拥塞、取消/flush、
+同 Task 多 Child 与 1→7/7→1 仍待真机验收。不要把离线测试通过当作硬件路径通过。

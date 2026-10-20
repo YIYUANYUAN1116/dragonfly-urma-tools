@@ -1518,6 +1518,47 @@
       "category": "urma-read-current-validation"
     },
     {
+      "name": "read-sendrecv-piece32-cc16",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "registration": {
+          "mode": "piece",
+          "maxRegionBytes": "1GiB"
+        },
+        "controlTransport": "sendrecv",
+        "controlBytes": "16MiB"
+      },
+      "category": "urma-read-sendrecv-control-validation"
+    },
+    {
+      "name": "read-cached-region256-sendrecv-piece32-cc16",
+      "fileClass": "1g",
+      "pieceLength": "32mib",
+      "concurrentPieceCount": 16,
+      "postListSize": 1,
+      "pipelineDepth": 1,
+      "maxInflightChunks": 16,
+      "repetitions": 3,
+      "warmups": 1,
+      "urmaRead": {
+        "registration": {
+          "mode": "cached",
+          "maxRegionBytes": "256MiB"
+        },
+        "controlTransport": "sendrecv",
+        "controlBytes": "16MiB"
+      },
+      "category": "urma-read-sendrecv-control-validation",
+      "requireCachedSourceReuse": true
+    },
+    {
       "name": "read-registration-piece32-cc16",
       "fileClass": "1g",
       "pieceLength": "32mib",
