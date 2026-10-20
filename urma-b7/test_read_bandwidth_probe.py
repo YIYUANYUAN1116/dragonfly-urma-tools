@@ -141,6 +141,31 @@ class ReadBandwidthProbeTests(unittest.TestCase):
             with self.subTest(prefix=prefix), self.assertRaises(ValueError):
                 probe.evidence(prefix + passed, "B", "parent", "fixed")
 
+    def test_contiguous_layout_only_changes_layout_environment_and_is_b_only(self):
+        default = probe.environment(probe.parser().parse_args(self.args("--mode", "B")))
+        args = probe.parser().parse_args(self.args("--mode", "B", "--destination-layout", "contiguous"))
+        probe.validate(args)
+        contiguous = probe.environment(args)
+        self.assertEqual(contiguous.pop("URMA_BW_DESTINATION_LAYOUT"), "contiguous")
+        self.assertEqual(default.pop("URMA_BW_DESTINATION_LAYOUT"), "segments")
+        self.assertEqual(contiguous, default)
+        with self.assertRaises(ValueError):
+            probe.validate(probe.parser().parse_args(self.args("--destination-layout", "contiguous")))
+
+    def test_contiguous_run_requires_actual_single_segment_allocation_evidence(self):
+        config = "URMA_BW_CONFIG mode=B role=child depth=16 destination_layout=contiguous\n"
+        allocation = "URMA_BW_DESTINATION layout=contiguous segments=1 segment_bytes=536870912 registered_bytes=536870912 slots=16 slot_bytes=33554432\n"
+        result = "URMA_BW_RESULT mode=B completed_bytes=1073741824 completed_pieces=32 elapsed_ns=500000000 GiBps=2.0000 Gbps=17.1799 storage=false crc_timed=false drain_included=true\n"
+        passed = "URMA_BW_PASS mode=B role=child integrity=all-pieces-before-and-after shutdown=both-sides"
+        def evidence(prefix):
+            return probe.evidence(prefix + result + passed, "B", "child", destination_layout="contiguous")
+        self.assertEqual(evidence(config + allocation)["completedPieces"], 32)
+        for prefix in ("", config, allocation, config.replace("contiguous", "segments") + allocation,
+                       config + allocation.replace("segments=1 ", "segments=16 "),
+                       config + allocation.replace("slots=16 ", "slots=8 "), config + allocation * 2):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                evidence(prefix)
+
 
 if __name__ == "__main__":
     unittest.main()

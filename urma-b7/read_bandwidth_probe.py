@@ -36,6 +36,8 @@ def parser():
     p.add_argument("--region-bytes", type=int, default=256 << 20)
     p.add_argument("--source-pattern", choices=("sequential", "fixed"), default="sequential",
                    help="B only: fixed reads Piece 0 during warmup/measurement; validation still covers the whole file")
+    p.add_argument("--destination-layout", choices=("segments", "contiguous"), default="segments",
+                   help="B only: separate registered buffers or one Segment with disjoint Slot ranges")
     p.add_argument("--depth", type=int, default=16)
     p.add_argument("--seconds", type=int, default=10)
     p.add_argument("--warmup-seconds", type=int, default=1)
@@ -47,6 +49,8 @@ def parser():
 
 
 def validate(a):
+    if a.mode != "B" and a.destination_layout != "segments":
+        raise ValueError("--destination-layout contiguous is supported only by mode B")
     if a.mode != "B" and a.source_pattern != "sequential":
         raise ValueError("--source-pattern fixed is supported only by mode B")
     if a.role == "parent" and a.file is None:
@@ -79,6 +83,7 @@ def environment(a):
         "URMA_BW_SECONDS": str(a.seconds), "URMA_BW_WARMUP_SECONDS": str(a.warmup_seconds),
         "URMA_BW_TOKIO_THREADS": str(a.tokio_threads),
         "URMA_BW_SOURCE_PATTERN": a.source_pattern,
+        "URMA_BW_DESTINATION_LAYOUT": a.destination_layout,
     }
 
 
@@ -97,10 +102,20 @@ def executable(output):
     return Path(paths.pop())
 
 
-def evidence(text, mode, role, source_pattern="sequential"):
+def evidence(text, mode, role, source_pattern="sequential", destination_layout="segments"):
     if source_pattern == "fixed" and not re.search(
             rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bsource_pattern=fixed(?:\s|$)", text):
         raise ValueError("Probe did not prove fixed source pattern; update the Rust probe on both nodes")
+    if destination_layout == "contiguous":
+        if not re.search(rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bdestination_layout=contiguous(?:\s|$)", text):
+            raise ValueError("Probe did not prove contiguous destination layout; update the Rust probe on both nodes")
+        if role == "child":
+            destination = re.findall(r"URMA_BW_DESTINATION layout=contiguous segments=1 segment_bytes=(\d+) registered_bytes=(\d+) slots=(\d+) slot_bytes=(\d+)(?:\s|$)", text)
+            if len(destination) != 1:
+                raise ValueError("Expected one actual contiguous destination allocation")
+            segment, registered, slots, piece = map(int, destination[0])
+            if not (0 < segment == registered == slots * piece and 1 <= slots <= 64 and piece > 0):
+                raise ValueError("Inconsistent contiguous destination geometry")
     marker = f"URMA_BW_PASS mode={mode} role={role} integrity=all-pieces-before-and-after shutdown=both-sides"
     if marker not in text:
         raise ValueError("Probe did not prove integrity and both-side shutdown")
@@ -160,7 +175,7 @@ def main(argv=None):
             metadata.write("\n")
             raise ValueError("Storage probe build failed; no hardware test executed")
         binary = executable(proc.stdout)
-        record = {"kind": "urma-read-bw-probe", "mode": a.mode, "role": a.role, "sourcePattern": a.source_pattern,
+        record = {"kind": "urma-read-bw-probe", "mode": a.mode, "role": a.role, "sourcePattern": a.source_pattern, "destinationLayout": a.destination_layout,
                   "builtAtUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                   "repo": str(a.repo.resolve()), "testExecutable": str(binary),
                   "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "env": env, "cpus": a.cpus,
@@ -174,7 +189,7 @@ def main(argv=None):
                 log.flush()
                 if proc.returncode:
                     raise ValueError(f"Probe exited {proc.returncode}; inspect {a.log}")
-                record["result"] = evidence(a.log.read_text(errors="replace"), a.mode, a.role, a.source_pattern)
+                record["result"] = evidence(a.log.read_text(errors="replace"), a.mode, a.role, a.source_pattern, a.destination_layout)
             record["state"] = "built" if a.build_only else "passed"
         except Exception as error:
             record.update(state="failed", error=str(error))

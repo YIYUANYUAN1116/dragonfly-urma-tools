@@ -1267,3 +1267,79 @@ URMA_BW_DST_LAYOUT=shared taskset -c 192-223 \
 BW average、进程退出状态。相邻跑原版/shared/slots，建议三轮，以确认环境波动。
 若shared仍约400 Gbps而slots明显下降，支持目的工作集是差距因素；若两者均降低，
 不能单独归因目的范围，应先排查扩大注册/首次触页、库版本及NUMA差异。
+
+
+### B 单 Segment 目的窗口对照（无需 perftest 源码）
+
+参考urma-transport-lab的单Segment独立RX Slot布局，新增B-only参数：
+
+```text
+--destination-layout segments       # 默认：16×32 MiB分配，注册16个Segment
+--destination-layout contiguous     # 1×512 MiB分配，注册1个Segment，划分16个独立范围
+```
+
+两种布局的总字节、独立Slot数量/长度、LOCAL_ONLY注册flag/对齐/清零及post/poll循环相同。
+源file/Region/import和source-pattern不变。每个WR在对应Slot完成前独占其目的范围，
+不共写目的地址。contiguous的READ local_offset及CRC slice均来自同一份Slot范围表；
+全部buffer在前后校验完成和WR排空后只关闭一次。小文件的校验至少发depth次，以覆盖
+每个目的Slot；源索引循环，仍覆盖全部文件。
+
+仅测试用Rust模块改变，不修改生产DestinationPool、Source Cache、Storage或GC。
+两端签名包含layout，C拒绝contiguous。launcher除了CONFIG还校验Child实际
+URMA_BW_DESTINATION记录的单Segment、Slot数与注册字节一致，防止旧binary忽略新参数。
+CONFIG/NATIVE和.log.json也记录layout。
+
+**范围：**这同时改变分配和注册形态，物理页布局、首次触页/NUMA分布可能随之变化。
+若性能改变，说明该布局组合值得继续细分，不能直接断言是Segment数量本身导致。
+建议同轮交替segments/contiguous，固定source-pattern=fixed、CPU、provider和所有其它参数。
+
+#### 两端更新并预构建
+
+同步`dragonfly-client-storage/src/urma/read_bandwidth_probe.rs`和工具
+`urma-b7/read_bandwidth_probe.py`。不需要UMDK perftest源码；使用之前可构建Rust探针的
+已安装头文件/库（例如UMDK_INCLUDE_DIR=/usr/include/ub/umdk/urma、UMDK_LIB_DIR=/usr/lib64）。
+两端先执行一次，避免Parent等待Child首次编译：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --destination-layout contiguous \
+  --role child --addr 10.10.10.2:31918 \
+  --log results/read-bw-B-contiguous-build-001/build.log \
+  --build-only --execute
+```
+
+Parent：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --destination-layout contiguous \
+  --role parent --addr 0.0.0.0:31918 \
+  --file /home/y30083740/dragonfly-b7/origin/input-1g.bin \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-contiguous-001/parent.log --execute
+```
+
+Child：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --destination-layout contiguous \
+  --role child --addr 10.10.10.2:31918 \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-contiguous-001/child.log --execute
+```
+
+先Parent后Child；两端都退出后用segments替换contiguous、换新日志目录跑对照。
+两组均保留完整性和双方shutdown门禁，不以单轮变化宣布性能收益。
+
+```bash
+grep -E 'URMA_BW_(CONFIG|DESTINATION|RESULT|NATIVE|PASS)' \
+  results/read-bw-B-contiguous-001/child.log
+```
+
+默认几何应出现`layout=contiguous segments=1 segment_bytes=536870912
+registered_bytes=536870912 slots=16 slot_bytes=33554432`。segments组应为16个32 MiB
+Segment，registered_bytes相同。取值/计时定义沿用前文B汇总观测，软件未退休深度不等于硬件占用。
