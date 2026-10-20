@@ -203,6 +203,18 @@ def recompute_stage_summary(run_dir: Path, manifest: dict):
             texts.append((run_dir / "evidence" / name).read_text(encoding="utf-8"))
         except OSError:
             continue
+    if not texts and not samples:
+        # Legacy manifests may omit the per-batch index. Only explicit sample
+        # logs qualify; never promote warmup or the merged whole-run log.
+        task_ids = set(transfer.get("measuredTaskIds") or [])
+        for path in range_logs(run_dir, "child"):
+            if ".sample-" not in path.name:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            texts.append(b7.filter_task_scoped_log(text, task_ids) if task_ids else text)
     if not texts:
         return None
     summary = b7.urma_read_stage_summary("\n".join(texts))
@@ -210,10 +222,22 @@ def recompute_stage_summary(run_dir: Path, manifest: dict):
 
 
 def stage_summary(run_dir: Path, manifest: dict, stored: dict) -> dict:
-    """The manifest summary when it already carries the pwrite call count and
-    concurrency, otherwise a fresh parse of the stored task-scoped logs."""
+    """Keep stored stage aggregates, backfill native attribution from evidence.
+
+    Missing local batch logs must not replace full-run manifest aggregates with
+    a partial sample set. The readDriver pieceCount exposes its own coverage.
+    """
     storage = (stored or {}).get("storage") or {}
     if storage.get("pwriteCalls") and (stored or {}).get("pwriteActivity"):
+        if "readDriver" not in stored:
+            fresh = recompute_stage_summary(run_dir, manifest)
+            if fresh:
+                return {
+                    **stored,
+                    "stageDurationsAreAdditive": False,
+                    "readIntervalScope": "piece-driver",
+                    "readDriver": fresh["readDriver"],
+                }
         return stored
     return recompute_stage_summary(run_dir, manifest) or stored
 
@@ -234,6 +258,15 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
     piece_bytes = human_bytes(case.get("pieceLength", ""))
     read_size = human_bytes(read.get("maxReadSize", "")) if read else 0
     concurrency = case.get("concurrentPieceCount") or case.get("concurrency")
+    timeline = views["read_timeline"]
+    if timeline:
+        # Annotate archived aggregates as well; preserve every numeric value.
+        timeline = {
+            **timeline,
+            "readIntervalScope": "piece-driver",
+            "readConcurrencyIsHardwareWrCount": False,
+            "stageDurationsAreAdditive": False,
+        }
 
     record = {
         "run": views["run"] or run_dir.name,
@@ -251,7 +284,7 @@ def summarize_run(run_dir: Path, cases: dict) -> dict:
         "throughput": views["throughput"],
         "timing": views["timing"],
         "read_stages": stage_summary(run_dir, manifest, views["read_stages"]),
-        "read_timeline": views["read_timeline"],
+        "read_timeline": timeline,
         "evidence": views["evidence"],
         "sample_count": views["samples"],
         "logs": {},
@@ -321,9 +354,9 @@ def print_tables(records: list[dict]) -> None:
     print("\n== per run ==")
     print(
         f"{'run':<14} {'case':<32} {'cc':>3} {'piece':>6} {'maxRd':>6} {'chk':>3} "
-        f"{'pwrCap':>6} {'aggMiB/s':>8} {'dfget ms':>8} {'toREAD':>7} {'READ->1':>7} "
-        f"{'READspan':>8} {'piece ms':>8} {'tail ms':>7} "
-        f"{'rate':>7} {'effMaxRd':>9} {'fallb':>5} {'ok/att':>9} {'n':>2}"
+        f"{'pwrCap':>6} {'aggMiB/s':>8} {'dfget ms':>8} {'toTry':>7} {'try->1':>7} "
+        f"{'trySpan':>8} {'pieceGap':>8} {'tail ms':>7} "
+        f"{'gapRate':>7} {'effMaxRd':>9} {'fallb':>5} {'ok/att':>9} {'n':>2}"
     )
     for r in records:
         timing = r["timing"]
@@ -361,8 +394,8 @@ def print_tables(records: list[dict]) -> None:
 
     print("\n== child RM READ stages (measured samples, p50 ms) ==")
     print(
-        f"{'run':<14} {'lane':>7} {'offer':>7} {'dstAdm':>7} {'READ':>7} "
-        f"{'lease':>7} {'doneTx':>7} {'doneWait':>8} {'pwrWait':>8} {'fileOpen':>8} "
+        f"{'run':<14} {'lane':>7} {'offer':>7} {'dstAdm':>7} {'rdDrv':>7} "
+        f"{'leasePub':>7} {'doneEnq':>7} {'doneWait':>8} {'pwrWait':>8} {'fileOpen':>8} "
         f"{'pwrite':>7} {'crc':>7} {'writeback':>9} {'calls':>5} {'pwrAct':>6} {'pwrEnd':>6} "
         f"{'pwrQ':>7} {'crcQ':>7} {'recycle':>7} {'meta':>7} {'pieceE2E':>9}"
     )
@@ -370,8 +403,10 @@ def print_tables(records: list[dict]) -> None:
         stages = r.get("read_stages") or {}
 
         def stage_ms(group, field):
-            value = (((stages.get(group) or {}).get(field) or {}).get("medianNs"))
-            return ns_to_ms(value)
+            entry = (stages.get(group) or {}).get(field) or {}
+            if not entry.get("count"):
+                return "-"
+            return f"{ns_to_ms(entry.get('medianNs')):.2f}"
 
         def stage_count(group, field):
             entry = (stages.get(group) or {}).get(field) or {}
@@ -383,33 +418,66 @@ def print_tables(records: list[dict]) -> None:
             continue
         print(
             f"{str(r['run']):<14} "
-            f"{stage_ms('transport', 'laneAcquireNs'):>7.2f} "
-            f"{stage_ms('transport', 'segmentOfferWaitNs'):>7.2f} "
-            f"{stage_ms('transport', 'destinationAdmissionNs'):>7.2f} "
-            f"{stage_ms('transport', 'readCompletionNs'):>7.2f} "
-            f"{stage_ms('transport', 'leasePublishNs'):>7.2f} "
-            f"{stage_ms('transport', 'readDoneSendNs'):>7.2f} "
-            f"{stage_ms('transport', 'doneWaitNs'):>8.2f} "
-            f"{stage_ms('storage', 'pwriteAdmissionNs'):>8.2f} "
-            f"{stage_ms('storage', 'fileOpenNs'):>8.2f} "
-            f"{stage_ms('storage', 'pwriteNs'):>7.2f} "
-            f"{stage_ms('storage', 'digestNs'):>7.2f} "
-            f"{stage_ms('storage', 'writebackNs'):>9.2f} "
+            f"{stage_ms('transport', 'laneAcquireNs'):>7} "
+            f"{stage_ms('transport', 'segmentOfferWaitNs'):>7} "
+            f"{stage_ms('transport', 'destinationAdmissionNs'):>7} "
+            f"{stage_ms('transport', 'readCompletionNs'):>7} "
+            f"{stage_ms('transport', 'leasePublishNs'):>7} "
+            f"{stage_ms('transport', 'readDoneSendNs'):>7} "
+            f"{stage_ms('transport', 'doneWaitNs'):>8} "
+            f"{stage_ms('storage', 'pwriteAdmissionNs'):>8} "
+            f"{stage_ms('storage', 'fileOpenNs'):>8} "
+            f"{stage_ms('storage', 'pwriteNs'):>7} "
+            f"{stage_ms('storage', 'digestNs'):>7} "
+            f"{stage_ms('storage', 'writebackNs'):>9} "
             f"{stage_count('storage', 'pwriteCalls'):>5} "
             f"{stage_count('pwriteActivity', 'pwriteActiveAtStart'):>6} "
             f"{stage_count('pwriteActivity', 'pwriteActiveAfter'):>6} "
-            f"{stage_ms('storage', 'pwriteBlockingQueueNs'):>7.2f} "
-            f"{stage_ms('storage', 'digestBlockingQueueNs'):>7.2f} "
-            f"{stage_ms('finish', 'recycleNs'):>7.2f} "
-            f"{stage_ms('finish', 'metadataCommitNs'):>7.2f} "
-            f"{stage_ms('attempt', 'pieceE2eNs'):>9.2f}"
+            f"{stage_ms('storage', 'pwriteBlockingQueueNs'):>7} "
+            f"{stage_ms('storage', 'digestBlockingQueueNs'):>7} "
+            f"{stage_ms('finish', 'recycleNs'):>7} "
+            f"{stage_ms('finish', 'metadataCommitNs'):>7} "
+            f"{stage_ms('attempt', 'pieceE2eNs'):>9}"
         )
 
-    print("\n== child RM READ batch envelopes (measured samples, p50 ms) ==")
+    print("\n== child READ driver/native attribution (measured samples, p50 ms; overlapping) ==")
     print(
-        f"{'run':<14} {'batches':>7} {'complete':>8} {'READenv':>8} {'CQEspan':>8} "
-        f"{'startSp':>8} {'idle':>7} {'busy%':>6} {'avgRd':>6} {'peakRd':>6} "
-        f"{'WRs':>5} {'postB':>5} {'WR/post':>7} {'pwrEnv':>8} {'1CQE->pwr':>10} {'lastCQE->end':>12} {'overlap':>8} "
+        f"{'run':<14} {'n':>4} {'timedWRs':>8} {'driver':>8} {'sub':>8} "
+        f"{'admQ':>8} {'ownerQ':>8} {'postCmd':>8} {'postAPI':>8} "
+        f"{'nativeEnv':>9} {'cqeObs':>8} {'wake':>8}"
+    )
+    for r in records:
+        driver = (r.get("read_stages") or {}).get("readDriver") or {}
+        if not driver.get("pieceCount"):
+            continue
+
+        def driver_ms(field):
+            value = driver.get(field) or {}
+            if not value.get("count"):
+                return "-"
+            timed = driver.get("nativeTimedWrCount") or {}
+            if field.startswith("native") and timed.get("count") and not timed.get("totalNs"):
+                return "-"
+            return f"{ns_to_ms(value.get('medianNs')):.2f}"
+
+        timed = driver.get("nativeTimedWrCount") or {}
+        timed_count = str(timed["totalNs"]) if timed.get("count") else "-"
+        print(
+            f"{str(r['run']):<14} {driver['pieceCount']:>4} {timed_count:>8} "
+            + " ".join(f"{driver_ms(field):>8}" for field in (
+                "readCompletionNs", "progressSubscribeNs", "postAdmissionWaitNs",
+                "postQueueWaitNs", "postCommandNs", "nativePostCallNs",
+            ))
+            + f" {driver_ms('nativeReadEnvelopeNs'):>9}"
+            + f" {driver_ms('cqeToObservedNs'):>8}"
+            + f" {driver_ms('completionNotificationDelayNs'):>8}"
+        )
+
+    print("\n== child software READ driver batch envelopes (measured samples, p50 ms) ==")
+    print(
+        f"{'run':<14} {'batches':>7} {'complete':>8} {'drvEnv':>8} {'doneSpan':>8} "
+        f"{'startSp':>8} {'drvIdle':>7} {'active%':>7} {'avgDrv':>6} {'peakDrv':>7} "
+        f"{'WRs':>5} {'postB':>5} {'WR/post':>7} {'pwrEnv':>8} {'1done->pwr':>10} {'lastdone->end':>12} {'overlap':>8} "
         f"{'peakPwr':>8} {'earlyPwr':>8}"
     )
     for r in records:
@@ -419,7 +487,10 @@ def print_tables(records: list[dict]) -> None:
         durations = timeline.get("duration") or {}
 
         def timeline_ms(field):
-            return ns_to_ms((durations.get(field) or {}).get("medianNs"))
+            entry = durations.get(field) or {}
+            if not entry.get("count"):
+                return "-"
+            return f"{ns_to_ms(entry.get('medianNs')):.2f}"
 
         peak_read = (timeline.get("peakReadActive") or {}).get("median", float("nan"))
         average_read = (timeline.get("averageReadActiveMilli") or {}).get(
@@ -441,20 +512,20 @@ def print_tables(records: list[dict]) -> None:
             f"{str(r['run']):<14} "
             f"{timeline.get('batchCount', 0):>7} "
             f"{timeline.get('completeBatchCount', 0):>8} "
-            f"{timeline_ms('readBatchEnvelopeNs'):>8.2f} "
-            f"{timeline_ms('readCqeSpanNs'):>8.2f} "
-            f"{timeline_ms('readStartSpanNs'):>8.2f} "
-            f"{timeline_ms('readIdleNs'):>7.2f} "
-            f"{busy / 10:>6.1f} "
+            f"{timeline_ms('readBatchEnvelopeNs'):>8} "
+            f"{timeline_ms('readCqeSpanNs'):>8} "
+            f"{timeline_ms('readStartSpanNs'):>8} "
+            f"{timeline_ms('readIdleNs'):>7} "
+            f"{busy / 10:>7.1f} "
             f"{average_read / 1000:>6.2f} "
-            f"{peak_read:>6.1f} "
+            f"{peak_read:>7.1f} "
             f"{wrs:>5.0f} "
             f"{post_batches:>5.0f} "
             f"{wr_per_post / 1000:>7.2f} "
-            f"{timeline_ms('pwriteEnvelopeNs'):>8.2f} "
-            f"{timeline_ms('firstReadCqeToFirstPwriteStartNs'):>10.2f} "
-            f"{timeline_ms('lastReadCqeToLastPwriteEndNs'):>12.2f} "
-            f"{timeline_ms('readPwriteEnvelopeOverlapNs'):>8.2f} "
+            f"{timeline_ms('pwriteEnvelopeNs'):>8} "
+            f"{timeline_ms('firstReadCqeToFirstPwriteStartNs'):>10} "
+            f"{timeline_ms('lastReadCqeToLastPwriteEndNs'):>12} "
+            f"{timeline_ms('readPwriteEnvelopeOverlapNs'):>8} "
             f"{peak:>8.1f} "
             f"{early:>8.1f}"
         )
@@ -463,7 +534,7 @@ def print_tables(records: list[dict]) -> None:
     print(
         f"{'run':<14} {'use':<7} {'n':>3} {'childE2E p50/p95':>17} {'srcE2E p50/p95':>15} "
         f"{'register':>8} {'alloc':>7} {'copy#2':>7} {'pin':>5} {'token':>6} "
-        f"{'wait':>7} {'revoke':>7} {'direct':>7} {'hit/miss/evict':>15} {'pkRet':>7} {'fallb':>6}"
+        f"{'wait':>7} {'revoke':>7} {'direct':>7} {'hit/miss/evict':>15} {'dstRet':>7} {'fallb':>6}"
     )
     for r in records:
         for label in ("samples", "warmup"):
@@ -515,8 +586,8 @@ def print_tables(records: list[dict]) -> None:
             ]
             print(" ".join(columns))
 
-    print("\n== parent Source cache (successfully served identities; not native API call counts) ==")
-    print(f"{'run':<14} {'use':<7} {'mode':>6} {'ctl':>8} {'region':>8} {'cached':>7} {'sources':>7} {'reuse':>7} {'noID':>5} {'leases':>7} {'adm ms':>8} {'lease ms':>9}")
+    print("\n== parent Source cache (successfully served identities; timings p50 ms, not native API call counts) ==")
+    print(f"{'run':<14} {'use':<7} {'mode':>6} {'ctl':>8} {'region':>8} {'cached':>7} {'sources':>7} {'reuse':>7} {'noID':>5} {'leases':>7} {'cacheAdm':>8} {'leaseEnq':>9}")
     for r in records:
         for label in ("samples", "warmup"):
             parent = r.get("pools", {}).get(label, {}).get("parent")
@@ -570,6 +641,16 @@ def print_tables(records: list[dict]) -> None:
     for r in records:
         for note in r["notes"]:
             print(f"note {r['run']}: {note}")
+
+    print("\nTiming scope:")
+    print("  try = URMA Piece attempt; trySpan includes control, READ and Storage. gapRate excludes first-Piece work.")
+    print("  rdDrv/drvEnv/avgDrv/peakDrv/active% describe software driver intervals, not hardware WRs or NIC utilization.")
+    print("  nativeEnv = first native post -> last polled CQE (host observed, includes provider/DMA/poll delay; not wire time).")
+    print("  sub = progress subscription; admQ/ownerQ = post admission/dispatch wait; postCmd includes those waits and execution.")
+    print("  cqeObs = last CQE poll -> driver observation; wake = notification -> observation. Timings overlap; do not add medians.")
+    print("  doneEnq ends at writer enqueue; cacheAdm excludes earlier Storage/FD preparation; leaseEnq includes release + Done enqueue.")
+    print("  leasePub includes Child drain/unimport and publishing the destination lease, not returning the Buffer to its pool.")
+    print("  dstRet is Child destination-pool retention, not Parent Source cache. '-' in attribution means missing timing.")
 
 
 def ns_to_ms(value):

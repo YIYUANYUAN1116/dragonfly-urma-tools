@@ -952,3 +952,167 @@ done
 先单独跑一个 SEND/RECV case 确认能握手、完成和安全关停，再进行上述同配置 A/B。
 本轮仅离线验证；真实 provider 的收发、低 credit/接收拥塞、取消/flush、
 同 Task 多 Child 与 1→7/7→1 仍待真机验收。不要把离线测试通过当作硬件路径通过。
+
+### READ 性能汇总口径与 native 时序（2026-10-20）
+
+更新工具后可直接重算已有 run，不用更新二进制或重新跑测试：
+
+```bash
+python3 read_attribution_summary.py \
+  results/read-sendrecv-piece32-cc16-002 \
+  results/read-cached-region256-sendrecv-piece32-cc16
+```
+
+只指定需要的 run，避免无意遍历整个 results。脚本从已有 measured task-scoped
+日志补齐 native 字段；旧 manifest 没有 batch 索引时，只使用明确的
+`child*.sample-*.log`，不把 warmup 或合并后的全 run 日志当作 measured。
+部分日志缺失时保留 manifest 的完整 transport/storage 聚合，native 表的 `n`
+仅表示本地可解析 data-completion 事件数，可能小于完整样本数。
+
+显示名修正，原始 JSON 数值及历史字段名保持兼容：
+
+| 旧显示 | 新显示 | 实际含义 |
+|---|---|---|
+| toREAD / READ→1 / READspan | toTry / try→1 / trySpan | Piece attempt 起点；发生在握手、准备和实际 READ post 之前；trySpan 含 Storage |
+| piece ms / rate | pieceGap / gapRate | 首片完成到末片完成；gapRate 分母遗漏首片前工作，不是实际链路吞吐 |
+| READ / READenv | rdDrv / drvEnv | 完整软件 drive_reads 阶段及批次包络 |
+| CQEspan | doneSpan | 软件 data-completion 日志时间跨度，不是硬件 CQE 时间 |
+| avgRd / peakRd / busy% | avgDrv / peakDrv / active% | 软件 driver 区间重叠与覆盖率，不是硬件在途或网卡利用率 |
+| idle | drvIdle | 批次包络内无软件 driver 活跃的区间，不是网卡空闲 |
+| 1CQE→pwr / lastCQE→end | 1done→pwr / lastdone→end | 从软件完成日志重建的 Storage 关系 |
+| doneTx | doneEnq | ReadDone 进入 writer channel，尚未等待实际 SEND CQE |
+| pkRet | dstRet | Child destination pool 保留峰值，不是 Parent Source cache |
+| adm ms / lease ms | cacheAdm / leaseEnq | 缓存查询/注册等待；租约释放及 Done 入队，不是 native 注销或控制 RTT |
+
+`cacheAdm` 不包含前面的 Storage metadata/当前文件 FD 打开；Cached 的
+`source_open_ns=0` 也不能说明没有打开文件。
+
+新增 `child READ driver/native attribution` 表，仅从
+`urma READ child completed data transfer` 解析，避免与随后重复字段的
+`child finished transfer` 日志重复计数：
+
+| 列 | 日志字段 / 边界 |
+|---|---|
+| n / timedWRs | data-completion Piece 事件数 / 这些事件的 native_timed_wr_count 总数 |
+| driver | read_completion_ns，含订阅、提交、DMA、poll 和异步通知 |
+| sub | progress_subscribe_ns，首次订阅命令往返 |
+| admQ / ownerQ | post_admission_wait_ns / post_queue_wait_ns |
+| postCmd | post_command_ns，含 admission、排队、执行及回复调度 |
+| postAPI | native_post_call_ns，native post 调用累计时间 |
+| nativeEnv | native_read_envelope_ns，首 native post 到末匹配 CQE 的主机观察区间 |
+| cqeObs | cqe_to_observed_ns，末 CQE poll 返回到 driver 观察完成 |
+| wake | completion_notification_delay_ns，通知发布到 driver 观察完成 |
+
+全部时长列按各自 measured 样本给 p50，**重叠且不能相加，也不能拿不同字段的
+中位数相减当作精确剩余时间**。nativeEnv 包含 provider/DMA/网络和 owner poll
+延迟，不能称纯 wire 时间；postAPI 已包含在它之内。cqeObs 包含 wake。
+
+旧日志缺字段显示 `-`，真实测得的零仍显示 `0.00`；显式
+`native_timed_wr_count=0` 时，不把零 native 时长显示为成功测得的传输。
+`--json` 的 `read_stages.readDriver` 保留每字段的 count，另有
+nativePostToCqeSumNs/nativePostToCqeMaxNs/progressWaitNs；多 WR 的 sum 可以重叠，
+progressWaitNs 也含正常 DMA 等待，不能解释成纯软件 CPU 开销。
+
+新 manifest 和汇总 JSON 增加 `readIntervalScope: piece-driver`、
+`readConcurrencyIsHardwareWrCount: false`（timeline）及
+`stageDurationsAreAdditive: false`。旧 `readCqe*` / `readActive*` 等 JSON key
+保留历史名称，其含义仍是软件区间。已有结果文件不会被重写。
+
+### B/C：热 Cached READ 带宽验证（独立于正式下载）
+
+新增 `read_bandwidth_probe.py`，在两端**分别本地运行**，不使用旧 SEND_IMM
+`transport-only` case。它构建当前 checkout 的 release Storage lib-test 可执行文件，
+再直接调用一个明确的 ignored 真机入口；没有该入口的旧 binary 不会被当作成功。
+
+| 模式 | 计时区间 | 保留/排除 |
+|---|---|---|
+| B | 持续 native post/poll，停止补投后排空所有在途 WR | 生产 shim、file-backed mmap、共享 TABLE token ID、32 MiB READ、16个独立目的Segment；注册/import只在准备阶段，无Fabric和逐片控制 |
+| C | 持续 Cached Piece 生命周期，含末批排空、Done和Buffer回收 | 生产Fabric、SEND/RECV、当前FD重开/身份检查、lookup-only cache hit、lease acquire/expose/release、Child import/unimport、READ、Done；不做Child Storage/CRC/元数据提交 |
+
+两组默认都使用已填充的1 GiB文件、256 MiB Region、32 MiB Piece、深度/并发16，
+1s预热+10s测量。Parent先计算每片CRC32并注册全部Region；Child在计时前后各遍历
+完整文件并核对CRC32。计时期间不计算数据CRC，但仍保留长度、offset、单WR完成及
+身份/状态校验；查不到已预热Source立即失败，不走冷注册或TCP bulk fallback。
+目的Buffer均在测量前热好。建议使用原B7输入文件，保持inode/内容不变，不用只truncate
+出来的稀疏文件代替已填充文件。
+
+**测量范围：** B刻意busy-poll，与perftest接近；C保留现有Fabric owner轮询和
+Tokio调度，默认32个Tokio worker。C复用生产传输核心，但文件完整性/Piece digest
+元数据来自固定fixture，不运行scheduler、RocksDB Task/Piece查询、完整dfdaemon启动
+或应用日志配置。因此C是传输核心基线，不是“从正式下载只删除pwrite”的精确A/B。
+B/C都接近perftest时，只能把剩余差距定位到更高层集成（包括Storage），不能单凭此
+把全部差距归因于Storage。
+
+#### 两端先同步代码并完成离线构建
+
+在 Parent 和 Child 的 `urma-b7` 目录各执行一次；`repo` 改成这台节点实际的新代码目录。
+此步骤不打开provider、不绑定控制端口：
+
+```bash
+repo=/home/y30083740/dragonfly/urma-cached-source
+python3 read_bandwidth_probe.py \
+  --repo "$repo" --mode B --role child --addr 10.10.10.2:31918 \
+  --log results/read-bw-build-001/build.log \
+  --build-only --execute
+```
+
+两端都构建完再启动Parent，避免首次编译让对端等超时。脚本使用现有UMDK编译/链接
+环境（UMDK_INCLUDE_DIR/UMDK_LIB_DIR/LD_LIBRARY_PATH按节点原有设置），没有新增crate依赖。
+后续run仍检查增量构建，**编译时间不计入带宽**。
+
+#### B：Parent先启动，Child随后启动
+
+Parent节点：
+
+```bash
+repo=/home/y30083740/dragonfly/urma-cached-source
+python3 read_bandwidth_probe.py \
+  --repo "$repo" --mode B --role parent --addr 0.0.0.0:31918 \
+  --file /home/y30083740/dragonfly-b7/origin/input-1g.bin \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-001/parent.log --execute
+```
+
+Child节点：
+
+```bash
+repo=/home/y30083740/dragonfly/urma-cached-source
+python3 read_bandwidth_probe.py \
+  --repo "$repo" --mode B --role child --addr 10.10.10.2:31918 \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-001/child.log --execute
+```
+
+**C：**两端B都结束后，将上述命令中的`--mode B`改为`--mode C`，日志路径改为
+`results/read-bw-C-001/{parent,child}.log`，其余保持一致，再先Parent后Child。
+需使用两台真实节点，不能用同EID单机loopback替代。
+
+显式参数还包括 `--file-bytes`、`--piece-bytes`、`--region-bytes`、`--depth`、
+`--seconds`、`--warmup-seconds`、`--tokio-threads`；单位为整数bytes/seconds。
+两端的模式、几何、深度和时长必须相同，初始化先核对签名。Child不需要输入文件。
+不带`--execute`只打印构建/运行参数。旧日志不会被覆盖，重跑使用新路径。
+
+#### 看结果
+
+```bash
+grep -E 'URMA_BW_(CONFIG|SOURCE_READY|RESULT|PASS)' \
+  results/read-bw-B-001/child.log
+```
+
+Child只有在前后完整文件CRC32校验、全部WR/lease回收、Child runtime关闭和Parent
+关闭确认均成功后才输出`URMA_BW_RESULT`。`GiBps`为完成字节/实际测量耗时，
+`Gbps`为十进制bit/s；两者来自同一计时，不含setup/校验/warmup。耗时包含截止后
+已提交工作排空，因此可能略长于10s，不只统计post数量。Parent不输出本地伪造带宽。
+
+两端均须有`URMA_BW_PASS ... integrity=all-pieces-before-and-after shutdown=both-sides`。
+launcher另要求进程退出0；即使Cargo返回0但实际没有运行匹配的测试，也判失败。
+每个日志旁的`.log.json`记录实际test binary路径/SHA256、git HEAD/dirty、参数和结果，
+没有向正式Storage发布成功Task或伪造文件产物。失败/不确定post不生成成功带宽；
+不要把超时、EOF或强制杀进程当作drain证明。
+
+与A比较时保持READ、RM/CTP、同设备/EID/NUMA、32 MiB、单Jetty、depth16、post-list1、
+CQ每WR通知一致；taskset只证明CPU范围，不证明内存NUMA落点。各组单独运行，
+比较平均/稳态带宽。B显著低于A还可能来自file-backed/页布局、shim或poll/post；
+C显著低于B重点检查控制、owner队列和逐片生命周期。不要将B busy-poll结果当作正式
+dfdaemon无需占CPU就能达到的保证，也不要将这个热缓存结果与每batch新Task的B7
+冷Source注册成本混为一谈。

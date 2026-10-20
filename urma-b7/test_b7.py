@@ -18,6 +18,130 @@ import read_attribution_summary as read_attribution
 
 
 class B7Tests(unittest.TestCase):
+    @staticmethod
+    def read_driver_event():
+        return (
+            "2026-10-20T01:00:00.100000000Z task_id=task piece_number=0 "
+            "read_completion_ns=10000000 progress_subscribe_ns=1000000 "
+            "post_command_ns=2000000 post_admission_wait_ns=0 post_queue_wait_ns=1000000 "
+            "native_post_call_ns=50000 native_read_envelope_ns=3000000 "
+            "native_post_to_cqe_sum_ns=3000000 native_post_to_cqe_max_ns=3000000 "
+            "cqe_to_observed_ns=4000000 completion_notification_delay_ns=1000000 "
+            "progress_wait_ns=6000000 native_timed_wr_count=1 "
+            "read_wr_count=1 read_post_batch_count=1 urma READ child completed data transfer"
+        )
+
+    def test_read_driver_attribution_uses_data_event_once_and_preserves_native_boundaries(self):
+        repeated = (
+            "retained_cleanup_ns=0 lane_acquire_ns=0 buffer_ready_send_ns=0 "
+            "segment_offer_wait_ns=0 destination_admission_ns=0 read_completion_ns=99000000 "
+            "lease_publish_ns=0 read_done_send_ns=0 done_wait_ns=0 done_round_trip_ns=0 "
+            "session_run_ns=0 read_transfer_total_ns=0 native_read_envelope_ns=99000000 "
+            "urma READ child finished transfer"
+        )
+        summary = b7.urma_read_stage_summary(self.read_driver_event() + "\n" + repeated)
+        driver = summary["readDriver"]
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertFalse(summary["stageDurationsAreAdditive"])
+        self.assertEqual(summary["readIntervalScope"], "piece-driver")
+        self.assertEqual(driver["pieceCount"], 1)
+        self.assertEqual(driver["readCompletionNs"]["totalNs"], 10_000_000)
+        self.assertEqual(driver["nativeReadEnvelopeNs"]["totalNs"], 3_000_000)
+        self.assertEqual(driver["cqeToObservedNs"]["totalNs"], 4_000_000)
+        self.assertEqual(driver["completionNotificationDelayNs"]["totalNs"], 1_000_000)
+        self.assertEqual(driver["nativeTimedWrCount"]["totalNs"], 1)
+        self.assertEqual(driver["postAdmissionWaitNs"]["count"], 1)
+        self.assertEqual(driver["postAdmissionWaitNs"]["totalNs"], 0)
+        timeline = b7.urma_read_batch_timeline(self.read_driver_event())
+        self.assertFalse(timeline["readConcurrencyIsHardwareWrCount"])
+        self.assertEqual(timeline["readBatchEnvelopeNs"], 10_000_000)
+        summary_timeline = b7.urma_read_timeline_summary([timeline])
+        self.assertFalse(summary_timeline["readConcurrencyIsHardwareWrCount"])
+
+    def test_read_driver_archived_missing_fields_stay_unknown(self):
+        summary = b7.urma_read_stage_summary(
+            "read_completion_ns=10000000 post_queue_wait_ns=0 "
+            "urma READ child completed data transfer"
+        )
+        driver = summary["readDriver"]
+        self.assertEqual(summary["malformedLines"], 0)
+        self.assertEqual(driver["pieceCount"], 1)
+        self.assertEqual(driver["postQueueWaitNs"]["count"], 1)
+        self.assertEqual(driver["postQueueWaitNs"]["totalNs"], 0)
+        self.assertEqual(driver["nativeReadEnvelopeNs"]["count"], 0)
+        self.assertEqual(driver["cqeToObservedNs"]["count"], 0)
+        malformed = b7.urma_read_stage_summary("urma READ child completed data transfer")
+        self.assertEqual(malformed["malformedLines"], 1)
+        self.assertEqual(malformed["readDriver"]["pieceCount"], 0)
+
+    def test_read_driver_backfill_excludes_warmup_and_keeps_full_manifest_aggregates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            evidence = run / "evidence"
+            evidence.mkdir()
+            (evidence / "child.sample-001.tasks.log").write_text(self.read_driver_event())
+            (evidence / "child.warmup-001.log").write_text(
+                self.read_driver_event().replace("read_completion_ns=10000000", "read_completion_ns=99000000")
+            )
+            manifest = {"result": {"transfer": {"batches": {"samples": [
+                {"taskScopedEvidence": {"child": "child.sample-001.tasks.log"}},
+                {"taskScopedEvidence": {"child": "child.sample-002.tasks.log"}},
+            ]}}}}
+            stored = {
+                "observed": True, "transport": {"pieceCount": 96},
+                "storage": {"pwriteCalls": {"count": 96}},
+                "pwriteActivity": {"pieceCount": 96},
+            }
+            result = read_attribution.stage_summary(run, manifest, stored)
+            self.assertEqual(result["transport"]["pieceCount"], 96)
+            self.assertEqual(result["storage"]["pwriteCalls"]["count"], 96)
+            self.assertNotIn("readDriver", stored)
+            self.assertEqual(result["readDriver"]["pieceCount"], 1)
+            self.assertEqual(result["readDriver"]["readCompletionNs"]["totalNs"], 10_000_000)
+            (evidence / "child.sample-001.tasks.log").unlink()
+            self.assertEqual(read_attribution.stage_summary(run, manifest, stored), stored)
+
+    def test_read_driver_legacy_index_fallback_reads_only_explicit_sample_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            evidence = run / "evidence"
+            evidence.mkdir()
+            (evidence / "child.warmup-001.log").write_text(self.read_driver_event())
+            (evidence / "child.log").write_text(self.read_driver_event())
+            self.assertIsNone(read_attribution.recompute_stage_summary(run, {}))
+            (evidence / "child.sample-001.log").write_text(self.read_driver_event())
+            summary = read_attribution.recompute_stage_summary(run, {})
+            self.assertEqual(summary["readDriver"]["pieceCount"], 1)
+
+    def test_read_attribution_labels_software_intervals_and_renders_missing_not_zero(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            summary = b7.urma_read_stage_summary(
+                "read_completion_ns=10000000 post_queue_wait_ns=0 "
+                "urma READ child completed data transfer"
+            )
+            (run / "manifest.json").write_text(json.dumps({
+                "runId": "archived", "result": {"transfer": {"urmaReadStageSummary": summary}},
+            }))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                read_attribution.print_tables([read_attribution.summarize_run(run, {})])
+            text = output.getvalue()
+            self.assertIn("software READ driver batch envelopes", text)
+            self.assertIn("avgDrv", text)
+            self.assertIn("doneEnq", text)
+            self.assertNotIn("CQEspan", text)
+            self.assertNotIn("peakRd", text)
+            self.assertIn("not hardware WRs or NIC utilization", text)
+            native_table = text.split("== child READ driver/native attribution", 1)[1].split("==", 2)[1]
+            row = next(line for line in native_table.splitlines() if line.startswith("archived "))
+            cells = row.split()
+            self.assertEqual(cells[3], "10.00")
+            self.assertEqual(cells[6], "0.00")  # Real zero owner queue wait.
+            self.assertEqual(cells[9:], ["-", "-", "-"])  # Missing native/notification timings.
+
     def test_read_attribution_keeps_manifest_timeline_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             run_dir = Path(temp_dir)
@@ -38,7 +162,9 @@ class B7Tests(unittest.TestCase):
                 encoding="utf-8",
             )
             record = read_attribution.summarize_run(run_dir, {})
-            self.assertEqual(record["read_timeline"], timeline)
+            for key, value in timeline.items():
+                self.assertEqual(record["read_timeline"][key], value)
+            self.assertFalse(record["read_timeline"]["readConcurrencyIsHardwareWrCount"])
 
     def test_read_attribution_recomputes_occupancy_from_archived_logs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -108,6 +108,23 @@ READ_DESTINATION_ADMISSION_NS_RE = re.compile(r"\bdestination_admission_ns=(\d+)
 READ_COMPLETION_NS_RE = re.compile(r"\bread_completion_ns=(\d+)")
 READ_WR_COUNT_RE = re.compile(r"\bread_wr_count=(\d+)")
 READ_POST_BATCH_COUNT_RE = re.compile(r"\bread_post_batch_count=(\d+)")
+# Parsed only from the per-Piece data-completion event, not the later transfer
+# summary which repeats many of these fields. Timings overlap; do not add them.
+READ_DRIVER_FIELDS = (
+    ("readCompletionNs", READ_COMPLETION_NS_RE),
+    ("progressSubscribeNs", re.compile(r"\bprogress_subscribe_ns=(\d+)")),
+    ("postCommandNs", re.compile(r"\bpost_command_ns=(\d+)")),
+    ("postAdmissionWaitNs", re.compile(r"\bpost_admission_wait_ns=(\d+)")),
+    ("postQueueWaitNs", re.compile(r"\bpost_queue_wait_ns=(\d+)")),
+    ("nativePostCallNs", re.compile(r"\bnative_post_call_ns=(\d+)")),
+    ("nativeReadEnvelopeNs", re.compile(r"\bnative_read_envelope_ns=(\d+)")),
+    ("nativePostToCqeSumNs", re.compile(r"\bnative_post_to_cqe_sum_ns=(\d+)")),
+    ("nativePostToCqeMaxNs", re.compile(r"\bnative_post_to_cqe_max_ns=(\d+)")),
+    ("cqeToObservedNs", re.compile(r"\bcqe_to_observed_ns=(\d+)")),
+    ("completionNotificationDelayNs", re.compile(r"\bcompletion_notification_delay_ns=(\d+)")),
+    ("progressWaitNs", re.compile(r"\bprogress_wait_ns=(\d+)")),
+    ("nativeTimedWrCount", re.compile(r"\bnative_timed_wr_count=(\d+)")),
+)
 READ_LEASE_PUBLISH_NS_RE = re.compile(r"\blease_publish_ns=(\d+)")
 READ_DONE_SEND_NS_RE = re.compile(r"\bread_done_send_ns=(\d+)")
 READ_DONE_WAIT_NS_RE = re.compile(r"\bdone_wait_ns=(\d+)")
@@ -2484,6 +2501,13 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         # Done round trip. Keep their other transport stages comparable.
         optional_indexes=frozenset((7, 8)),
     )
+    driver, driver_bad = samples(
+        "urma READ child completed data transfer",
+        tuple(pattern for _, pattern in READ_DRIVER_FIELDS),
+        # Archived logs may have only the whole driver duration. Missing native
+        # timing stays missing, not zero, and does not invalidate other stages.
+        optional_indexes=frozenset(range(1, len(READ_DRIVER_FIELDS))),
+    )
     storage, storage_bad = samples(
         "finished writing piece from RM-READ lease",
         tuple(pattern for _, pattern in storage_fields),
@@ -2519,14 +2543,18 @@ def urma_read_stage_summary(child: str) -> dict[str, Any]:
         }
 
     return {
-        "observed": bool(transport or storage or finish or attempt),
+        "observed": bool(transport or driver or storage or finish or attempt),
+        "stageDurationsAreAdditive": False,
+        "readIntervalScope": "piece-driver",
         "transport": summarize(transport, transport_fields),
+        "readDriver": summarize(driver, READ_DRIVER_FIELDS),
         "storage": summarize(storage, storage_fields),
         "pwriteActivity": summarize(pwrite_activity, pwrite_activity_fields),
         "finish": summarize(finish, finish_fields),
         "attempt": summarize(attempt, attempt_fields),
         "malformedLines": (
             transport_bad
+            + driver_bad
             + storage_bad
             + pwrite_activity_bad
             + finish_bad
@@ -2555,6 +2583,9 @@ READ_TIMELINE_DURATION_FIELDS = (
 def urma_read_batch_timeline(child: str) -> dict[str, Any]:
     """Build one batch's normal-path READ/pwrite envelope from daemon events.
 
+    READ intervals bracket the software driver (subscribe/post/wait/observe),
+    not actual WR lifetimes. Historical readCqe*/readActive* JSON keys are kept
+    for compatibility: their ends are application log timestamps, not CQEs.
     Start timestamps are reconstructed from the completion event and its
     monotonic duration so instrumentation adds only two log lines per Piece.
     """
@@ -2601,6 +2632,9 @@ def urma_read_batch_timeline(child: str) -> dict[str, Any]:
     observed = bool(read_events or pwrite_events)
     result: dict[str, Any] = {
         "observed": observed,
+        "readIntervalScope": "piece-driver",
+        "readConcurrencyIsHardwareWrCount": False,
+        "stageDurationsAreAdditive": False,
         "complete": False,
         "readStartCount": len(read_events),
         "readCqeCount": len(read_events),
@@ -2705,6 +2739,9 @@ def urma_read_timeline_summary(timelines: list[dict[str, Any]]) -> dict[str, Any
     observed = [timeline for timeline in timelines if timeline.get("observed")]
     return {
         "observed": bool(observed),
+        "readIntervalScope": "piece-driver",
+        "readConcurrencyIsHardwareWrCount": False,
+        "stageDurationsAreAdditive": False,
         "batchCount": len(observed),
         "completeBatchCount": sum(bool(timeline.get("complete")) for timeline in observed),
         "peakReadActive": integer_value_summary(
