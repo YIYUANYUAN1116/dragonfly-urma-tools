@@ -79,6 +79,49 @@ class ReadBandwidthProbeTests(unittest.TestCase):
             self.assertTrue(record["gitDirty"])
             self.assertNotIn("result", record)
 
+    def test_copied_worktree_without_valid_git_still_runs_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "dragonfly-client-storage").mkdir()
+            (root / "dragonfly-client-storage/Cargo.toml").write_text("fixture")
+            (root / ".git").write_text("gitdir: /missing/source/.git/worktrees/copied\n")
+            binary = root / "probe"
+            binary.write_bytes(b"copied-binary")
+            artifact = {"reason": "compiler-artifact", "profile": {"test": True},
+                        "target": {"name": "dragonfly_client_storage"}, "executable": str(binary)}
+            log = root / "child.log"
+            def run(command, **kwargs):
+                if command[0] == "cargo":
+                    return subprocess.CompletedProcess(command, 0, json.dumps(artifact))
+                self.assertEqual(command[0], "taskset")
+                kwargs["stdout"].write(
+                    "URMA_BW_RESULT mode=C completed_bytes=1073741824 completed_pieces=32 elapsed_ns=500000000 GiBps=2.0000 Gbps=17.1799 storage=false crc_timed=false drain_included=true\n"
+                    "URMA_BW_PASS mode=C role=child integrity=all-pieces-before-and-after shutdown=both-sides\n")
+                return subprocess.CompletedProcess(command, 0)
+            for error in (subprocess.CalledProcessError(128, ["git"]), FileNotFoundError("git")):
+                with self.subTest(error=error):
+                    if log.exists():
+                        log.unlink()
+                        log.with_suffix(".log.json").unlink()
+                    with mock.patch.object(probe.subprocess, "run", side_effect=run) as runner, \
+                            mock.patch.object(probe.subprocess, "check_output", side_effect=error), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(probe.main(self.args("--repo", str(root), "--log", str(log), "--execute")), 0)
+                    self.assertEqual(runner.call_count, 2)
+                    record = json.loads(log.with_suffix(".log.json").read_text())
+                    self.assertEqual(record["state"], "passed")
+                    self.assertFalse(record["gitAvailable"])
+                    self.assertIsNone(record["gitHead"])
+                    self.assertIsNone(record["gitDirty"])
+                    self.assertEqual(record["sha256"], probe.hashlib.sha256(binary.read_bytes()).hexdigest())
+
+    def test_git_identity_handles_real_dangling_worktree_pointer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").write_text("gitdir: /missing/source/.git/worktrees/copied\n")
+            self.assertEqual(probe.git_identity(root), {
+                "gitAvailable": False, "gitHead": None, "gitDirty": None})
+
 
 if __name__ == "__main__":
     unittest.main()

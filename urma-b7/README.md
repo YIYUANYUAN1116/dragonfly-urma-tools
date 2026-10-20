@@ -1107,6 +1107,8 @@ Child只有在前后完整文件CRC32校验、全部WR/lease回收、Child runti
 两端均须有`URMA_BW_PASS ... integrity=all-pieces-before-and-after shutdown=both-sides`。
 launcher另要求进程退出0；即使Cargo返回0但实际没有运行匹配的测试，也判失败。
 每个日志旁的`.log.json`记录实际test binary路径/SHA256、git HEAD/dirty、参数和结果，
+复制代码目录没有 Git、或 `.git` 指向另一台机器的 worktree 时仍可运行：
+记录 `gitAvailable=false`、`gitHead=null`、`gitDirty=null`，binary SHA256 仍必填。
 没有向正式Storage发布成功Task或伪造文件产物。失败/不确定post不生成成功带宽；
 不要把超时、EOF或强制杀进程当作drain证明。
 

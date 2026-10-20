@@ -111,6 +111,22 @@ def evidence(text, mode, role):
             "GiBps": float(gibps), "Gbps": float(gbps)}
 
 
+def git_identity(repo):
+    """Git metadata is optional for copied checkouts and missing worktrees."""
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True,
+            stderr=subprocess.DEVNULL).strip()
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo, text=True,
+            stderr=subprocess.DEVNULL).strip())
+        return {"gitAvailable": True, "gitHead": head, "gitDirty": dirty}
+    except (OSError, subprocess.CalledProcessError):
+        # Unknown must not be reported as a clean checkout. Binary SHA256 is
+        # still mandatory and identifies the executable actually tested.
+        return {"gitAvailable": False, "gitHead": None, "gitDirty": None}
+
+
 def main(argv=None):
     a = parser().parse_args(argv)
     validate(a)
@@ -140,8 +156,7 @@ def main(argv=None):
                   "builtAtUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                   "repo": str(a.repo.resolve()), "testExecutable": str(binary),
                   "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "env": env, "cpus": a.cpus,
-                  "gitHead": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=a.repo, text=True).strip(),
-                  "gitDirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=a.repo, text=True).strip())}
+                  **git_identity(a.repo)}
         try:
             if not a.build_only:
                 command = ["taskset", "-c", a.cpus, str(binary), TESTS[a.mode], "--exact", "--ignored", "--nocapture", "--test-threads=1"]
