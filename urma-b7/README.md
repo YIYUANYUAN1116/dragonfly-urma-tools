@@ -1158,3 +1158,112 @@ python3 read_bandwidth_probe.py \
 与默认`--source-pattern sequential`交替跑三轮、各用新日志路径。如果fixed明显提高，
 支持源工作集是差距因素；仍不能把剩余差距直接归因Rust/shim。若差异不大，再检查目的
 工作集、NUMA和native post/poll，先不修改生产控制/Storage实现。
+
+
+#### B native 汇总观测
+
+B在成功校验和双方关闭后，额外输出一行`URMA_BW_NATIVE`；只汇总measured阶段，
+不混入预热或前后完整性校验，不输出逐WR日志。原launcher JSON带宽字段保持不变。
+同步新版Rust探针即可；旧命令均可用，重跑换新日志路径。
+
+```bash
+grep -E 'URMA_BW_(CONFIG|RESULT|NATIVE|PASS)' \
+  results/read-bw-B-fixed-002/child.log
+```
+
+| 字段 | 含义 |
+|---|---|
+| avg_unretired / peak_unretired | 已接受post起点至匹配CQE被poll观察的WR时间加权平均/峰值 |
+| full_window_pct / zero_unretired_pct | 上述未退休计数等于depth/为0的时间比例，含启动和最后排空 |
+| polls / empty_polls / empty_poll_pct | poll调用数、返回0次数及其调用比例；不是CPU空闲或链路利用率 |
+| post_call_ms / post_call_mean_us / post_call_max_us | 既有ReadPostTiming包围的生产shim post调用累计/均值/最大值，含检查和WR设置，不含外围HashMap/空闲Slot管理 |
+| post_to_cqe_mean_us / min_us / max_us | post调用起点到匹配CQE的主机poll观察时间，含post调用和poll延迟，不是纯DMA/wire时间 |
+| refill_count / refill_mean_us / refill_max_us | 已观察CQE的目的Slot到下一次用于post的间隔；不含初始空Slot及最终未再复用Slot |
+
+`avg_unretired`按时长加权，不是循环采样均值；设备可能已完成但CQE尚未poll，
+所以这些计数不能称硬件队列占用/NIC busy%。`post_to_cqe`跨WR可以重叠，
+与post_call不能相加；empty_poll_pct高在busy-poll下可以完全正常。所有观测使用
+既有post/poll时间戳，空poll仅递增计数，不额外读钟；仍有少量汇总计算开销。
+
+先比较avg_unretired/满窗口时间和refill，再看post开销：长期接近depth且refill很短，
+会降低“补投不及时”的优先级，但不能仅凭软件未退休深度排除所有软件影响。
+
+
+### perftest 独立目的范围对照（只用于实验）
+
+新增`build_read_perftest_slots.py`和`read_perftest_slots.h`。构建器复制当前UMDK的
+perftest源码至新输出目录，严格匹配并修改两个文件，再生成独立的
+`urma_perftest_read_slots`；不修改UMDK原源码或安装的`urma_perftest`。源码不匹配直接失败，
+输出目录不覆盖。保存原始/修改后源码SHA256、构建命令及binary SHA256到`build.json`。
+
+同一个新binary用`URMA_BW_DST_LAYOUT=shared|slots`选择：
+
+| 项目 | shared | slots |
+|---|---|---|
+| 源访问 | 固定32 MiB | 固定32 MiB |
+| 目的访问 | 全部在途READ反复写同一段32 MiB | 16个独立32 MiB范围，共512 MiB |
+| 实际分配/注册 | 两端均为一块544 MiB匿名Segment，提前写入触页 | 相同 |
+| WR管理 | 相同的16 Slot分配/CQE回收逻辑 | 相同 |
+
+两种模式均保留perftest原post/poll主循环、RM/CTP、单Jetty、depth16、post-list1、
+CQmod1、poll batch16及原持续时间统计。user_ctx改为Slot+1，按匹配CQE释放确切Slot，
+不依赖完成顺序；只有成功CQE才能推进正常测试。拒绝非read_bw、非32 MiB、不同深度、
+双向、事件poll、credit/notify、随机大小、hugepage/固定VA等超出本次实验范围的模式。
+
+**边界：**新shared也扩展了注册范围并增加首次触页/Slot管理，因此必须先确认它仍接近
+原版perftest，才能把shared→slots差距归因目的访问范围。新slots是一个Segment里的
+16个独立范围，B是16个独立Segment；仍有注册映射/NUMA/源内存类型等差异。
+此工具保持perftest原内容校验能力，不新增全文件CRC或双方安全关闭门禁，不能称为
+B/C完整性验证通过，也不能替代正式下载正确性测试。输出明确标`integrity=not-checked`。
+原perftest duration包含预热/统计/结束阶段，`-D10`的统计窗口约5s；不改这个口径。
+
+#### 两端先构建
+
+在两端urma-b7目录运行；`UMDK_ROOT`填这台节点UMDK源码根目录（应包含
+`src/urma/tools/urma_perftest`）。链接库应与原版perftest相同：先用`ldd "$(command -v urma_perftest)"`
+核对liburma/liburma_common。默认沿用UMDK_LIB_DIR，否则查UMDK的build-perftest；
+可显式传`--lib-dir`和`--common-lib-dir`，例如两者均在`/usr/lib64`。
+
+```bash
+UMDK_ROOT=/实际的/umdk源码目录
+python3 build_read_perftest_slots.py \
+  --umdk "$UMDK_ROOT" \
+  --output results/read-perftest-dst-build-001 \
+  --execute
+ldd results/read-perftest-dst-build-001/urma_perftest_read_slots
+```
+
+如果匹配库在系统目录，构建时增加：
+
+```text
+--lib-dir /usr/lib64 --common-lib-dir /usr/lib64
+```
+
+默认dry-run只校验/打印构建计划，不打开provider；build也不打开provider。保存源码目录
+供审查；不需要sudo安装，也不用重新构建整个UMDK。
+
+#### 先shared，再slots；每组先Parent后Child
+
+Parent：
+
+```bash
+URMA_BW_DST_LAYOUT=shared taskset -c 192-223 \
+  results/read-perftest-dst-build-001/urma_perftest_read_slots read_bw \
+  -d udmac0d1e2 --eid_idx 0 --ctp -p 0 \
+  -s 33554432 -J 1 -T 16 -l 1 -Q 1 -D 10 -w -N
+```
+
+Child：
+
+```bash
+URMA_BW_DST_LAYOUT=shared taskset -c 192-223 \
+  results/read-perftest-dst-build-001/urma_perftest_read_slots read_bw \
+  -d udmac0d1e2 --eid_idx 0 --ctp -p 0 \
+  -s 33554432 -J 1 -T 16 -l 1 -Q 1 -D 10 -w -N \
+  -S 10.10.10.2
+```
+
+两端都退出后，仅将shared改slots重跑，其余不变。贴两端`URMA_PERFTEST_DST`及Child
+BW average、进程退出状态。相邻跑原版/shared/slots，建议三轮，以确认环境波动。
+若shared仍约400 Gbps而slots明显下降，支持目的工作集是差距因素；若两者均降低，
+不能单独归因目的范围，应先排查扩大注册/首次触页、库版本及NUMA差异。
