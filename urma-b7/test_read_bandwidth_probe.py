@@ -122,6 +122,25 @@ class ReadBandwidthProbeTests(unittest.TestCase):
             self.assertEqual(probe.git_identity(root), {
                 "gitAvailable": False, "gitHead": None, "gitDirty": None})
 
+    def test_fixed_source_is_explicit_b_only_and_propagated_without_geometry_changes(self):
+        default = probe.environment(probe.parser().parse_args(self.args("--mode", "B")))
+        fixed_args = probe.parser().parse_args(self.args("--mode", "B", "--source-pattern", "fixed"))
+        probe.validate(fixed_args)
+        fixed = probe.environment(fixed_args)
+        self.assertEqual(fixed.pop("URMA_BW_SOURCE_PATTERN"), "fixed")
+        self.assertEqual(default.pop("URMA_BW_SOURCE_PATTERN"), "sequential")
+        self.assertEqual(default, fixed)
+        with self.assertRaises(ValueError):
+            probe.validate(probe.parser().parse_args(self.args("--source-pattern", "fixed")))
+
+    def test_fixed_run_requires_binary_to_confirm_pattern_in_config(self):
+        passed = "URMA_BW_PASS mode=B role=parent integrity=all-pieces-before-and-after shutdown=both-sides"
+        config = "URMA_BW_CONFIG mode=B role=parent depth=16 source_pattern=fixed\n"
+        self.assertTrue(probe.evidence(config + passed, "B", "parent", "fixed")["shutdown"])
+        for prefix in ("", config.replace("fixed", "sequential"), config.replace("role=parent", "role=child")):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                probe.evidence(prefix + passed, "B", "parent", "fixed")
+
 
 if __name__ == "__main__":
     unittest.main()

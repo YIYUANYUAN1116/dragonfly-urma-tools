@@ -1118,3 +1118,43 @@ CQ每WR通知一致；taskset只证明CPU范围，不证明内存NUMA落点。�
 C显著低于B重点检查控制、owner队列和逐片生命周期。不要将B busy-poll结果当作正式
 dfdaemon无需占CPU就能达到的保证，也不要将这个热缓存结果与每batch新Task的B7
 冷Source注册成本混为一谈。
+
+
+#### B 固定源工作集对照
+
+新增 `--source-pattern fixed`（仅 B 支持，默认 `sequential`）。两端必须一致；
+初始化签名核对模式，launcher还要求实际binary的CONFIG明确输出`source_pattern=fixed`，
+防止旧Rust入口忽略新环境变量却被当作固定源结果。旧顺序模式命令仍然可用。
+
+只改变预热和计时阶段：所有READ反复读Piece0的32 MiB源范围；保留整个1 GiB文件、
+四个256 MiB注册Region、全部import及16个独立目的Buffer（512 MiB），不共用目的地址。
+前后校验阶段仍遍历全部Piece，校验/注册/shutdown门禁保持。此对照只缩小源访问工作集，
+不能单独区分CPU缓存、地址翻译和内存带宽，也不复刻perftest的共享目的Buffer。
+
+两端同步`read_bandwidth_probe.py`及Rust `src/urma/read_bandwidth_probe.rs`，先按上文
+build-only完成构建，再启动Parent和Child。使用原来的1 GiB已填充文件，不需要新建32 MiB文件。
+
+Parent：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --role parent --addr 0.0.0.0:31918 \
+  --file /home/y30083740/dragonfly-b7/origin/input-1g.bin \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-fixed-001/parent.log --execute
+```
+
+Child：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --role child --addr 10.10.10.2:31918 \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-fixed-001/child.log --execute
+```
+
+与默认`--source-pattern sequential`交替跑三轮、各用新日志路径。如果fixed明显提高，
+支持源工作集是差距因素；仍不能把剩余差距直接归因Rust/shim。若差异不大，再检查目的
+工作集、NUMA和native post/poll，先不修改生产控制/Storage实现。
