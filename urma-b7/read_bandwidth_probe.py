@@ -37,7 +37,7 @@ def parser():
     p.add_argument("--source-pattern", choices=("sequential", "fixed"), default="sequential",
                    help="B only: fixed reads Piece 0 during warmup/measurement; validation still covers the whole file")
     p.add_argument("--source-backing", choices=("file", "anonymous"), default="file",
-                   help="B only: file mmap or anonymous mmap copied from the same input before timing")
+                   help="B/C: file mmap or anonymous mmap copied from the same input before timing")
     p.add_argument("--destination-layout", choices=("segments", "contiguous"), default="segments",
                    help="B only: separate registered buffers or one Segment with disjoint Slot ranges")
     p.add_argument("--depth", type=int, default=16)
@@ -51,8 +51,6 @@ def parser():
 
 
 def validate(a):
-    if a.mode != "B" and a.source_backing != "file":
-        raise ValueError("--source-backing anonymous is supported only by mode B")
     if a.mode != "B" and a.destination_layout != "segments":
         raise ValueError("--destination-layout contiguous is supported only by mode B")
     if a.mode != "B" and a.source_pattern != "sequential":
@@ -113,7 +111,7 @@ def evidence(text, mode, role, source_pattern="sequential", destination_layout="
             rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bsource_backing=anonymous(?:\s|$)", text)
         if len(configs) != 1:
             raise ValueError("Probe did not prove anonymous source backing; update Rust probe on both nodes")
-        if role == "parent":
+        if role == "parent" and mode == "B":
             sources = re.findall(r"URMA_BW_SOURCE backing=anonymous segments=(\d+) registered_bytes=(\d+) region_bytes=(\d+) direct=true(?:\s|$)", text)
             if len(sources) != 1:
                 raise ValueError("Expected actual directly registered anonymous Source evidence")
@@ -126,6 +124,15 @@ def evidence(text, mode, role, source_pattern="sequential", destination_layout="
             if not (0 < region == region_bytes <= registered == file_bytes and
                     segments == (registered + region - 1) // region):
                 raise ValueError("Inconsistent anonymous Source geometry")
+        if role == "parent" and mode == "C":
+            sources = re.findall(r"URMA_BW_CACHED_SOURCE backing=anonymous segments=(\d+) registered_bytes=(\d+) region_bytes=(\d+)(?:\s|$)", text)
+            geometry = [re.search(rf"\b{key}=(\d+)(?:\s|$)", configs[0]) for key in ("file_bytes", "region_bytes")]
+            if len(sources) != 1 or not all(geometry):
+                raise ValueError("Missing actual anonymous Cached Source evidence")
+            segments, registered, region = map(int, sources[0])
+            if not (0 < region <= registered and registered == int(geometry[0][1]) and
+                    region == int(geometry[1][1]) and segments == (registered + region - 1) // region):
+                raise ValueError("Inconsistent anonymous Cached Source geometry")
     if source_pattern == "fixed" and not re.search(
             rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bsource_pattern=fixed(?:\s|$)", text):
         raise ValueError("Probe did not prove fixed source pattern; update the Rust probe on both nodes")

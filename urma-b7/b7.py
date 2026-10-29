@@ -4122,8 +4122,10 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         if control_bytes is None or ((urma_read or {}).get("controlTransport") == "sendrecv" and control_bytes < 33 * 4096):
             raise B7Error(f"case {case['name']} urmaRead.controlBytes must cover the SEND/RECV endpoint")
         registration = (urma_read or {}).get("registration", {})
-        if not isinstance(registration, dict) or set(registration) - {"mode", "maxRegionBytes"}:
+        if not isinstance(registration, dict) or set(registration) - {"mode", "backing", "maxRegionBytes"}:
             raise B7Error(f"case {case['name']} has invalid urmaRead.registration")
+        if registration.get("backing", "file") not in ("file", "anonymous"):
+            raise B7Error(f"case {case['name']} registration.backing must be file or anonymous")
         if registration.get("mode", "piece") not in ("piece", "cached"):
             raise B7Error(f"case {case['name']} registration.mode must be piece or cached")
         if parse_registration_bytes(registration.get("maxRegionBytes", "1GiB")) is None:
@@ -4217,6 +4219,14 @@ def validate_cached_source_reuse(case: dict, parent_log: str, task_id: str, file
     if (observed["cachedPieces"] != pieces or observed["distinctSources"] != sources
             or observed["missingIdentities"] or pieces <= sources):
         raise B7Error(f"cached Source reuse not proven for {task_id}: {observed}")
+    if case["urmaRead"]["registration"].get("backing", "file") == "anonymous":
+        scoped = filter_task_scoped_log(parent_log, {task_id})
+        anonymous = sum("urma READ cached source fully read; releasing lease" in line
+                        and re.search(r"\bsource_backing=Anonymous\b", line) is not None
+                        for line in scoped.splitlines())
+        if anonymous != pieces:
+            raise B7Error(f"anonymous Cached Source backing not proven for {task_id}: {anonymous}/{pieces}; rebuild Parent")
+        observed["anonymousPieces"] = anonymous
     return observed
 
 
@@ -4410,7 +4420,7 @@ def role_overlays(
         ):
             overlays.pop(("storage", "server", "urma", key), None)
         registration = read.get("registration", {})
-        for key, default in (("mode", "piece"), ("maxRegionBytes", "1GiB")):
+        for key, default in (("mode", "piece"), ("backing", "file"), ("maxRegionBytes", "1GiB")):
             overlays[("storage", "server", "urma", "read", "registration", key)] = registration.get(key, default)
     return overlays
 

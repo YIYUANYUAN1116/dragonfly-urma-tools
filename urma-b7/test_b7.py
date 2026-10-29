@@ -210,9 +210,34 @@ class B7Tests(unittest.TestCase):
                 self.assertIn(f'maxRegionBytes: "{cap}"', rendered)
                 self.assertIn(f"mmapContent: {str(role == 'parent').lower()}", rendered)
 
+    def test_anonymous_cached_case_renders_backing_and_worker_pool(self):
+        inventory = b7.select_profile(self.inventory, "read")
+        _, _, layouts = b7.generated_layout(inventory, "dual", "copy-overlay", None)
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        stale = "storage:\n  server:\n    urma:\n      read:\n        registration:\n          backing: anonymous\n"
+        for backing in ("file", "anonymous"):
+            case = cases[f"read-cached-region256-{backing}-workers2-sendrecv-piece32-cc16"]
+            self.assertTrue(case["requireCachedSourceReuse"])
+            for role in ("parent", "child"):
+                rendered = b7.render_role_config(stale, inventory, layouts[role], role, "copy-overlay", case)
+                self.assertIn(f'backing: "{backing}"', rendered)
+                self.assertIn('sourceWorkers: 2', rendered)
+        rendered = b7.render_role_config(stale, inventory, layouts["parent"], "parent", "copy-overlay", cases["read-auto-piece32-cc16"])
+        self.assertIn('backing: "file"', rendered)
+
+    def test_anonymous_cached_gate_rejects_old_or_file_backing_binary(self):
+        case = b7.load_cases(TOOL_DIR / "cases.json")["read-cached-region256-anonymous-workers2-sendrecv-piece32-cc16"]
+        log = self.cached_parent_log(4)
+        with self.assertRaisesRegex(b7.B7Error, "backing not proven"):
+            b7.validate_cached_source_reuse(case, log, "cache-task", 1024**3)
+        proof = log.replace("source_cached=true", "source_cached=true source_backing=Anonymous")
+        self.assertEqual(b7.validate_cached_source_reuse(case, proof, "cache-task", 1024**3)["anonymousPieces"], 32)
+        with self.assertRaisesRegex(b7.B7Error, "backing not proven"):
+            b7.validate_cached_source_reuse(case, proof.replace("Anonymous", "File", 1), "cache-task", 1024**3)
+
     def test_registration_case_validation(self):
         base = b7.load_cases(TOOL_DIR / "cases.json")["read-auto-piece32-cc16"]
-        for registration in (None, [], {"mode": "file"}, {"maxRegionBytes": "0B"},
+        for registration in (None, [], {"mode": "file"}, {"backing": "typo"}, {"maxRegionBytes": "0B"},
                              {"maxRegionBytes": 1024}, {"maxRegionBytes": "bad"},
                              {"maxRegionBytes": "-1GiB"}, {"other": True}):
             with self.subTest(registration=registration), tempfile.TemporaryDirectory() as tmp:

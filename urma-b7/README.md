@@ -1344,11 +1344,11 @@ grep -E 'URMA_BW_(CONFIG|DESTINATION|RESULT|NATIVE|PASS)' \
 registered_bytes=536870912 slots=16 slot_bytes=33554432`。segments组应为16个32 MiB
 Segment，registered_bytes相同。取值/计时定义沿用前文B汇总观测，软件未退休深度不等于硬件占用。
 
-### B 源内存对照：file / anonymous
+### B/C 源内存对照：file / anonymous
 
-新增 `--source-backing file|anonymous`，默认 `file`，仅 B 支持；两端必须相同。
-先同步 Rust 探针、`ffi/read/source.rs` 和 Python launcher。匿名 mmap 类型只在
-`cfg(test)` 下编译，不改变生产 Source、Cache、Storage 或 DestinationPool 行为。
+`--source-backing file|anonymous` 默认 `file`；两端必须相同。
+现已同时支持B和C：B保持原生对照，C通过生产Cached注册路径使用匿名Source。
+先同步Dragonfly源码和Python launcher。生产默认仍为file，显式配置后才使用匿名Source。
 
 - file：原文件 mmap 直接注册。
 - anonymous：准备阶段逐 Region 分配匿名 mmap，从同一文件范围复制全部内容，转只读后
@@ -1409,5 +1409,71 @@ grep -E 'URMA_BW_(CONFIG|SOURCE|DESTINATION|RESULT|NATIVE|PASS)' \
   results/read-bw-B-file-001/child.log
 ```
 
-在Parent用相同grep表达式读取两组`parent.log`。此实验只比较源backing，不与C模式混比，
+在Parent用相同grep表达式读取两组`parent.log`。B与C应各自进行file/anonymous对照，
 也不保证匿名内存一定提高带宽；优先看同轮结果，再决定是否调整源注册几何/NUMA。
+
+
+### 实验性生产 Cached 匿名源
+
+Parent配置增量（其余URMA配置保持）：
+
+```yaml
+storage:
+  server:
+    urma:
+      mmapContent: true
+      read:
+        controlTransport: sendrecv
+        sourceWorkers: 2
+        registration:
+          mode: cached
+          backing: anonymous
+          maxRegionBytes: 256MiB
+```
+
+`backing`只影响已完成普通Task的Cached路径，默认为`file`。未完成文件、Persistent、
+Piece模式继续走原路径。两种backing共用预算、并发miss合并、租约/淘汰/注销逻辑。
+匿名Region在Source预算预留成功后分配；拷贝到同一块最终注册内存，native不再复制。
+文件mmap在复制后释放，Cache仍保留文件句柄用于inode身份，因此这版不保证GC unlink后
+立即释放磁盘空间。匿名副本与文件页缓存可能同时占用内存，Source预算只计匿名注册副本。
+
+使用已有注册工作线程并行处理不同Region的准备/注册，复用现有Piece并发、SEND/RECV
+描述符控制和Child READ窗口。一个Region完成复制/注册后才发布，不能让Child读取半复制
+内存；不新增SEND数据流、环形窗口、后台预取或并行memcpy线程池。
+`sourceWorkers: 0`仍可用，但复制/注册同步占用Fabric owner，性能对照建议两组均设2。
+
+复制先使用平台优化的`copy_from_slice`，一次拷贝兼首次触页，没有先填零再做应用层复制。
+这不意味着内核零页分配没有成本。每个miss输出DEBUG事件
+`urma READ anonymous source backing prepared`：`cached_backing_bytes`、
+`cached_backing_prepare_ns`（匿名分配+复制+转只读，包括缺页，不是纯memcpy时间）。
+该字段不等于原native `register_copy_ns`；命中不重复复制。社区PR前按既有要求清理实验埋点。
+
+新增完全匹配的端到端case，均为SEND/RECV、256MiB Region、32MiB Piece、CC16、workers2：
+
+- `read-cached-region256-file-workers2-sendrecv-piece32-cc16`
+- `read-cached-region256-anonymous-workers2-sendrecv-piece32-cc16`
+
+沿用B7的prepare/run流程，无需修改模板；backing由case覆盖。匿名case除了内容/零fallback/
+Cached复用门禁，还要求Parent每个成功Cached Piece日志有`source_backing=Anonymous`，
+防止旧binary忽略新YAML而误报成功。每batch新Task仍含首次复制；不要将此结果称为纯热缓存。
+
+```bash
+python3 b7.py prepare \
+  --profile read --mode dual \
+  --run-id read-cached-anonymous-workers2-001 \
+  --case read-cached-region256-anonymous-workers2-sendrecv-piece32-cc16 \
+  --parent-cpus 192-223 --child-cpus 192-223 --execute
+
+python3 b7.py run \
+  --manifest results/read-cached-anonymous-workers2-001/manifest.json --execute
+```
+
+file对照将case改为对应file名称，run-id改为`read-cached-file-workers2-001`。
+先看同轮READspan、Offer/首次Region准备、READ envelope、pwrite和完整下载；再考虑扩展优化。
+
+C模式：沿用上方B匿名源两端命令，将`--mode B`改为`--mode C`、删除
+`--source-pattern fixed`和`--destination-layout contiguous`，两端保留
+`--source-backing anonymous`，换新日志目录`results/read-bw-C-anonymous-001/`。
+C匿名源通过生产Cache预注册，复制/注册不计时，保留双方校验/关闭。Parent应输出
+`URMA_BW_CACHED_SOURCE backing=anonymous segments=4 registered_bytes=1073741824 region_bytes=268435456`。
+C中的Fabric准备仍使用sourceWorkers=0，预注册在计时外；不要把C热源结果当作端到端首传结果。

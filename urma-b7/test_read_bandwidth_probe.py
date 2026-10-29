@@ -167,14 +167,13 @@ class ReadBandwidthProbeTests(unittest.TestCase):
                 evidence(prefix)
 
 
-    def test_anonymous_source_is_b_only_and_sets_environment(self):
+    def test_anonymous_source_supports_b_c_and_sets_environment(self):
         args = probe.parser().parse_args(self.args("--mode", "B", "--source-backing", "anonymous"))
         probe.validate(args)
         self.assertEqual(probe.environment(args)["URMA_BW_SOURCE_BACKING"], "anonymous")
         default = probe.parser().parse_args(self.args())
         self.assertEqual(probe.environment(default)["URMA_BW_SOURCE_BACKING"], "file")
-        with self.assertRaises(ValueError):
-            probe.validate(probe.parser().parse_args(self.args("--source-backing", "anonymous")))
+        probe.validate(probe.parser().parse_args(self.args("--source-backing", "anonymous")))
 
     def test_anonymous_evidence_rejects_old_binary_or_missing_actual_source(self):
         config = "URMA_BW_CONFIG mode=B role=parent file_bytes=1073741824 region_bytes=268435456 source_backing=anonymous\n"
@@ -196,6 +195,19 @@ class ReadBandwidthProbeTests(unittest.TestCase):
                                       "B", "child", source_backing="anonymous")["shutdown"])
         with self.assertRaises(ValueError):
             probe.evidence(child_result + child_pass, "B", "child", source_backing="anonymous")
+
+
+    def test_cached_anonymous_requires_matching_production_source_evidence(self):
+        config = "URMA_BW_CONFIG mode=C role=parent file_bytes=1073741824 region_bytes=268435456 source_backing=anonymous\n"
+        source = "URMA_BW_CACHED_SOURCE backing=anonymous segments=4 registered_bytes=1073741824 region_bytes=268435456\n"
+        passed = "URMA_BW_PASS mode=C role=parent integrity=all-pieces-before-and-after shutdown=both-sides"
+        def evidence(prefix):
+            return probe.evidence(prefix + passed, "C", "parent", source_backing="anonymous")
+        self.assertTrue(evidence(config + source)["shutdown"])
+        for prefix in (config, source, config + source.replace("segments=4", "segments=1"),
+                       config + source.replace("anonymous", "file"), config + source * 2):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                evidence(prefix)
 
 
 if __name__ == "__main__":
