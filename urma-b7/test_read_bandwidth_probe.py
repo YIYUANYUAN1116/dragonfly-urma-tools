@@ -167,5 +167,36 @@ class ReadBandwidthProbeTests(unittest.TestCase):
                 evidence(prefix)
 
 
+    def test_anonymous_source_is_b_only_and_sets_environment(self):
+        args = probe.parser().parse_args(self.args("--mode", "B", "--source-backing", "anonymous"))
+        probe.validate(args)
+        self.assertEqual(probe.environment(args)["URMA_BW_SOURCE_BACKING"], "anonymous")
+        default = probe.parser().parse_args(self.args())
+        self.assertEqual(probe.environment(default)["URMA_BW_SOURCE_BACKING"], "file")
+        with self.assertRaises(ValueError):
+            probe.validate(probe.parser().parse_args(self.args("--source-backing", "anonymous")))
+
+    def test_anonymous_evidence_rejects_old_binary_or_missing_actual_source(self):
+        config = "URMA_BW_CONFIG mode=B role=parent file_bytes=1073741824 region_bytes=268435456 source_backing=anonymous\n"
+        source = "URMA_BW_SOURCE backing=anonymous segments=4 registered_bytes=1073741824 region_bytes=268435456 direct=true\n"
+        passed = "URMA_BW_PASS mode=B role=parent integrity=all-pieces-before-and-after shutdown=both-sides"
+        def evidence(prefix):
+            return probe.evidence(prefix + passed, "B", "parent", source_backing="anonymous")
+        self.assertTrue(evidence(config + source)["integrity"])
+        for prefix in ("", config, source, config.replace("anonymous", "file") + source,
+                       config + source.replace("segments=4", "segments=1"),
+                       config + source.replace("direct=true", "direct=false"), config + source * 2,
+                       config + source.replace("1073741824", "536870912")):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                evidence(prefix)
+        child_config = config.replace("role=parent", "role=child")
+        child_result = "URMA_BW_RESULT mode=B completed_bytes=1073741824 completed_pieces=32 elapsed_ns=500000000 GiBps=2.0000 Gbps=17.1799 storage=false crc_timed=false drain_included=true\n"
+        child_pass = passed.replace("role=parent", "role=child")
+        self.assertTrue(probe.evidence(child_config + child_result + child_pass,
+                                      "B", "child", source_backing="anonymous")["shutdown"])
+        with self.assertRaises(ValueError):
+            probe.evidence(child_result + child_pass, "B", "child", source_backing="anonymous")
+
+
 if __name__ == "__main__":
     unittest.main()

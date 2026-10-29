@@ -1343,3 +1343,71 @@ grep -E 'URMA_BW_(CONFIG|DESTINATION|RESULT|NATIVE|PASS)' \
 默认几何应出现`layout=contiguous segments=1 segment_bytes=536870912
 registered_bytes=536870912 slots=16 slot_bytes=33554432`。segments组应为16个32 MiB
 Segment，registered_bytes相同。取值/计时定义沿用前文B汇总观测，软件未退休深度不等于硬件占用。
+
+### B 源内存对照：file / anonymous
+
+新增 `--source-backing file|anonymous`，默认 `file`，仅 B 支持；两端必须相同。
+先同步 Rust 探针、`ffi/read/source.rs` 和 Python launcher。匿名 mmap 类型只在
+`cfg(test)` 下编译，不改变生产 Source、Cache、Storage 或 DestinationPool 行为。
+
+- file：原文件 mmap 直接注册。
+- anonymous：准备阶段逐 Region 分配匿名 mmap，从同一文件范围复制全部内容，转只读后
+  通过相同 Source/native API 直接注册。每页在复制时触页；分配、复制、注册均在计时外。
+- 两种模式仍使用原1 GiB输入、4×256 MiB源 Segment、fixed 时的32 MiB源访问范围、
+  16个独立目的Slot和相同post/poll/校验/关闭流程。不是把源注册改成32 MiB。
+- anonymous 会改变物理页和首次触页/NUMA分布；即使有收益，也不能只归因文件页类型。
+- `Bytes` 的 shim 分配/复制路径未用于此对照。两种模式均检查 native `direct` 标记，
+  Parent 输出 `URMA_BW_SOURCE backing=... segments=4 registered_bytes=1073741824
+  region_bytes=268435456 direct=true`。双方配置和握手签名包含 backing，launcher 拒绝
+  未证明匿名配置的旧binary；Parent还必须提供真实Source几何证据。
+- Parent 仍要求 `--file`；前后完整性校验覆盖所有Piece，不局限fixed读取的Piece0。
+
+两端先预构建（使用此前相同UMDK_INCLUDE_DIR/UMDK_LIB_DIR/LIBCLANG_PATH）：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --source-backing anonymous \
+  --destination-layout contiguous \
+  --role child --addr 10.10.10.2:31918 \
+  --log results/read-bw-B-source-build-001/build.log \
+  --build-only --execute
+```
+
+Parent先启动：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --source-backing anonymous \
+  --destination-layout contiguous \
+  --role parent --addr 0.0.0.0:31918 \
+  --file /home/y30083740/dragonfly-b7/origin/input-1g.bin \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-anonymous-001/parent.log --execute
+```
+
+Child后启动：
+
+```bash
+python3 read_bandwidth_probe.py \
+  --repo /home/y30083740/dragonfly/urma-cached-source \
+  --mode B --source-pattern fixed --source-backing anonymous \
+  --destination-layout contiguous \
+  --role child --addr 10.10.10.2:31918 \
+  --cpus 192-223 --device udmac0d1e2 --eid-index 0 \
+  --log results/read-bw-B-anonymous-001/child.log --execute
+```
+
+两端退出后，仅将双方 `--source-backing anonymous` 改为 `--source-backing file`，
+日志目录改为 `results/read-bw-B-file-001/`。交替跑file/anonymous，重复时换002/003目录。
+每轮保留两端CONFIG/SOURCE/PASS及Child RESULT/NATIVE：
+
+```bash
+grep -E 'URMA_BW_(CONFIG|SOURCE|DESTINATION|RESULT|NATIVE|PASS)' \
+  results/read-bw-B-anonymous-001/child.log \
+  results/read-bw-B-file-001/child.log
+```
+
+在Parent用相同grep表达式读取两组`parent.log`。此实验只比较源backing，不与C模式混比，
+也不保证匿名内存一定提高带宽；优先看同轮结果，再决定是否调整源注册几何/NUMA。
