@@ -1584,3 +1584,22 @@ B/C计时不含准备成本，所以优先结合B7端到端结果判断。
 所以Cached完成日志中的`register_direct=false`及零alloc/copy字段不能证明实际走了shim复制。
 确认直接注册应看物理Source的注册记录；不要将该字段作为dirty或额外复制的证据。
 复测使用新的run-id（例如`read-cached-file-collapse-workers2-002`），不要复用001的manifest。
+
+file-collapse后续修正：若日志显示回写errno=0、重试1次后仍立即EINVAL，不能继续认定只是dirty。
+Storage的FDCache保留写FD，而文件THP资格可能要求inode没有写打开。仅在普通Task已确认全文件
+完成、file-collapse缓存未命中时，当前代码移除该Task的缓存写FD引用，再进入注册准备。
+只移除写缓存，不移除读缓存、不关闭仍被活动写入/后台writeback持有的FD，也不是写入屏障。
+
+Parent事件`urma READ file collapse cached writer released`记录：
+`cached_writer_removed`和`cached_writer_other_refs`（移除瞬间的其他Arc引用数，仅为观测值，
+不代表整个系统已没有写FD）。并发miss下后续请求可能显示removed=false，表示已无缓存条目。
+折叠事件另加`collapse_va_mod_2m`、`collapse_offset_mod_2m`、`collapse_alignment_2m`，
+核对本部署2MiB PMD所需的虚拟地址/文件偏移同余；不是只检查Region长度。
+这些修改尚需在定制内核上确认；其他进程的写FD、内核VMA资格和实际对齐仍可能导致失败。
+不要为此给数据映射增加PROT_EXEC。复测换新run-id，例如`read-cached-file-collapse-workers2-003`。
+
+```bash
+grep -n -m 40 -E \
+  'file collapse cached writer released|file source collapse attempted' \
+  results/read-cached-file-collapse-workers2-003/evidence/parent.warmup-001.log
+```
