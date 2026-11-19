@@ -1558,7 +1558,8 @@
         "sourceWorkers": 2
       },
       "category": "urma-read-sendrecv-control-validation",
-      "requireCachedSourceReuse": true
+      "requireCachedSourceReuse": true,
+      "requireFileCollapseSuccess": true
     },
     {
       "name": "read-cached-region256-file-workers2-sendrecv-piece32-cc16",

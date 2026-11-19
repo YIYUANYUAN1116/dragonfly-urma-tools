@@ -248,10 +248,25 @@ class B7Tests(unittest.TestCase):
             return b7.validate_cached_source_reuse(case, text, "cache-task", 1 << 30)
         self.assertEqual(evidence(rows + log)["collapseSucceeded"], 4)
         failed = rows.replace("collapse_succeeded=true collapse_errno=0", "collapse_succeeded=false collapse_errno=22")
-        self.assertEqual(evidence(failed + log)["collapseFailed"], 4)
+        with self.assertRaisesRegex(b7.B7Error, "collapse success gate failed"):
+            evidence(failed + log)
+        fallback_case = {**case, "requireFileCollapseSuccess": False}
+        self.assertEqual(b7.validate_cached_source_reuse(fallback_case, failed + log, "cache-task", 1 << 30)["collapseFailed"], 4)
         for text in (log, rows + log.replace("FileCollapse", "File"), rows * 2 + log):
             with self.subTest(text=text), self.assertRaises(b7.B7Error):
                 evidence(text)
+
+    def test_collapse_success_gate_requires_boolean_and_file_collapse_case(self):
+        base = b7.load_cases(TOOL_DIR / "cases.json")["read-cached-region256-file-collapse-workers2-sendrecv-piece32-cc16"]
+        self.assertTrue(base["requireFileCollapseSuccess"])
+        for case in ({**base, "requireFileCollapseSuccess": "true"},
+                     {**base, "requireCachedSourceReuse": False},
+                     {**base, "urmaRead": {**base["urmaRead"], "registration": {"mode": "cached", "backing": "file"}}}):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "cases.json"
+                path.write_text(json.dumps({"schemaVersion": 1, "cases": [case]}))
+                with self.assertRaisesRegex(b7.B7Error, "requireFileCollapseSuccess"):
+                    b7.load_cases(path)
 
     def test_registration_case_validation(self):
         base = b7.load_cases(TOOL_DIR / "cases.json")["read-auto-piece32-cc16"]

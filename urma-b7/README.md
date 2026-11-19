@@ -1499,7 +1499,9 @@ storage:
 ```
 
 在现有注册工作线程上执行折叠；`sourceWorkers: 0`仍是同步owner路径，性能对照建议2。
-每次Cache miss尝试一次，不后台重试，不改变全局THP策略。系统调用失败后继续注册同一个
+每次Cache miss先尝试折叠。首次返回EINVAL/EAGAIN/EBUSY时，对该Region执行一次
+`sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER)`等待数据回写完成，再重试一次；
+首次成功不触发回写，其余errno直接回退。不后台重试，不改变全局THP策略。最终失败后继续注册同一个
 有效文件映射，允许部分折叠成功；不自动转成anonymous，也不影响内容正确性。
 
 Parent每Region输出INFO事件`urma READ file source collapse attempted`，字段：
@@ -1507,7 +1509,14 @@ Parent每Region输出INFO事件`urma READ file source collapse attempted`，字�
 - `collapse_bytes`、`source_offset`：本次请求的文件范围。
 - `collapse_succeeded`、`collapse_errno`：MADV_COLLAPSE返回是否成功，0表示成功。
 - `collapse_hint_errno`：前置MADV_HUGEPAGE提示的结果；不阻止后续collapse尝试。
-- `collapse_ns`：提示及同步折叠总耗时，包含可能的缺页、内核复制或内存整理。
+- `collapse_ns`：整个准备总耗时，包含提示、初次折叠、可选回写等待和重试。
+- `collapse_initial_errno`、`collapse_retries`：首次折叠结果和重试次数（至多1）。
+- `collapse_writeback_ns`、`collapse_writeback_errno`：Region回写等待耗时和错误；回写失败不重试。
+
+WRITE标志本身不保证回写完成，也可能阻塞；这版通过WAIT_BEFORE/WAIT_AFTER避免用sleep猜测完成。
+该操作不是fsync或持久化保证，只在显式file-collapse准备失败后执行；不修改普通Storage写入语义。
+在sourceWorkers上执行，需把实际I/O等待成本计入冷缓存下载。重试次数有上限，不代表磁盘等待有固定时限。
+读取映射不能保证清理dirty状态，因此不用touch替代回写。
 
 成功只描述内核对该请求的返回结果，不替代smaps页覆盖确认。虚拟地址、文件偏移、长度、
 内核和文件系统条件都影响有效折叠范围；小文件和尾部不保证有大页。映射生命周期、文件
@@ -1538,8 +1547,9 @@ python3 read_attribution_summary.py \
 `read-cached-region256-anonymous-workers2-sendrecv-piece32-cc16`，各选新的run-id。
 每batch新Task的首次准备计入下载；不能把旧文件已被折叠后的file结果当作小页基线。
 B7保持内容、零fallback及Cached复用检查，还要求每个成功Piece证明`source_backing=FileCollapse`，
-并核对当批每个固定Region的真实折叠尝试。失败降级允许正常通过，结果中的
-`collapseAttempts/collapseSucceeded/collapseFailed/collapseElapsedNs`分别保留次数与累计时间，
+并核对当批每个固定Region的真实折叠尝试。生产代码保留失败回退，但该性能case已启用`requireFileCollapseSuccess: true`，
+任一Region最终折叠失败都会使run失败；可显式关闭此case门禁以单独验证功能回退。
+结果中的`collapseAttempts/collapseSucceeded/collapseFailed/collapseElapsedNs`按Region统计最终结果与累计时间，
 不能将多个worker重叠的累计时间当作端到端墙钟时间。
 
 只读取一个Parent样本文件即可查看准备阶段：
@@ -1560,9 +1570,17 @@ grep -n -m 40 -E \
 - 两端先build-only，然后先Parent、后Child。
 
 探针准备阶段打印`URMA_BW_COLLAPSE`的范围、实际成功/errno及elapsed_ns。Parent launcher
-要求每个Region都有一致的尝试证据，并在JSON中返回成功/失败计数与总耗时。失败仍保留
-正常READ、完整性及双方shutdown验证。B/C计时不含准备成本，所以优先结合B7端到端结果判断。
+要求每个Region都有一致的尝试证据，并在JSON中返回成功/失败计数与总耗时。默认保留失败回退和正常READ、完整性及双方shutdown验证。
+性能验收增加`--require-collapse-success`（要求file-collapse），Parent将拒绝任何Region最终失败。
+`URMA_BW_COLLAPSE`附加initial_errno/retries/writeback_ns/writeback_errno便于分解准备时间。
+B/C计时不含准备成本，所以优先结合B7端到端结果判断。
 
 **实验文件：**file、file-collapse和anonymous应分别使用相同内容的新inode，顺序交替，
 同轮至少三次；collapse可能改变共享page cache，进程重启不等于恢复小页。不要在共享机器
 上全局drop_caches。远端先前DF_MMAP_COLLAPSE诊断补丁应保持撤除，以免污染file对照。
+
+
+2026-11修正说明：Cached Offer的`register_stages`会在按传输租约返回时清零，
+所以Cached完成日志中的`register_direct=false`及零alloc/copy字段不能证明实际走了shim复制。
+确认直接注册应看物理Source的注册记录；不要将该字段作为dirty或额外复制的证据。
+复测使用新的run-id（例如`read-cached-file-collapse-workers2-002`），不要复用001的manifest。

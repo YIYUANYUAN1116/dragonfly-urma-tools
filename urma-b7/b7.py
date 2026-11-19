@@ -4136,6 +4136,11 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         if require_cache and (registration.get("mode") != "cached" or topology != "queue"
                               or protocol != "urma" or not case.get("pieceLength")):
             raise B7Error(f"case {case['name']} cache reuse gate requires cached/urma/queue and pieceLength")
+        require_collapse = case.get("requireFileCollapseSuccess", False)
+        if type(require_collapse) is not bool:
+            raise B7Error(f"case {case['name']} requireFileCollapseSuccess must be bool")
+        if require_collapse and (not require_cache or registration.get("backing") != "file-collapse"):
+            raise B7Error(f"case {case['name']} requireFileCollapseSuccess needs Cached reuse and file-collapse backing")
         if protocol == "tcp" and topology != "queue":
             raise B7Error(
                 f"case {case['name']} protocol tcp only supports queue topology"
@@ -4249,6 +4254,8 @@ def validate_cached_source_reuse(case: dict, parent_log: str, task_id: str, file
             observed.update(collapseAttempts=len(attempts), collapseSucceeded=succeeded,
                             collapseFailed=len(attempts) - succeeded,
                             collapseElapsedNs=sum(int(row["collapse_ns"]) for row in attempts))
+            if case.get("requireFileCollapseSuccess") and succeeded != len(attempts):
+                raise B7Error(f"file collapse success gate failed for {task_id}: {succeeded}/{len(attempts)} Regions; {observed}")
     return observed
 
 

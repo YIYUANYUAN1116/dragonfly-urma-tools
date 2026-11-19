@@ -225,12 +225,25 @@ class ReadBandwidthProbeTests(unittest.TestCase):
             result = evidence(config + source + rows)
             self.assertEqual(result["collapseSucceeded"], 4)
             self.assertEqual(result["collapseElapsedNs"], 400)
+            self.assertTrue(probe.evidence(config + source + rows + passed, mode, "parent",
+                source_backing="file-collapse", require_collapse_success=True)["shutdown"])
             failed = rows.replace("succeeded=true errno=0", "succeeded=false errno=22")
             self.assertEqual(evidence(config + source + failed)["collapseFailed"], 4)
+            with self.assertRaisesRegex(ValueError, "success required"):
+                probe.evidence(config + source + failed + passed, mode, "parent",
+                    source_backing="file-collapse", require_collapse_success=True)
             for text in (config + source, source + rows, config + source + rows * 2,
                          config + source + rows.replace("succeeded=true errno=0", "succeeded=true errno=22")):
                 with self.subTest(mode=mode, text=text), self.assertRaises(ValueError):
                     evidence(text)
+
+
+    def test_require_collapse_success_rejects_unrelated_backing(self):
+        with self.assertRaises(ValueError):
+            probe.validate(probe.parser().parse_args(self.args("--require-collapse-success")))
+        args = probe.parser().parse_args(self.args("--source-backing", "file-collapse", "--require-collapse-success"))
+        probe.validate(args)
+        self.assertTrue(args.require_collapse_success)
 
 
 if __name__ == "__main__":

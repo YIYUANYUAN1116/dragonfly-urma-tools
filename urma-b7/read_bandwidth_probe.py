@@ -45,12 +45,16 @@ def parser():
     p.add_argument("--warmup-seconds", type=int, default=1)
     p.add_argument("--tokio-threads", type=int, default=32)
     p.add_argument("--log", type=Path, required=True, help="New role log; companion .json stores build/result identity")
+    p.add_argument("--require-collapse-success", action="store_true",
+                   help="Parent result must prove every file-collapse Region succeeded")
     p.add_argument("--build-only", action="store_true")
     p.add_argument("--execute", action="store_true")
     return p
 
 
 def validate(a):
+    if a.require_collapse_success and a.source_backing != "file-collapse":
+        raise ValueError("--require-collapse-success requires --source-backing file-collapse")
     if a.mode != "B" and a.destination_layout != "segments":
         raise ValueError("--destination-layout contiguous is supported only by mode B")
     if a.mode != "B" and a.source_pattern != "sequential":
@@ -105,7 +109,7 @@ def executable(output):
     return Path(paths.pop())
 
 
-def evidence(text, mode, role, source_pattern="sequential", destination_layout="segments", source_backing="file"):
+def evidence(text, mode, role, source_pattern="sequential", destination_layout="segments", source_backing="file", require_collapse_success=False):
     preparation = {}
     if source_backing != "file":
         backing_pattern = re.escape(source_backing)
@@ -134,6 +138,8 @@ def evidence(text, mode, role, source_pattern="sequential", destination_layout="
                 preparation = {"collapseAttempts": len(attempts), "collapseSucceeded": succeeded,
                                "collapseFailed": len(attempts) - succeeded,
                                "collapseElapsedNs": sum(int(row[5]) for row in attempts)}
+                if require_collapse_success and succeeded != len(attempts):
+                    raise ValueError(f"File collapse success required: {succeeded}/{len(attempts)} Regions")
     if source_pattern == "fixed" and not re.search(
             rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bsource_pattern=fixed(?:\s|$)", text):
         raise ValueError("Probe did not prove fixed source pattern; update the Rust probe on both nodes")
@@ -189,7 +195,7 @@ def main(argv=None):
     env = environment(a)
     if not a.execute:
         print(json.dumps({"repo": str(a.repo.resolve()), "build": build, "env": env,
-                          "test": TESTS[a.mode], "cpus": a.cpus, "log": str(a.log), "buildOnly": a.build_only}, indent=2))
+                          "test": TESTS[a.mode], "cpus": a.cpus, "log": str(a.log), "buildOnly": a.build_only, "requireCollapseSuccess": a.require_collapse_success}, indent=2))
         return 0
     if not (a.repo / "dragonfly-client-storage/Cargo.toml").is_file():
         raise ValueError("--repo is not the Dragonfly source checkout")
@@ -206,7 +212,7 @@ def main(argv=None):
             metadata.write("\n")
             raise ValueError("Storage probe build failed; no hardware test executed")
         binary = executable(proc.stdout)
-        record = {"kind": "urma-read-bw-probe", "mode": a.mode, "role": a.role, "sourcePattern": a.source_pattern, "destinationLayout": a.destination_layout, "sourceBacking": a.source_backing,
+        record = {"kind": "urma-read-bw-probe", "mode": a.mode, "role": a.role, "sourcePattern": a.source_pattern, "destinationLayout": a.destination_layout, "sourceBacking": a.source_backing, "requireCollapseSuccess": a.require_collapse_success,
                   "builtAtUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                   "repo": str(a.repo.resolve()), "testExecutable": str(binary),
                   "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "env": env, "cpus": a.cpus,
@@ -220,7 +226,7 @@ def main(argv=None):
                 log.flush()
                 if proc.returncode:
                     raise ValueError(f"Probe exited {proc.returncode}; inspect {a.log}")
-                record["result"] = evidence(a.log.read_text(errors="replace"), a.mode, a.role, a.source_pattern, a.destination_layout, a.source_backing)
+                record["result"] = evidence(a.log.read_text(errors="replace"), a.mode, a.role, a.source_pattern, a.destination_layout, a.source_backing, a.require_collapse_success)
             record["state"] = "built" if a.build_only else "passed"
         except Exception as error:
             record.update(state="failed", error=str(error))
