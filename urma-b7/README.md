@@ -1346,7 +1346,7 @@ Segment，registered_bytes相同。取值/计时定义沿用前文B汇总观测�
 
 ### B/C 源内存对照：file / anonymous
 
-`--source-backing file|anonymous` 默认 `file`；两端必须相同。
+`--source-backing file|file-collapse|anonymous` 默认 `file`；两端必须相同。
 现已同时支持B和C：B保持原生对照，C通过生产Cached注册路径使用匿名Source。
 先同步Dragonfly源码和Python launcher。生产默认仍为file，显式配置后才使用匿名Source。
 
@@ -1477,3 +1477,92 @@ C模式：沿用上方B匿名源两端命令，将`--mode B`改为`--mode C`、�
 C匿名源通过生产Cache预注册，复制/注册不计时，保留双方校验/关闭。Parent应输出
 `URMA_BW_CACHED_SOURCE backing=anonymous segments=4 registered_bytes=1073741824 region_bytes=268435456`。
 C中的Fabric准备仍使用sourceWorkers=0，预注册在计时外；不要把C热源结果当作端到端首传结果。
+
+### 实验性 file-collapse：直接注册折叠后的文件页
+
+`registration.backing: file-collapse` 在已完成普通Task的Cached Region首次准备时，执行
+`MADV_HUGEPAGE`提示和一次同步`MADV_COLLAPSE`，然后直接注册原文件映射。默认仍为`file`。
+它通过现有Source准备函数接入；Piece、未完成文件和Persistent路径不调用该Cached准备逻辑。
+
+```yaml
+storage:
+  server:
+    urma:
+      mmapContent: true
+      read:
+        controlTransport: sendrecv
+        sourceWorkers: 2
+        registration:
+          mode: cached
+          backing: file-collapse
+          maxRegionBytes: 256MiB
+```
+
+在现有注册工作线程上执行折叠；`sourceWorkers: 0`仍是同步owner路径，性能对照建议2。
+每次Cache miss尝试一次，不后台重试，不改变全局THP策略。系统调用失败后继续注册同一个
+有效文件映射，允许部分折叠成功；不自动转成anonymous，也不影响内容正确性。
+
+Parent每Region输出INFO事件`urma READ file source collapse attempted`，字段：
+
+- `collapse_bytes`、`source_offset`：本次请求的文件范围。
+- `collapse_succeeded`、`collapse_errno`：MADV_COLLAPSE返回是否成功，0表示成功。
+- `collapse_hint_errno`：前置MADV_HUGEPAGE提示的结果；不阻止后续collapse尝试。
+- `collapse_ns`：提示及同步折叠总耗时，包含可能的缺页、内核复制或内存整理。
+
+成功只描述内核对该请求的返回结果，不替代smaps页覆盖确认。虚拟地址、文件偏移、长度、
+内核和文件系统条件都影响有效折叠范围；小文件和尾部不保证有大页。映射生命周期、文件
+身份、Cache预算、租约及GC行为与file相同。对共享文件页缓存的改变可能在映射释放后保留。
+社区PR前按已有要求清理实验埋点。
+
+#### 先测端到端三组
+
+新增case：`read-cached-region256-file-collapse-workers2-sendrecv-piece32-cc16`。
+它与已有file/anonymous的workers2 case保持相同Region256MiB、Piece32MiB、CC16及控制层配置。
+两端同步Dragonfly代码和B7工具后执行；配置由case覆盖，无需改模板：
+
+```bash
+python3 b7.py prepare \
+  --profile read --mode dual \
+  --run-id read-cached-file-collapse-workers2-001 \
+  --case read-cached-region256-file-collapse-workers2-sendrecv-piece32-cc16 \
+  --parent-cpus 192-223 --child-cpus 192-223 --execute
+
+python3 b7.py run \
+  --manifest results/read-cached-file-collapse-workers2-001/manifest.json --execute
+
+python3 read_attribution_summary.py \
+  results/read-cached-file-collapse-workers2-001
+```
+
+对照使用`read-cached-region256-file-workers2-sendrecv-piece32-cc16`和
+`read-cached-region256-anonymous-workers2-sendrecv-piece32-cc16`，各选新的run-id。
+每batch新Task的首次准备计入下载；不能把旧文件已被折叠后的file结果当作小页基线。
+B7保持内容、零fallback及Cached复用检查，还要求每个成功Piece证明`source_backing=FileCollapse`，
+并核对当批每个固定Region的真实折叠尝试。失败降级允许正常通过，结果中的
+`collapseAttempts/collapseSucceeded/collapseFailed/collapseElapsedNs`分别保留次数与累计时间，
+不能将多个worker重叠的累计时间当作端到端墙钟时间。
+
+只读取一个Parent样本文件即可查看准备阶段：
+
+```bash
+grep -n -m 40 -E \
+  'file source collapse attempted|source_worker_queue_ns|source_worker_execution_ns' \
+  results/read-cached-file-collapse-workers2-001/evidence/parent.sample-001.log
+```
+
+#### B/C热源诊断
+
+启动器新增 `--source-backing file-collapse`，B/C均支持，两端必须一致。沿用之前命令：
+
+- B保留`--source-pattern fixed --destination-layout contiguous`。
+- C使用默认sequential/segments，不传fixed/contiguous。
+- Parent保留`--file`，换新日志目录，例如`results/read-bw-B-file-collapse-001/`。
+- 两端先build-only，然后先Parent、后Child。
+
+探针准备阶段打印`URMA_BW_COLLAPSE`的范围、实际成功/errno及elapsed_ns。Parent launcher
+要求每个Region都有一致的尝试证据，并在JSON中返回成功/失败计数与总耗时。失败仍保留
+正常READ、完整性及双方shutdown验证。B/C计时不含准备成本，所以优先结合B7端到端结果判断。
+
+**实验文件：**file、file-collapse和anonymous应分别使用相同内容的新inode，顺序交替，
+同轮至少三次；collapse可能改变共享page cache，进程重启不等于恢复小页。不要在共享机器
+上全局drop_caches。远端先前DF_MMAP_COLLAPSE诊断补丁应保持撤除，以免污染file对照。

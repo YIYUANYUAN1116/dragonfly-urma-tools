@@ -235,6 +235,24 @@ class B7Tests(unittest.TestCase):
         with self.assertRaisesRegex(b7.B7Error, "backing not proven"):
             b7.validate_cached_source_reuse(case, proof.replace("Anonymous", "File", 1), "cache-task", 1024**3)
 
+    def test_file_collapse_case_requires_attempts_and_accepts_recorded_fallback(self):
+        cases = b7.load_cases(TOOL_DIR / "cases.json")
+        case = cases["read-cached-region256-file-collapse-workers2-sendrecv-piece32-cc16"]
+        inventory = b7.select_profile(self.inventory, "read")
+        _, _, layouts = b7.generated_layout(inventory, "dual", "collapse-overlay", None)
+        rendered = b7.render_role_config("", inventory, layouts["parent"], "parent", "collapse-overlay", case)
+        self.assertIn('backing: "file-collapse"', rendered)
+        log = self.cached_parent_log(4).replace("source_cached=true", "source_cached=true source_backing=FileCollapse")
+        rows = "".join(f"collapse_bytes=268435456 source_offset={offset} collapse_succeeded=true collapse_errno=0 collapse_ns=100 urma READ file source collapse attempted\n" for offset in range(0, 1 << 30, 256 << 20))
+        def evidence(text):
+            return b7.validate_cached_source_reuse(case, text, "cache-task", 1 << 30)
+        self.assertEqual(evidence(rows + log)["collapseSucceeded"], 4)
+        failed = rows.replace("collapse_succeeded=true collapse_errno=0", "collapse_succeeded=false collapse_errno=22")
+        self.assertEqual(evidence(failed + log)["collapseFailed"], 4)
+        for text in (log, rows + log.replace("FileCollapse", "File"), rows * 2 + log):
+            with self.subTest(text=text), self.assertRaises(b7.B7Error):
+                evidence(text)
+
     def test_registration_case_validation(self):
         base = b7.load_cases(TOOL_DIR / "cases.json")["read-auto-piece32-cc16"]
         for registration in (None, [], {"mode": "file"}, {"backing": "typo"}, {"maxRegionBytes": "0B"},

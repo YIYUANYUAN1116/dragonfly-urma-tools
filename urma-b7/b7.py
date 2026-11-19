@@ -4124,8 +4124,8 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
         registration = (urma_read or {}).get("registration", {})
         if not isinstance(registration, dict) or set(registration) - {"mode", "backing", "maxRegionBytes"}:
             raise B7Error(f"case {case['name']} has invalid urmaRead.registration")
-        if registration.get("backing", "file") not in ("file", "anonymous"):
-            raise B7Error(f"case {case['name']} registration.backing must be file or anonymous")
+        if registration.get("backing", "file") not in ("file", "file-collapse", "anonymous"):
+            raise B7Error(f"case {case['name']} registration.backing must be file, file-collapse or anonymous")
         if registration.get("mode", "piece") not in ("piece", "cached"):
             raise B7Error(f"case {case['name']} registration.mode must be piece or cached")
         if parse_registration_bytes(registration.get("maxRegionBytes", "1GiB")) is None:
@@ -4219,14 +4219,36 @@ def validate_cached_source_reuse(case: dict, parent_log: str, task_id: str, file
     if (observed["cachedPieces"] != pieces or observed["distinctSources"] != sources
             or observed["missingIdentities"] or pieces <= sources):
         raise B7Error(f"cached Source reuse not proven for {task_id}: {observed}")
-    if case["urmaRead"]["registration"].get("backing", "file") == "anonymous":
+    backing = case["urmaRead"]["registration"].get("backing", "file")
+    if backing != "file":
         scoped = filter_task_scoped_log(parent_log, {task_id})
-        anonymous = sum("urma READ cached source fully read; releasing lease" in line
-                        and re.search(r"\bsource_backing=Anonymous\b", line) is not None
-                        for line in scoped.splitlines())
-        if anonymous != pieces:
-            raise B7Error(f"anonymous Cached Source backing not proven for {task_id}: {anonymous}/{pieces}; rebuild Parent")
-        observed["anonymousPieces"] = anonymous
+        label = "Anonymous" if backing == "anonymous" else "FileCollapse"
+        served = sum("urma READ cached source fully read; releasing lease" in line
+                     and re.search(rf"\bsource_backing={label}\b", line) is not None
+                     for line in scoped.splitlines())
+        if served != pieces:
+            raise B7Error(f"{backing} Cached Source backing not proven for {task_id}: {served}/{pieces}; rebuild Parent")
+        observed["anonymousPieces" if backing == "anonymous" else "fileCollapsePieces"] = served
+        if backing == "file-collapse":
+            # These queue cases serve one new Task per batch. Preparation logs
+            # run on native workers, outside the task tracing span.
+            attempts = []
+            for line in parent_log.splitlines():
+                if "urma READ file source collapse attempted" not in line:
+                    continue
+                fields = {key: re.search(rf"\b{key}=(\d+|true|false)\b", line)
+                          for key in ("collapse_bytes", "source_offset", "collapse_succeeded", "collapse_errno", "collapse_ns")}
+                if not all(fields.values()):
+                    raise B7Error("incomplete file collapse preparation evidence")
+                attempts.append({key: match[1] for key, match in fields.items()})
+            ranges = sorted((int(row["source_offset"]), int(row["collapse_bytes"])) for row in attempts)
+            expected = [(offset, min(window, file_bytes - offset)) for offset in range(0, file_bytes, window)]
+            if ranges != expected or any((row["collapse_succeeded"] == "true") != (int(row["collapse_errno"]) == 0) for row in attempts):
+                raise B7Error(f"file collapse attempts not proven for {task_id}")
+            succeeded = sum(row["collapse_succeeded"] == "true" for row in attempts)
+            observed.update(collapseAttempts=len(attempts), collapseSucceeded=succeeded,
+                            collapseFailed=len(attempts) - succeeded,
+                            collapseElapsedNs=sum(int(row["collapse_ns"]) for row in attempts))
     return observed
 
 

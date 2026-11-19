@@ -36,8 +36,8 @@ def parser():
     p.add_argument("--region-bytes", type=int, default=256 << 20)
     p.add_argument("--source-pattern", choices=("sequential", "fixed"), default="sequential",
                    help="B only: fixed reads Piece 0 during warmup/measurement; validation still covers the whole file")
-    p.add_argument("--source-backing", choices=("file", "anonymous"), default="file",
-                   help="B/C: file mmap or anonymous mmap copied from the same input before timing")
+    p.add_argument("--source-backing", choices=("file", "file-collapse", "anonymous"), default="file",
+                   help="B/C: file, best-effort file collapse, or anonymous copy; preparation is outside timing")
     p.add_argument("--destination-layout", choices=("segments", "contiguous"), default="segments",
                    help="B only: separate registered buffers or one Segment with disjoint Slot ranges")
     p.add_argument("--depth", type=int, default=16)
@@ -106,33 +106,34 @@ def executable(output):
 
 
 def evidence(text, mode, role, source_pattern="sequential", destination_layout="segments", source_backing="file"):
-    if source_backing == "anonymous":
+    preparation = {}
+    if source_backing != "file":
+        backing_pattern = re.escape(source_backing)
         configs = re.findall(
-            rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bsource_backing=anonymous(?:\s|$)", text)
+            rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bsource_backing={backing_pattern}(?:\s|$)", text)
         if len(configs) != 1:
-            raise ValueError("Probe did not prove anonymous source backing; update Rust probe on both nodes")
-        if role == "parent" and mode == "B":
-            sources = re.findall(r"URMA_BW_SOURCE backing=anonymous segments=(\d+) registered_bytes=(\d+) region_bytes=(\d+) direct=true(?:\s|$)", text)
-            if len(sources) != 1:
-                raise ValueError("Expected actual directly registered anonymous Source evidence")
-            segments, registered, region = map(int, sources[0])
-            config = configs[0]
-            geometry = [re.search(rf"\b{key}=(\d+)(?:\s|$)", config) for key in ("file_bytes", "region_bytes")]
-            if not all(geometry):
-                raise ValueError("Missing anonymous Source configuration geometry")
-            file_bytes, region_bytes = [int(value[1]) for value in geometry]
-            if not (0 < region == region_bytes <= registered == file_bytes and
-                    segments == (registered + region - 1) // region):
-                raise ValueError("Inconsistent anonymous Source geometry")
-        if role == "parent" and mode == "C":
-            sources = re.findall(r"URMA_BW_CACHED_SOURCE backing=anonymous segments=(\d+) registered_bytes=(\d+) region_bytes=(\d+)(?:\s|$)", text)
+            raise ValueError(f"Probe did not prove {source_backing} source backing; update Rust probe on both nodes")
+        if role == "parent":
+            prefix = "URMA_BW_SOURCE" if mode == "B" else "URMA_BW_CACHED_SOURCE"
+            direct = r" direct=true" if mode == "B" else ""
+            sources = re.findall(rf"{prefix} backing={backing_pattern} segments=(\d+) registered_bytes=(\d+) region_bytes=(\d+){direct}(?:\s|$)", text)
             geometry = [re.search(rf"\b{key}=(\d+)(?:\s|$)", configs[0]) for key in ("file_bytes", "region_bytes")]
             if len(sources) != 1 or not all(geometry):
-                raise ValueError("Missing actual anonymous Cached Source evidence")
+                raise ValueError(f"Missing actual {source_backing} Source evidence")
             segments, registered, region = map(int, sources[0])
             if not (0 < region <= registered and registered == int(geometry[0][1]) and
                     region == int(geometry[1][1]) and segments == (registered + region - 1) // region):
-                raise ValueError("Inconsistent anonymous Cached Source geometry")
+                raise ValueError(f"Inconsistent {source_backing} Source geometry")
+            if source_backing == "file-collapse":
+                attempts = re.findall(r"URMA_BW_COLLAPSE bytes=(\d+) offset=(\d+) succeeded=(true|false) errno=(\d+) hint_errno=(\d+) elapsed_ns=(\d+)(?:\s|$)", text)
+                ranges = sorted((int(offset), int(size)) for size, offset, *_ in attempts)
+                expected = [(offset, min(region, registered - offset)) for offset in range(0, registered, region)]
+                if ranges != expected or any((ok == "true") != (int(errno) == 0) for _, _, ok, errno, _, _ in attempts):
+                    raise ValueError("Missing or inconsistent actual file collapse attempts")
+                succeeded = sum(ok == "true" for _, _, ok, _, _, _ in attempts)
+                preparation = {"collapseAttempts": len(attempts), "collapseSucceeded": succeeded,
+                               "collapseFailed": len(attempts) - succeeded,
+                               "collapseElapsedNs": sum(int(row[5]) for row in attempts)}
     if source_pattern == "fixed" and not re.search(
             rf"URMA_BW_CONFIG mode={mode} role={role} [^\n]*\bsource_pattern=fixed(?:\s|$)", text):
         raise ValueError("Probe did not prove fixed source pattern; update the Rust probe on both nodes")
@@ -153,7 +154,7 @@ def evidence(text, mode, role, source_pattern="sequential", destination_layout="
     if role == "parent":
         if results:
             raise ValueError("Unexpected Child bandwidth result in Parent log")
-        return {"integrity": True, "shutdown": True}
+        return {"integrity": True, "shutdown": True, **preparation}
     if len(results) != 1 or results[0][0] != mode:
         raise ValueError("Expected exactly one matching Child result")
     _, size, pieces, elapsed, gibps, gbps = results[0]

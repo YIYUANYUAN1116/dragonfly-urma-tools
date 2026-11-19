@@ -210,5 +210,28 @@ class ReadBandwidthProbeTests(unittest.TestCase):
                 evidence(prefix)
 
 
+    def test_file_collapse_requires_real_attempts_and_reports_fallback(self):
+        for mode in ("B", "C"):
+            args = probe.parser().parse_args(self.args("--mode", mode, "--source-backing", "file-collapse"))
+            probe.validate(args)
+            self.assertEqual(probe.environment(args)["URMA_BW_SOURCE_BACKING"], "file-collapse")
+            config = f"URMA_BW_CONFIG mode={mode} role=parent file_bytes=1073741824 region_bytes=268435456 source_backing=file-collapse\n"
+            prefix = "URMA_BW_SOURCE" if mode == "B" else "URMA_BW_CACHED_SOURCE"
+            source = f"{prefix} backing=file-collapse segments=4 registered_bytes=1073741824 region_bytes=268435456" + (" direct=true" if mode == "B" else "") + "\n"
+            passed = f"URMA_BW_PASS mode={mode} role=parent integrity=all-pieces-before-and-after shutdown=both-sides"
+            rows = "".join(f"URMA_BW_COLLAPSE bytes=268435456 offset={offset} succeeded=true errno=0 hint_errno=0 elapsed_ns=100\n" for offset in range(0, 1 << 30, 256 << 20))
+            def evidence(text):
+                return probe.evidence(text + passed, mode, "parent", source_backing="file-collapse")
+            result = evidence(config + source + rows)
+            self.assertEqual(result["collapseSucceeded"], 4)
+            self.assertEqual(result["collapseElapsedNs"], 400)
+            failed = rows.replace("succeeded=true errno=0", "succeeded=false errno=22")
+            self.assertEqual(evidence(config + source + failed)["collapseFailed"], 4)
+            for text in (config + source, source + rows, config + source + rows * 2,
+                         config + source + rows.replace("succeeded=true errno=0", "succeeded=true errno=22")):
+                with self.subTest(mode=mode, text=text), self.assertRaises(ValueError):
+                    evidence(text)
+
+
 if __name__ == "__main__":
     unittest.main()
